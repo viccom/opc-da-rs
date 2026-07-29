@@ -8,8 +8,10 @@ pub use crate::bindings::da::tagOPCITEMDEF;
 pub use crate::bindings::da::{tagOPCITEMRESULT, tagOPCITEMSTATE};
 pub use crate::opc_da::client::*;
 pub use crate::opc_da::com_utils::RemoteArray;
+use crate::opc_da::com_utils::TryFromNative as _;
 pub use crate::opc_da::errors::{OpcError, OpcResult};
-use anyhow::Context;
+use crate::opc_da::typedefs::ServerStatus;
+use crate::provider::{ItemProperty, TagValue};
 pub use windows::Win32::System::Variant::VARIANT;
 use windows::core::Interface;
 
@@ -31,7 +33,12 @@ pub trait ServerConnector: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the COM registry enumeration fails.
-    fn enumerate_servers(&self) -> OpcResult<Vec<String>>;
+    /// Enumerate OPC DA server ProgIDs on `host`.
+    ///
+    /// `host == "localhost"` (or empty) enumerates the local machine. A remote host requires
+    /// DCOM `CoCreateInstanceEx` against the remote `IOPCServerList` (see ROADMAP P1-05:
+    /// `ComConnector` currently enumerates locally regardless of `host`).
+    fn enumerate_servers(&self, host: &str) -> OpcResult<Vec<String>>;
 
     /// Connect to the named OPC DA server and return a server facade.
     ///
@@ -113,6 +120,75 @@ pub trait ConnectedServer {
     ///
     /// Returns an error if the group removal fails.
     fn remove_group(&self, server_group: GroupHandle, force: bool) -> OpcResult<()>;
+
+    /// Query the current server status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IOPCServer::GetStatus` is unsupported or fails.
+    fn get_status(&self) -> OpcResult<ServerStatus> {
+        Err(OpcError::NotImplemented(
+            "get_status not supported".to_string(),
+        ))
+    }
+
+    /// Query the available properties of an item.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IOPCItemProperties` is unsupported or the query fails.
+    fn get_item_properties(&self, _item_id: &str) -> OpcResult<Vec<ItemProperty>> {
+        Err(OpcError::NotImplemented(
+            "get_item_properties not supported".to_string(),
+        ))
+    }
+
+    /// Get a server-localized error string for an HRESULT.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IOPCCommon` is unsupported or the call fails.
+    fn get_error_string(&self, _hresult: i32) -> OpcResult<String> {
+        Err(OpcError::NotImplemented(
+            "get_error_string not supported".to_string(),
+        ))
+    }
+
+    /// Advise an `IOPCShutdown` sink to this server, returning the connection cookie.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the shutdown connection point is unavailable or `Advise` fails.
+    fn advise_shutdown(&self, _sink: &windows::core::IUnknown) -> OpcResult<u32> {
+        Err(OpcError::NotImplemented(
+            "advise_shutdown not supported".to_string(),
+        ))
+    }
+
+    /// Unadvise a previously advised shutdown sink by cookie.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cookie is unknown or `Unadvise` fails.
+    fn unadvise_shutdown(&self, _cookie: u32) -> OpcResult<()> {
+        Err(OpcError::NotImplemented(
+            "unadvise_shutdown not supported".to_string(),
+        ))
+    }
+
+    /// Set the server locale (`IOPCCommon::SetLocaleID`).
+    fn set_locale_id(&self, _locale_id: u32) -> OpcResult<()> {
+        Err(OpcError::NotImplemented(
+            "set_locale_id not supported".to_string(),
+        ))
+    }
+
+    /// Set the client application name (`IOPCCommon::SetClientName`).
+    fn set_client_name(&self, _name: &str) -> OpcResult<()> {
+        Err(OpcError::NotImplemented(
+            "set_client_name not supported".to_string(),
+        ))
+    }
 }
 
 /// Facade over an OPC DA group for item management and I/O.
@@ -158,23 +234,122 @@ pub trait ConnectedGroup {
         server_handles: &[ItemHandle],
         values: &[VARIANT],
     ) -> OpcResult<RemoteArray<windows::core::HRESULT>>;
+
+    /// Read item values with a maximum-age constraint, returning assembled `TagValue`s.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IOPCSyncIO2` is unsupported or the read fails.
+    fn read_max_age(
+        &self,
+        _server_handles: &[ItemHandle],
+        _max_age_ms: u32,
+        _tag_ids: &[String],
+    ) -> OpcResult<Vec<TagValue>> {
+        Err(OpcError::NotImplemented(
+            "read_max_age not supported".to_string(),
+        ))
+    }
+
+    /// Write values with quality/timestamp (`IOPCSyncIO2::WriteVQT`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IOPCSyncIO2` is unsupported or the write fails.
+    fn write_vqt(
+        &self,
+        _server_handles: &[ItemHandle],
+        _values: &[crate::bindings::da::tagOPCITEMVQT],
+    ) -> OpcResult<RemoteArray<windows::core::HRESULT>> {
+        Err(OpcError::NotImplemented(
+            "write_vqt not supported".to_string(),
+        ))
+    }
+
+    /// Advise an `IOPCDataCallback` sink to this group, returning the connection cookie.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection point is unavailable or `Advise` fails.
+    fn advise_data_callback(&self, _sink: &windows::core::IUnknown) -> OpcResult<u32> {
+        Err(OpcError::NotImplemented(
+            "advise_data_callback not supported".to_string(),
+        ))
+    }
+
+    /// Unadvise a previously advised callback by cookie.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cookie is unknown or `Unadvise` fails.
+    fn unadvise_data_callback(&self, _cookie: u32) -> OpcResult<()> {
+        Err(OpcError::NotImplemented(
+            "unadvise_data_callback not supported".to_string(),
+        ))
+    }
+
+    /// Adjust the group's update rate at runtime (`IOPCGroupStateMgt::SetState`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `SetState` is unsupported or fails.
+    fn set_update_rate(&self, _update_rate: u32) -> OpcResult<u32> {
+        Err(OpcError::NotImplemented(
+            "set_update_rate not supported".to_string(),
+        ))
+    }
+
+    /// Set the group keep-alive interval (`IOPCGroupStateMgt2::SetKeepAlive`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `IOPCGroupStateMgt2` is unsupported or the call fails.
+    fn set_keep_alive(&self, _keep_alive_ms: u32) -> OpcResult<u32> {
+        Err(OpcError::NotImplemented(
+            "set_keep_alive not supported".to_string(),
+        ))
+    }
 }
 
 // ── COM-backed implementations ──────────────────────────────────────
 
 /// Real COM-backed server connector implementation.
 ///
-/// Uses Windows COM to enumerate and connect to OPC DA servers.
-pub struct ComConnector;
+/// Uses Windows COM to enumerate and connect to OPC DA servers. Carries a `host` that selects
+/// the target machine for [`Self::connect`]: remote hosts go through `create_server2` (DCOM).
+pub struct ComConnector {
+    host: String,
+}
+
+impl ComConnector {
+    /// Create a connector targeting `host` (e.g. `"localhost"` or `"192.168.1.10"`).
+    #[must_use]
+    pub fn new(host: impl Into<String>) -> Self {
+        Self { host: host.into() }
+    }
+
+    /// Target host for subsequent `connect` calls.
+    #[must_use]
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+}
+
+impl Default for ComConnector {
+    fn default() -> Self {
+        Self::new("localhost")
+    }
+}
 
 impl ServerConnector for ComConnector {
     type Server = ComServer;
 
-    fn enumerate_servers(&self) -> OpcResult<Vec<String>> {
+    fn enumerate_servers(&self, host: &str) -> OpcResult<Vec<String>> {
         let client = crate::opc_da::client::v2::Client;
-        let guid_iter = client
-            .get_servers()
-            .context("Failed to enumerate OPC DA servers from registry")?;
+        let guid_iter = client.get_servers(Some(host)).map_err(|e| {
+            tracing::warn!(error = ?e, host = %host, "IOPCServerList enumeration failed");
+            e
+        })?;
 
         let mut servers = Vec::new();
         for guid in guid_iter.flatten() {
@@ -199,14 +374,16 @@ impl ServerConnector for ComConnector {
     }
 
     fn connect(&self, server_name: &str) -> OpcResult<Self::Server> {
-        let opc_server = crate::helpers::connect_server(server_name)?;
+        let opc_server = crate::helpers::connect_server(server_name, &self.host)?;
         let unknown: windows::core::IUnknown = opc_server.cast()?;
 
         Ok(ComServer {
             server: opc_server,
             common: unknown.cast()?,
             connection_point_container: unknown.cast()?,
-            item_properties: unknown.cast()?,
+            item_properties: unknown.cast().ok(),
+            browse: unknown.cast().ok(),
+            item_io: unknown.cast().ok(),
             server_public_groups: unknown.cast().ok(),
             browse_server_address_space: unknown.cast().ok(),
         })
@@ -218,7 +395,9 @@ pub struct ComServer {
     pub(crate) server: crate::bindings::da::IOPCServer,
     pub(crate) common: crate::bindings::comn::IOPCCommon,
     pub(crate) connection_point_container: windows::Win32::System::Com::IConnectionPointContainer,
-    pub(crate) item_properties: crate::bindings::da::IOPCItemProperties,
+    pub(crate) item_properties: Option<crate::bindings::da::IOPCItemProperties>,
+    pub(crate) browse: Option<crate::bindings::da::IOPCBrowse>,
+    pub(crate) item_io: Option<crate::bindings::da::IOPCItemIO>,
     pub(crate) server_public_groups: Option<crate::bindings::da::IOPCServerPublicGroups>,
     pub(crate) browse_server_address_space:
         Option<crate::bindings::da::IOPCBrowseServerAddressSpace>,
@@ -244,7 +423,9 @@ impl ConnectionPointContainerTrait for ComServer {
 
 impl ItemPropertiesTrait for ComServer {
     fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCItemProperties> {
-        Ok(&self.item_properties)
+        self.item_properties
+            .as_ref()
+            .ok_or_else(|| OpcError::NotImplemented("IOPCItemProperties not supported".to_string()))
     }
 }
 
@@ -261,6 +442,22 @@ impl BrowseServerAddressSpaceTrait for ComServer {
         self.browse_server_address_space.as_ref().ok_or_else(|| {
             OpcError::NotImplemented("IOPCBrowseServerAddressSpace not supported".to_string())
         })
+    }
+}
+
+impl BrowseTrait for ComServer {
+    fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCBrowse> {
+        self.browse
+            .as_ref()
+            .ok_or_else(|| OpcError::NotImplemented("IOPCBrowse not supported".to_string()))
+    }
+}
+
+impl ItemIoTrait for ComServer {
+    fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCItemIO> {
+        self.item_io
+            .as_ref()
+            .ok_or_else(|| OpcError::NotImplemented("IOPCItemIO not supported".to_string()))
     }
 }
 
@@ -329,6 +526,86 @@ impl ConnectedServer for ComServer {
     fn remove_group(&self, server_group: GroupHandle, force: bool) -> OpcResult<()> {
         ServerTrait::remove_group(self, server_group, force)
     }
+
+    fn get_status(&self) -> OpcResult<ServerStatus> {
+        let ptr = ServerTrait::get_status(self)?;
+        let native = ptr.ok()?;
+        ServerStatus::try_from_native(native).map_err(OpcError::from)
+    }
+
+    fn get_item_properties(&self, item_id: &str) -> OpcResult<Vec<ItemProperty>> {
+        use crate::opc_da::com_utils::TryFromNative as _;
+
+        let (ids, descriptions, datatypes) =
+            ItemPropertiesTrait::query_available_properties(self, item_id)?;
+        let ids_slice = ids.as_slice();
+        if ids_slice.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (values, errors) = ItemPropertiesTrait::get_item_properties(self, item_id, ids_slice)?;
+        let descs = descriptions.as_slice();
+        let dtypes = datatypes.as_slice();
+        let vals = values.as_slice();
+        let errs = errors.as_slice();
+
+        let mut out = Vec::with_capacity(ids_slice.len());
+        for (i, &id) in ids_slice.iter().enumerate() {
+            let description = descs
+                .get(i)
+                .and_then(|p| String::try_from_native(p).ok())
+                .unwrap_or_default();
+            let data_type = *dtypes.get(i).unwrap_or(&0);
+            let value = if errs.get(i).is_some_and(|e| e.is_ok()) {
+                vals.get(i)
+                    .map(crate::helpers::variant_to_string)
+                    .unwrap_or_default()
+            } else {
+                let hr = errs.get(i).copied().unwrap_or(windows::core::HRESULT(0));
+                format!("Error: {}", crate::helpers::format_hresult(hr))
+            };
+            out.push(ItemProperty {
+                id,
+                description,
+                data_type,
+                value,
+            });
+        }
+        Ok(out)
+    }
+
+    fn get_error_string(&self, hresult: i32) -> OpcResult<String> {
+        CommonTrait::get_error_string(self, windows::core::HRESULT(hresult))
+    }
+
+    fn advise_shutdown(&self, sink: &windows::core::IUnknown) -> OpcResult<u32> {
+        let cp = ConnectionPointContainerTrait::find_connection_point(
+            self,
+            &crate::bindings::comn::IOPCShutdown::IID,
+        )?;
+        // SAFETY: `sink` implements IOPCShutdown (verified by the connection point).
+        let cookie = unsafe { cp.Advise(sink)? };
+        Ok(cookie)
+    }
+
+    fn unadvise_shutdown(&self, cookie: u32) -> OpcResult<()> {
+        let cp = ConnectionPointContainerTrait::find_connection_point(
+            self,
+            &crate::bindings::comn::IOPCShutdown::IID,
+        )?;
+        // SAFETY: `cookie` was returned by a prior `Advise` on this connection point.
+        unsafe {
+            cp.Unadvise(cookie)?;
+        }
+        Ok(())
+    }
+
+    fn set_locale_id(&self, locale_id: u32) -> OpcResult<()> {
+        CommonTrait::set_locale_id(self, locale_id)
+    }
+
+    fn set_client_name(&self, name: &str) -> OpcResult<()> {
+        CommonTrait::set_client_name(self, name)
+    }
 }
 
 pub struct ComGroup {
@@ -336,6 +613,11 @@ pub struct ComGroup {
     pub(crate) group_state_mgt: crate::bindings::da::IOPCGroupStateMgt,
     pub(crate) public_group_state_mgt: Option<crate::bindings::da::IOPCPublicGroupStateMgt>,
     pub(crate) sync_io: crate::bindings::da::IOPCSyncIO,
+    pub(crate) sync_io2: Option<crate::bindings::da::IOPCSyncIO2>,
+    pub(crate) group_state_mgt2: Option<crate::bindings::da::IOPCGroupStateMgt2>,
+    pub(crate) async_io3: Option<crate::bindings::da::IOPCAsyncIO3>,
+    pub(crate) item_deadband_mgt: Option<crate::bindings::da::IOPCItemDeadbandMgt>,
+    pub(crate) item_sampling_mgt: Option<crate::bindings::da::IOPCItemSamplingMgt>,
     pub(crate) async_io: Option<crate::bindings::da::IOPCAsyncIO>,
     pub(crate) async_io2: crate::bindings::da::IOPCAsyncIO2,
     pub(crate) connection_point_container: windows::Win32::System::Com::IConnectionPointContainer,
@@ -365,6 +647,46 @@ impl PublicGroupStateMgtTrait for ComGroup {
 impl SyncIoTrait for ComGroup {
     fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCSyncIO> {
         Ok(&self.sync_io)
+    }
+}
+
+impl SyncIo2Trait for ComGroup {
+    fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCSyncIO2> {
+        self.sync_io2
+            .as_ref()
+            .ok_or_else(|| OpcError::NotImplemented("IOPCSyncIO2 not supported".to_string()))
+    }
+}
+
+impl GroupStateMgt2Trait for ComGroup {
+    fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCGroupStateMgt2> {
+        self.group_state_mgt2
+            .as_ref()
+            .ok_or_else(|| OpcError::NotImplemented("IOPCGroupStateMgt2 not supported".to_string()))
+    }
+}
+
+impl AsyncIo3Trait for ComGroup {
+    fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCAsyncIO3> {
+        self.async_io3
+            .as_ref()
+            .ok_or_else(|| OpcError::NotImplemented("IOPCAsyncIO3 not supported".to_string()))
+    }
+}
+
+impl ItemDeadbandMgtTrait for ComGroup {
+    fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCItemDeadbandMgt> {
+        self.item_deadband_mgt.as_ref().ok_or_else(|| {
+            OpcError::NotImplemented("IOPCItemDeadbandMgt not supported".to_string())
+        })
+    }
+}
+
+impl ItemSamplingMgtTrait for ComGroup {
+    fn interface(&self) -> OpcResult<&crate::bindings::da::IOPCItemSamplingMgt> {
+        self.item_sampling_mgt.as_ref().ok_or_else(|| {
+            OpcError::NotImplemented("IOPCItemSamplingMgt not supported".to_string())
+        })
     }
 }
 
@@ -425,6 +747,85 @@ impl ConnectedGroup for ComGroup {
     ) -> OpcResult<RemoteArray<windows::core::HRESULT>> {
         SyncIoTrait::write(self, server_handles, values)
     }
+
+    fn read_max_age(
+        &self,
+        server_handles: &[ItemHandle],
+        max_age_ms: u32,
+        tag_ids: &[String],
+    ) -> OpcResult<Vec<TagValue>> {
+        let n = server_handles.len();
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let max_ages = vec![max_age_ms; n];
+        let (values, qualities, timestamps, errors) =
+            SyncIo2Trait::read_max_age(self, server_handles, &max_ages)?;
+        let vals = values.as_slice();
+        let quals = qualities.as_slice();
+        let times = timestamps.as_slice();
+        let errs = errors.as_slice();
+
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let tag_id = tag_ids.get(i).cloned().unwrap_or_default();
+            let (value, quality) = if errs.get(i).is_some_and(|e| e.is_ok()) {
+                let v = vals
+                    .get(i)
+                    .map_or_else(|| "Error".to_string(), crate::helpers::variant_to_string);
+                let q = quals.get(i).map_or_else(
+                    || "Bad".to_string(),
+                    |&q| crate::helpers::quality_to_string(q),
+                );
+                (v, q)
+            } else {
+                ("Error".to_string(), "Bad".to_string())
+            };
+            let timestamp = times
+                .get(i)
+                .map(|&ft| crate::helpers::filetime_to_string(ft))
+                .unwrap_or_default();
+            out.push(TagValue {
+                tag_id,
+                value,
+                quality,
+                timestamp,
+            });
+        }
+        Ok(out)
+    }
+
+    fn write_vqt(
+        &self,
+        server_handles: &[ItemHandle],
+        values: &[crate::bindings::da::tagOPCITEMVQT],
+    ) -> OpcResult<RemoteArray<windows::core::HRESULT>> {
+        SyncIo2Trait::write_vqt(self, server_handles, values)
+    }
+
+    fn advise_data_callback(&self, sink: &windows::core::IUnknown) -> OpcResult<u32> {
+        let cp = ConnectionPointContainerTrait::data_callback_connection_point(self)?;
+        // SAFETY: `sink` implements IOPCDataCallback (verified by the connection point).
+        let cookie = unsafe { cp.Advise(sink)? };
+        Ok(cookie)
+    }
+
+    fn unadvise_data_callback(&self, cookie: u32) -> OpcResult<()> {
+        let cp = ConnectionPointContainerTrait::data_callback_connection_point(self)?;
+        // SAFETY: `cookie` was returned by a prior `Advise` on this connection point.
+        unsafe {
+            cp.Unadvise(cookie)?;
+        }
+        Ok(())
+    }
+
+    fn set_update_rate(&self, update_rate: u32) -> OpcResult<u32> {
+        GroupStateMgtTrait::set_state(self, Some(update_rate), None, None, None, None, None)
+    }
+
+    fn set_keep_alive(&self, keep_alive_ms: u32) -> OpcResult<u32> {
+        GroupStateMgt2Trait::set_keep_alive(self, keep_alive_ms)
+    }
 }
 
 impl TryFrom<windows::core::IUnknown> for ComGroup {
@@ -436,6 +837,11 @@ impl TryFrom<windows::core::IUnknown> for ComGroup {
             group_state_mgt: unknown.cast()?,
             public_group_state_mgt: unknown.cast().ok(),
             sync_io: unknown.cast()?,
+            sync_io2: unknown.cast().ok(),
+            group_state_mgt2: unknown.cast().ok(),
+            async_io3: unknown.cast().ok(),
+            item_deadband_mgt: unknown.cast().ok(),
+            item_sampling_mgt: unknown.cast().ok(),
             async_io: unknown.cast().ok(),
             async_io2: unknown.cast()?,
             connection_point_container: unknown.cast()?,

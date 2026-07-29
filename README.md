@@ -13,9 +13,9 @@ See **[architecture.md](./architecture.md)** for the full design, state machine,
 
 ## ✨ Features
 
-- **Server Discovery**: Enumerate OPC DA servers on local or remote hosts.
+- **Server Discovery**: Enumerate OPC DA servers on the local host. *(Remote host enumeration is planned — see `ROADMAP.md`.)*
 - **Hierarchical Browsing**: Recursive exploration of complex server namespaces with partial-result harvesting on timeout.
-- **Real-time Monitoring**: Live tag value updates with 1-second auto-refresh.
+- **Real-time Monitoring**: Live tag value updates via 1-second auto-refresh polling. *(Event-driven subscription via `IOPCDataCallback` is planned — see `ROADMAP.md`.)*
 - **Tag Write Support**: Write typed values (int, float, bool, string) to individual tags.
 - **Search & Filter**: Substring search with `Tab`/`Shift+Tab` cycling through matches.
 - **Rich Error Hints**: Human-readable explanations for cryptic Windows COM/DCOM HRESULT codes.

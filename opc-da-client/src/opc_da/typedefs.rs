@@ -642,6 +642,31 @@ pub struct AuthInfo {
     pub capabilities: u32,
 }
 
+impl AuthInfo {
+    /// DCOM 默认认证配置：WinNT 认证服务、连接级认证、识别模拟、当前用户凭据。
+    ///
+    /// 适合同域/已登录用户的远程访问。跨域或特定凭据场景请构造自定义 [`AuthIdentity`]。
+    /// 常量值对应 `RPC_C_AUTHN_WINNT`(10)、`RPC_C_AUTHZ_NONE`(0)、
+    /// `RPC_C_AUTHN_LEVEL_CONNECT`(2)、`RPC_C_IMP_LEVEL_IDENTIFY`(2)。
+    #[must_use]
+    pub fn default_dcom() -> Self {
+        Self {
+            authn_svc: 10,
+            authz_svc: 0,
+            server_principal_name: String::new(),
+            authn_level: 2,
+            impersonation_level: 2,
+            auth_identity_data: AuthIdentity {
+                user: String::new(),
+                domain: String::new(),
+                password: String::new(),
+                flags: 0,
+            },
+            capabilities: 0,
+        }
+    }
+}
+
 /// FFI-safe bridge for `AuthInfo` (COAUTHINFO).
 pub struct AuthInfoBridge {
     pub authn_svc: u32,

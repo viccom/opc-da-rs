@@ -1,2 +1,7 @@
+# MSVC linkers (Visual Studio 2022 Build Tools on this machine).
+# Adjust the MSVC/<version> segment if your install differs.
 [target.x86_64-pc-windows-msvc]
-linker = 'C:\bin\portable-msvc\msvc\VC\Tools\MSVC\14.50.35717\bin\Hostx64\x64\link.exe'
+linker = "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.41.34120/bin/Hostx64/x64/link.exe"
+
+[target.i686-pc-windows-msvc]
+linker = "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC/14.41.34120/bin/Hostx64/x86/link.exe"

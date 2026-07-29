@@ -17,20 +17,61 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
     /// # Returns
     ///
     /// A `Result` containing a `GuidIterator` over server GUIDs, or an error if the operation fails.
-    fn get_servers(&self) -> OpcResult<GuidIterator> {
+    fn get_servers(&self, host: Option<&str>) -> OpcResult<GuidIterator> {
         tracing::debug!("Enumerating OPC DA Server classes via COM Component Categories Manager");
         let id = unsafe {
             windows::Win32::System::Com::CLSIDFromProgID(windows::core::w!("OPC.ServerList.1"))?
         };
 
-        let servers: crate::bindings::comn::IOPCServerList = unsafe {
-            // TODO: Use CoCreateInstanceEx
-            windows::Win32::System::Com::CoCreateInstance(
-                &id,
-                None,
-                // TODO: Convert from filters
-                windows::Win32::System::Com::CLSCTX_ALL,
-            )?
+        let servers: crate::bindings::comn::IOPCServerList = match host {
+            Some(h) if !h.is_empty() && !h.eq_ignore_ascii_case("localhost") => {
+                // SAFETY: `host_wide` is null-terminated and outlives the CoCreateInstanceEx call.
+                let mut host_wide: Vec<u16> = h.encode_utf16().chain(core::iter::once(0)).collect();
+                let native = windows::Win32::System::Com::COSERVERINFO {
+                    dwReserved1: 0,
+                    pwszName: windows::core::PWSTR(host_wide.as_ptr().cast_mut()),
+                    // pAuthInfo = null => DCOM default authentication (current logged-in user),
+                    // matching legacy 32-bit OPC clients. Avoids the AuthInfo bridge's dangling
+                    // pointer to a temporary COAUTHINFO (caused 0x800703E6 on 32-bit).
+                    pAuthInfo: std::ptr::null_mut(),
+                    dwReserved2: 0,
+                };
+                let mut results = [windows::Win32::System::Com::MULTI_QI {
+                    pIID: &crate::bindings::comn::IOPCServerList::IID,
+                    pItf: core::mem::ManuallyDrop::new(None),
+                    hr: windows::core::HRESULT(0),
+                }];
+                // SAFETY: CoCreateInstanceEx with a remote COSERVERINFO instantiates
+                // IOPCServerList on `host` and returns it via MULTI_QI.
+                unsafe {
+                    windows::Win32::System::Com::CoCreateInstanceEx(
+                        &id,
+                        None,
+                        windows::Win32::System::Com::CLSCTX_ALL,
+                        Some(&native),
+                        &mut results,
+                    )?;
+                }
+                if results[0].hr.is_err() {
+                    return Err(OpcError::Com {
+                        source: results[0].hr.into(),
+                    });
+                }
+                results[0]
+                    .pItf
+                    .as_ref()
+                    .ok_or_else(|| {
+                        OpcError::Internal("CoCreateInstanceEx returned null IOPCServerList".into())
+                    })?
+                    .cast()?
+            }
+            _ => unsafe {
+                windows::Win32::System::Com::CoCreateInstance(
+                    &id,
+                    None,
+                    windows::Win32::System::Com::CLSCTX_ALL,
+                )?
+            },
         };
 
         let versions = [Self::CATALOG_ID];
@@ -91,17 +132,40 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
             hr: windows::core::HRESULT(0),
         }];
 
+        // SAFETY: when remote, `host_wide` + `native` outlive the CoCreateInstanceEx call.
         unsafe {
-            windows::Win32::System::Com::CoCreateInstanceEx(
-                &class_id,
-                None,
-                class_context.to_native(),
-                match server_info {
-                    Some(info) => Some(&info.into_bridge().try_to_native()?),
-                    None => None,
-                },
-                &mut results,
-            )?
+            match &server_info {
+                Some(info) => {
+                    let mut host_wide: Vec<u16> = info
+                        .name
+                        .encode_utf16()
+                        .chain(core::iter::once(0))
+                        .collect();
+                    let native = windows::Win32::System::Com::COSERVERINFO {
+                        dwReserved1: 0,
+                        pwszName: windows::core::PWSTR(host_wide.as_ptr().cast_mut()),
+                        // pAuthInfo = null => DCOM default auth (current logged-in user),
+                        // matching legacy 32-bit clients; avoids the AuthInfo bridge's
+                        // dangling pointer to a temporary COAUTHINFO.
+                        pAuthInfo: std::ptr::null_mut(),
+                        dwReserved2: 0,
+                    };
+                    windows::Win32::System::Com::CoCreateInstanceEx(
+                        &class_id,
+                        None,
+                        class_context.to_native(),
+                        Some(&native),
+                        &mut results,
+                    )?
+                }
+                None => windows::Win32::System::Com::CoCreateInstanceEx(
+                    &class_id,
+                    None,
+                    class_context.to_native(),
+                    None,
+                    &mut results,
+                )?,
+            }
         };
 
         if results[0].hr.is_err() {

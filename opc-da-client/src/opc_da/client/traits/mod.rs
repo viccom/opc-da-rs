@@ -1,34 +1,31 @@
 #![allow(unused_imports)]
 /// OPC DA client trait definitions.
 ///
-/// This module contains all trait definitions for interacting with OPC DA servers.
-/// The traits are organized by functionality and OPC DA version compatibility:
+/// Trait definitions for interacting with OPC DA servers, organized by functionality
+/// and OPC DA version compatibility.
 ///
-/// Version independent traits:
-/// - CommonTrait: Basic server configuration and error handling
-/// - ConnectionPointContainerTrait: Event connection management
-/// - DataObjectTrait: COM data transfer functionality
+/// > **实现状态（2026-07-28 审计）**：trait 定义完整覆盖规范，但**生产路径只用到一小部分**。
+/// > 经 `OpcProvider` 对外暴露、被 `ComWorker` 实际调用的仅：`ServerTrait`（AddGroup/
+/// > RemoveGroup/GetStatus）、`BrowseServerAddressSpaceTrait`、`ItemMgtTrait`、`SyncIoTrait`，
+/// > 以及 `ClientTrait`（服务器枚举）。`CommonTrait`/`ItemPropertiesTrait`/`GroupStateMgtTrait`
+/// > 已在 `ComServer`/`ComGroup` 实现，部分正逐步暴露（见 `ROADMAP.md`）。
+/// > `AsyncIo*Trait` 与订阅回调（`IOPCDataCallback`）尚未接线。DA 3.0 trait
+/// > （`BrowseTrait`/`ItemIoTrait`/`GroupStateMgt2Trait`/`SyncIo2Trait`/`AsyncIo3Trait`/
+/// > `ItemDeadbandMgtTrait`/`ItemSamplingMgtTrait`）仅在未接线的 `v3` 模块有示例实现。
 ///
-/// OPC DA 1.0 traits:
-/// - AsyncIoTrait: Basic asynchronous operations
-/// - SyncIoTrait: Basic synchronous operations
+/// # Trait 清单
 ///
-/// OPC DA 2.0 traits:
-/// - AsyncIo2Trait: Enhanced asynchronous operations
-/// - SyncIo2Trait: Enhanced synchronous operations
-/// - BrowseServerAddressSpaceTrait: Address space navigation
+/// Version independent: `CommonTrait`, `ConnectionPointContainerTrait`, `DataObjectTrait`
 ///
-/// OPC DA 3.0 traits:
-/// - AsyncIo3Trait: Advanced asynchronous operations
-/// - BrowseTrait: Enhanced browsing capabilities
-/// - ItemDeadbandMgtTrait: Item deadband management
-/// - ItemIoTrait: Direct item access
-/// - ItemSamplingMgtTrait: Sampling rate control
-///   - GroupStateMgt2Trait: Extended group management
+/// DA 1.0: `AsyncIoTrait`, `SyncIoTrait`
+/// DA 2.0: `AsyncIo2Trait`, `SyncIo2Trait`, `BrowseServerAddressSpaceTrait`
+/// DA 3.0: `AsyncIo3Trait`, `BrowseTrait`, `ItemDeadbandMgtTrait`, `ItemIoTrait`,
+///         `ItemSamplingMgtTrait`, `GroupStateMgt2Trait`
 ///
-/// Types:
-/// - GroupHandle: Type-safe handle for OPC groups
-/// - ItemHandle: Type-safe handle for OPC items
+/// # Types
+///
+/// - `GroupHandle`: type-safe handle for OPC groups
+/// - `ItemHandle`: type-safe handle for OPC items
 mod async_io;
 mod async_io2;
 mod async_io3;

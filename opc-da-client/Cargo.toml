@@ -29,6 +29,8 @@ workspace = true
 default = ["opc-da-backend"]
 opc-da-backend = []
 test-support = ["dep:mockall"]
+# End-to-end tests against a real OPC DA server (Matrikon/Kepware). See tests/e2e.rs.
+e2e = ["opc-da-backend"]
 
 [dependencies]
 # Core (always included)
@@ -44,3 +46,6 @@ windows-core = { workspace = true }
 
 # Test support: mock provider (optional)
 mockall = { version = "0.13.1", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

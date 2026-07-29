@@ -7,12 +7,15 @@ use crate::helpers::{
     filetime_to_string, format_hresult, opc_value_to_variant, quality_to_string, variant_to_string,
 };
 use crate::opc_da::errors::{OpcError, OpcResult};
+use crate::opc_da::typedefs::ServerStatus;
 use crate::opc_da::typedefs::{GroupHandle, ItemHandle};
-use crate::provider::{OpcValue, TagValue, WriteResult};
+use crate::provider::{OpcValue, ShutdownHandle, SubscriptionHandle, TagValue, WriteResult};
+use crate::subscription::{DataCallbackSink, ShutdownSink};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot};
+use windows::core::Interface as _;
 
 /// Represents a asynchronous request dispatched to the COM worker thread.
 pub enum ComRequest {
@@ -53,8 +56,154 @@ pub enum ComRequest {
         progress: Arc<AtomicUsize>,
         /// Shared mutex-protected vector storing discovered tag names incrementally.
         tags_sink: Arc<std::sync::Mutex<Vec<String>>>,
+        /// Filter: requested canonical data type (0 = any).
+        data_type: u16,
+        /// Filter: required access rights (0 = any).
+        access_rights: u32,
         /// One-shot channel to send back the complete tag discovery list.
         reply: oneshot::Sender<OpcResult<Vec<String>>>,
+    },
+    /// Request to query the current server status (`IOPCServer::GetStatus`).
+    GetServerStatus {
+        /// OPC server ProgID.
+        server: String,
+        /// One-shot channel to send back the server status.
+        reply: oneshot::Sender<OpcResult<ServerStatus>>,
+    },
+    /// Request to write values to multiple tags in one operation.
+    WriteTagValues {
+        /// OPC server ProgID.
+        server: String,
+        /// `(tag_id, value)` pairs to write.
+        items: Vec<(String, OpcValue)>,
+        /// One-shot channel to send back the per-tag write results.
+        reply: oneshot::Sender<OpcResult<Vec<WriteResult>>>,
+    },
+    /// Request to query item properties (`IOPCItemProperties`).
+    GetItemProperties {
+        /// OPC server ProgID.
+        server: String,
+        /// Fully qualified item ID.
+        tag_id: String,
+        /// One-shot channel to send back the item properties.
+        reply: oneshot::Sender<OpcResult<Vec<crate::provider::ItemProperty>>>,
+    },
+    /// Request to read values with a maximum-age constraint (`IOPCSyncIO2::ReadMaxAge`).
+    ReadMaxAge {
+        /// OPC server ProgID.
+        server: String,
+        /// Tag IDs to read.
+        tag_ids: Vec<String>,
+        /// Maximum acceptable value age in milliseconds.
+        max_age_ms: u32,
+        /// One-shot channel to send back the tag values.
+        reply: oneshot::Sender<OpcResult<Vec<TagValue>>>,
+    },
+    /// Request to write a value with quality/timestamp (`IOPCSyncIO2::WriteVQT`).
+    WriteTagValueVqt {
+        /// OPC server ProgID.
+        server: String,
+        /// Tag identifier to write.
+        tag_id: String,
+        /// Typed value to write.
+        value: OpcValue,
+        /// Optional OPC quality bits. `None` = leave unset.
+        quality: Option<u16>,
+        /// Optional timestamp. `None` = leave unset.
+        timestamp: Option<std::time::SystemTime>,
+        /// One-shot channel to send back the write result.
+        reply: oneshot::Sender<OpcResult<WriteResult>>,
+    },
+    /// Request to get a server-localized error string (`IOPCCommon::GetErrorString`).
+    GetErrorString {
+        /// OPC server ProgID.
+        server: String,
+        /// Raw HRESULT as a signed 32-bit integer.
+        hresult: i32,
+        /// One-shot channel to send back the error string.
+        reply: oneshot::Sender<OpcResult<String>>,
+    },
+    /// Request to drop a cached server connection (next op reconnects).
+    Disconnect {
+        /// OPC server ProgID.
+        server: String,
+        /// One-shot channel to acknowledge.
+        reply: oneshot::Sender<OpcResult<()>>,
+    },
+    /// Request to force a fresh server connection (replaces cached).
+    Reconnect {
+        /// OPC server ProgID.
+        server: String,
+        /// One-shot channel to send back the outcome.
+        reply: oneshot::Sender<OpcResult<()>>,
+    },
+    /// Request to subscribe to data changes (`IOPCDataCallback`).
+    Subscribe {
+        /// OPC server ProgID.
+        server: String,
+        /// Tag IDs to monitor.
+        tag_ids: Vec<String>,
+        /// Requested group update rate in milliseconds.
+        update_rate: u32,
+        /// One-shot channel to send back the subscription handle.
+        reply: oneshot::Sender<OpcResult<SubscriptionHandle>>,
+    },
+    /// Request to tear down a subscription by cookie.
+    Unsubscribe {
+        /// Connection cookie returned by `Subscribe`.
+        cookie: u32,
+        /// One-shot channel to acknowledge.
+        reply: oneshot::Sender<OpcResult<()>>,
+    },
+    /// Request to subscribe to server shutdown notifications (`IOPCShutdown`).
+    SubscribeShutdown {
+        /// OPC server ProgID.
+        server: String,
+        /// One-shot channel to send back the shutdown handle.
+        reply: oneshot::Sender<OpcResult<ShutdownHandle>>,
+    },
+    /// Request to tear down a shutdown subscription by cookie.
+    UnsubscribeShutdown {
+        /// Connection cookie returned by `SubscribeShutdown`.
+        cookie: u32,
+        /// One-shot channel to acknowledge.
+        reply: oneshot::Sender<OpcResult<()>>,
+    },
+    /// Request to change an active subscription's update rate (`IOPCGroupStateMgt::SetState`).
+    SetSubscriptionRate {
+        /// Connection cookie returned by `Subscribe`.
+        cookie: u32,
+        /// Requested update rate in milliseconds.
+        update_rate: u32,
+        /// One-shot channel to send back the server-revised update rate.
+        reply: oneshot::Sender<OpcResult<u32>>,
+    },
+    /// Request to set keep-alive on an active subscription (`IOPCGroupStateMgt2::SetKeepAlive`).
+    SetKeepAlive {
+        /// Connection cookie returned by `Subscribe`.
+        cookie: u32,
+        /// Requested keep-alive interval in milliseconds (0 = disable).
+        keep_alive_ms: u32,
+        /// One-shot channel to send back the server-revised keep-alive interval.
+        reply: oneshot::Sender<OpcResult<u32>>,
+    },
+    /// Request to set the server locale (`IOPCCommon::SetLocaleID`).
+    SetLocaleId {
+        /// OPC server ProgID.
+        server: String,
+        /// Windows LCID.
+        locale_id: u32,
+        /// One-shot channel to acknowledge.
+        reply: oneshot::Sender<OpcResult<()>>,
+    },
+    /// Request to set the client name (`IOPCCommon::SetClientName`).
+    SetClientName {
+        /// OPC server ProgID.
+        server: String,
+        /// Client application name.
+        name: String,
+        /// One-shot channel to acknowledge.
+        reply: oneshot::Sender<OpcResult<()>>,
     },
 }
 
@@ -62,6 +211,29 @@ pub enum ComRequest {
 ///
 /// Dispatches requests received over an `mpsc` channel to Windows COM interfaces while maintaining
 /// a persistent connection pool and transparently evicting stale connection handles on RPC errors.
+/// Worker-side tracked state for an active subscription.
+///
+/// Kept alive so the group is not removed and the sink is not released until `Unsubscribe`.
+struct SubscriptionEntry<C: ServerConnector + 'static> {
+    /// ProgID owning the group (used to look the server up in cache for `remove_group`).
+    server_name: String,
+    /// Server-assigned group handle (for `remove_group` on teardown).
+    server_handle: GroupHandle,
+    /// The persistent group owning the advised callback.
+    group: <<C as ServerConnector>::Server as ConnectedServer>::Group,
+    /// Held reference to the COM sink; dropping this field (on `Unsubscribe`) releases the
+    /// callback object. Intentionally never read — its lifetime *is* the point.
+    #[allow(dead_code)]
+    sink: windows::core::IUnknown,
+}
+
+/// Worker-side tracked state for a shutdown subscription (server-level; no group).
+struct ShutdownEntry {
+    server_name: String,
+    #[allow(dead_code)]
+    sink: windows::core::IUnknown,
+}
+
 pub struct ComWorker<C: ServerConnector + 'static> {
     /// Channel sender for dispatching requests to the worker loop.
     pub sender: mpsc::Sender<ComRequest>,
@@ -84,6 +256,7 @@ fn is_connection_error(err: &OpcError) -> bool {
 }
 
 impl<C: ServerConnector + 'static> ComWorker<C> {
+    #[allow(clippy::too_many_lines)]
     pub fn start(connector: Arc<C>) -> Result<Self, OpcError> {
         let (tx, mut rx) = mpsc::channel(32);
         let (init_tx, init_rx) = std::sync::mpsc::channel();
@@ -105,6 +278,8 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             };
 
             let mut cache: HashMap<String, C::Server> = HashMap::new();
+            let mut subscriptions: HashMap<u32, SubscriptionEntry<C>> = HashMap::new();
+            let mut shutdown_subscriptions: HashMap<u32, ShutdownEntry> = HashMap::new();
 
             while let Some(req) = rx.blocking_recv() {
                 match req {
@@ -112,7 +287,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                         let span = tracing::info_span!("opc.list_servers", host = %host);
                         let _enter = span.enter();
                         let start = std::time::Instant::now();
-                        let servers = connector.enumerate_servers();
+                        let servers = connector.enumerate_servers(&host);
                         if let Ok(s) = &servers {
                             tracing::info!(
                                 count = s.len(),
@@ -161,6 +336,8 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                         max_tags,
                         progress,
                         tags_sink,
+                        data_type,
+                        access_rights,
                         reply,
                     } => {
                         let result = Self::dispatch_with_retry(
@@ -169,9 +346,211 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                             &server,
                             |opc_server| {
                                 Self::handle_browse(
-                                    &server, max_tags, &progress, &tags_sink, opc_server,
+                                    &server,
+                                    max_tags,
+                                    &progress,
+                                    &tags_sink,
+                                    data_type,
+                                    access_rights,
+                                    opc_server,
                                 )
                             },
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::GetServerStatus { server, reply } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            <C::Server as ConnectedServer>::get_status,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::WriteTagValues {
+                        server,
+                        items,
+                        reply,
+                    } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            |opc_server| Self::handle_write_values(&server, &items, opc_server),
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::GetItemProperties {
+                        server,
+                        tag_id,
+                        reply,
+                    } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            |opc_server| opc_server.get_item_properties(&tag_id),
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::ReadMaxAge {
+                        server,
+                        tag_ids,
+                        max_age_ms,
+                        reply,
+                    } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            |opc_server| {
+                                Self::handle_read_max_age(&server, &tag_ids, max_age_ms, opc_server)
+                            },
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::WriteTagValueVqt {
+                        server,
+                        tag_id,
+                        value,
+                        quality,
+                        timestamp,
+                        reply,
+                    } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            |opc_server| {
+                                Self::handle_write_vqt(
+                                    &server, &tag_id, &value, quality, timestamp, opc_server,
+                                )
+                            },
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::GetErrorString {
+                        server,
+                        hresult,
+                        reply,
+                    } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            |opc_server| opc_server.get_error_string(hresult),
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::Disconnect { server, reply } => {
+                        tracing::debug!(server = %server, "Explicit disconnect: evicting cached connection");
+                        cache.remove(&server);
+                        let _ = reply.send(Ok(()));
+                    }
+                    ComRequest::Reconnect { server, reply } => {
+                        tracing::debug!(server = %server, "Explicit reconnect: re-establishing connection");
+                        cache.remove(&server);
+                        let result = connector.connect(&server).map(|srv| {
+                            cache.insert(server.clone(), srv);
+                        }).map_err(|e| {
+                            tracing::warn!(error = ?e, server = %server, "explicit reconnect failed");
+                            e
+                        });
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::Subscribe {
+                        server,
+                        tag_ids,
+                        update_rate,
+                        reply,
+                    } => {
+                        let result = Self::handle_subscribe_request(
+                            &connector,
+                            &mut cache,
+                            &mut subscriptions,
+                            &server,
+                            &tag_ids,
+                            update_rate,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::Unsubscribe { cookie, reply } => {
+                        let result = Self::handle_unsubscribe(cookie, &cache, &mut subscriptions);
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::SubscribeShutdown { server, reply } => {
+                        let result = (|| {
+                            let srv = match cache.entry(server.clone()) {
+                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                std::collections::hash_map::Entry::Vacant(e) => {
+                                    e.insert(connector.connect(&server)?)
+                                }
+                            };
+                            Self::handle_subscribe_shutdown(
+                                &server,
+                                srv,
+                                &mut shutdown_subscriptions,
+                            )
+                        })();
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::UnsubscribeShutdown { cookie, reply } => {
+                        let result = Self::handle_unsubscribe_shutdown(
+                            cookie,
+                            &cache,
+                            &mut shutdown_subscriptions,
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::SetSubscriptionRate {
+                        cookie,
+                        update_rate,
+                        reply,
+                    } => {
+                        let result = match subscriptions.get_mut(&cookie) {
+                            Some(entry) => entry.group.set_update_rate(update_rate),
+                            None => Err(OpcError::InvalidState(format!(
+                                "unknown subscription cookie {cookie}"
+                            ))),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::SetKeepAlive {
+                        cookie,
+                        keep_alive_ms,
+                        reply,
+                    } => {
+                        let result = match subscriptions.get_mut(&cookie) {
+                            Some(entry) => entry.group.set_keep_alive(keep_alive_ms),
+                            None => Err(OpcError::InvalidState(format!(
+                                "unknown subscription cookie {cookie}"
+                            ))),
+                        };
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::SetLocaleId {
+                        server,
+                        locale_id,
+                        reply,
+                    } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            |opc_server| opc_server.set_locale_id(locale_id),
+                        );
+                        let _ = reply.send(result);
+                    }
+                    ComRequest::SetClientName {
+                        server,
+                        name,
+                        reply,
+                    } => {
+                        let result = Self::dispatch_with_retry(
+                            &mut cache,
+                            &connector,
+                            &server,
+                            |opc_server| opc_server.set_client_name(&name),
                         );
                         let _ = reply.send(result);
                     }
@@ -219,6 +598,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             .map_err(|_| OpcError::Internal("COM worker shut down during request".into()))?
     }
 
+    #[allow(clippy::too_many_lines)]
     fn dispatch_with_retry<F, R>(
         cache: &mut HashMap<String, C::Server>,
         connector: &Arc<C>,
@@ -228,36 +608,48 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
     where
         F: Fn(&C::Server) -> OpcResult<R>,
     {
-        let server_ref = match cache.entry(server_name.to_string()) {
-            std::collections::hash_map::Entry::Occupied(e) => {
-                tracing::trace!(server = %server_name, "Cache hit");
-                e.into_mut()
+        const MAX_RECONNECT_ATTEMPTS: u32 = 3;
+        let mut last_connection_error: Option<OpcError> = None;
+        for attempt in 0..=MAX_RECONNECT_ATTEMPTS {
+            let server_ref = match cache.entry(server_name.to_string()) {
+                std::collections::hash_map::Entry::Occupied(e) => {
+                    tracing::trace!(server = %server_name, "Cache hit");
+                    e.into_mut()
+                }
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    tracing::debug!(server = %server_name, "Cache miss, connecting");
+                    let srv = connector.connect(server_name)?;
+                    tracing::info!(server = %server_name, "Connection established, added to pool");
+                    e.insert(srv)
+                }
+            };
+            match operation(server_ref) {
+                Err(e) if is_connection_error(&e) => {
+                    last_connection_error = Some(e);
+                    tracing::warn!(
+                        server = %server_name,
+                        attempt,
+                        "Connection error; evicting stale connection"
+                    );
+                    cache.remove(server_name);
+                    if attempt < MAX_RECONNECT_ATTEMPTS {
+                        // Exponential backoff between reconnect attempts: 50ms, 100ms, 200ms.
+                        let backoff_ms = 50u64 << attempt;
+                        tracing::debug!(
+                            server = %server_name,
+                            attempt,
+                            backoff_ms,
+                            "Backing off before reconnect"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    }
+                }
+                other => return other,
             }
-            std::collections::hash_map::Entry::Vacant(e) => {
-                tracing::debug!(server = %server_name, "Cache miss, connecting");
-                let srv = connector.connect(server_name)?;
-                tracing::info!(server = %server_name, "Connection established, added to pool");
-                e.insert(srv)
-            }
-        };
-
-        match operation(server_ref) {
-            Err(e) if is_connection_error(&e) => {
-                tracing::warn!(server = %server_name, error = ?e, "Evicting stale connection");
-                cache.remove(server_name);
-                tracing::debug!(server = %server_name, "Reconnecting");
-                let fresh_srv = connector.connect(server_name).map_err(|connect_e| {
-                    tracing::error!(error = ?connect_e, "Reconnect failed");
-                    connect_e
-                })?;
-                let fresh_ref = &fresh_srv;
-                let result = operation(fresh_ref);
-                tracing::info!(server = %server_name, "Reconnection successful, pool updated");
-                cache.insert(server_name.to_string(), fresh_srv);
-                result
-            }
-            other => other,
         }
+        Err(last_connection_error.unwrap_or_else(|| {
+            OpcError::Internal("dispatch_with_retry exhausted without executing operation".into())
+        }))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -405,6 +797,214 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn handle_read_max_age(
+        server_name: &str,
+        tag_ids: &[String],
+        max_age_ms: u32,
+        opc_server: &C::Server,
+    ) -> OpcResult<Vec<TagValue>> {
+        let span = tracing::info_span!(
+            "opc.read_max_age",
+            server = %server_name,
+            tag_count = tag_ids.len(),
+            max_age_ms
+        );
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
+        let mut revised_update_rate = 0u32;
+        let mut server_handle = GroupHandle::default();
+        let group = opc_server.add_group(
+            "opc-da-client-read-max-age",
+            true,
+            1000,
+            server_handle,
+            0,
+            0.0,
+            0,
+            &mut revised_update_rate,
+            &mut server_handle,
+        )?;
+
+        let item_id_wides: Vec<Vec<u16>> = tag_ids
+            .iter()
+            .map(|id| id.encode_utf16().chain(std::iter::once(0)).collect())
+            .collect();
+        let item_defs: Vec<tagOPCITEMDEF> = item_id_wides
+            .iter()
+            .enumerate()
+            .map(|(idx, wide)| tagOPCITEMDEF {
+                szAccessPath: windows::core::PWSTR::null(),
+                szItemID: windows::core::PWSTR(wide.as_ptr().cast_mut()),
+                bActive: windows::Win32::Foundation::TRUE,
+                #[allow(clippy::cast_possible_truncation)]
+                hClient: idx as u32,
+                dwBlobSize: 0,
+                pBlob: std::ptr::null_mut(),
+                vtRequestedDataType: 0,
+                wReserved: 0,
+            })
+            .collect();
+
+        let (results, errors) = group.add_items(&item_defs)?;
+        if results.len() as usize != tag_ids.len() || errors.len() as usize != tag_ids.len() {
+            if let Err(e) = opc_server.remove_group(server_handle, true) {
+                tracing::warn!(error = ?e, operation = "read_max_age", "Failed to remove OPC group during cleanup");
+            }
+            return Err(OpcError::Internal(
+                "OPC server returned mismatched result array sizes".into(),
+            ));
+        }
+
+        let mut handles: Vec<ItemHandle> = Vec::new();
+        let mut valid_tag_ids: Vec<String> = Vec::new();
+        for (idx, (item_result, error)) in results
+            .as_slice()
+            .iter()
+            .zip(errors.as_slice().iter())
+            .enumerate()
+        {
+            if error.is_ok() {
+                handles.push(ItemHandle(item_result.hServer));
+                valid_tag_ids.push(tag_ids[idx].clone());
+            } else {
+                let hint = format_hresult(*error);
+                tracing::warn!(
+                    tag = %tag_ids[idx],
+                    error = %hint,
+                    "read_max_age: add_items rejected tag"
+                );
+            }
+        }
+
+        let tag_values = if handles.is_empty() {
+            Vec::new()
+        } else {
+            group.read_max_age(&handles, max_age_ms, &valid_tag_ids)?
+        };
+
+        tracing::info!(
+            count = tag_values.len(),
+            elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "read_max_age completed"
+        );
+        if let Err(e) = opc_server.remove_group(server_handle, true) {
+            tracing::warn!(error = ?e, operation = "read_max_age", "Failed to remove OPC group during cleanup");
+        }
+        Ok(tag_values)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_write_vqt(
+        server_name: &str,
+        tag_id: &str,
+        value: &OpcValue,
+        quality: Option<u16>,
+        timestamp: Option<std::time::SystemTime>,
+        opc_server: &C::Server,
+    ) -> OpcResult<WriteResult> {
+        use crate::opc_da::com_utils::TryToNative as _;
+        let span = tracing::info_span!("opc.write_vqt", server = %server_name, tag = %tag_id);
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
+        let mut revised_update_rate = 0u32;
+        let mut server_handle = GroupHandle::default();
+        let group = opc_server.add_group(
+            "opc-da-client-write-vqt",
+            true,
+            1000,
+            GroupHandle(0),
+            0,
+            0.0,
+            0,
+            &mut revised_update_rate,
+            &mut server_handle,
+        )?;
+
+        let mut item_id_wide: Vec<u16> = tag_id.encode_utf16().chain(std::iter::once(0)).collect();
+        let item_def = tagOPCITEMDEF {
+            szAccessPath: windows::core::PWSTR::null(),
+            szItemID: windows::core::PWSTR(item_id_wide.as_mut_ptr()),
+            bActive: windows::Win32::Foundation::TRUE,
+            hClient: 0,
+            dwBlobSize: 0,
+            pBlob: std::ptr::null_mut(),
+            vtRequestedDataType: 0,
+            wReserved: 0,
+        };
+
+        let (results, errors) = group.add_items(&[item_def])?;
+        let item_res = results
+            .as_slice()
+            .first()
+            .ok_or_else(|| OpcError::Internal("Server returned empty item results".to_string()))?;
+        let item_err = errors
+            .as_slice()
+            .first()
+            .ok_or_else(|| OpcError::Internal("Server returned empty item errors".to_string()))?;
+
+        if item_err.is_err() {
+            let msg = format!("Failed to add tag: {}", format_hresult(*item_err));
+            if let Err(e) = opc_server.remove_group(server_handle, true) {
+                tracing::warn!(error = ?e, operation = "write_vqt", "Failed to remove OPC group during cleanup");
+            }
+            return Ok(WriteResult {
+                tag_id: tag_id.to_string(),
+                success: false,
+                error: Some(msg),
+            });
+        }
+
+        let item_handle = ItemHandle(item_res.hServer);
+        let variant = opc_value_to_variant(value);
+        let ft_time_stamp = match &timestamp {
+            Some(t) => t.try_to_native()?,
+            None => windows::Win32::Foundation::FILETIME::default(),
+        };
+        let vqt = crate::bindings::da::tagOPCITEMVQT {
+            vDataValue: variant,
+            bQualitySpecified: windows::core::BOOL::from(quality.is_some()),
+            wQuality: quality.unwrap_or(0),
+            wReserved: 0,
+            bTimeStampSpecified: windows::core::BOOL::from(timestamp.is_some()),
+            dwReserved: 0,
+            ftTimeStamp: ft_time_stamp,
+        };
+
+        let write_errors = group.write_vqt(&[item_handle], &[vqt])?;
+        let write_err = write_errors
+            .as_slice()
+            .first()
+            .ok_or_else(|| OpcError::Internal("Server returned empty write errors".to_string()))?;
+
+        let write_result = if write_err.is_ok() {
+            tracing::info!(
+                elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                "write_vqt completed"
+            );
+            WriteResult {
+                tag_id: tag_id.to_string(),
+                success: true,
+                error: None,
+            }
+        } else {
+            let msg = format_hresult(*write_err);
+            tracing::warn!(error = %msg, "write_vqt: server rejected write");
+            WriteResult {
+                tag_id: tag_id.to_string(),
+                success: false,
+                error: Some(msg),
+            }
+        };
+
+        if let Err(e) = opc_server.remove_group(server_handle, true) {
+            tracing::warn!(error = ?e, operation = "write_vqt", "Failed to remove OPC group during cleanup");
+        }
+        Ok(write_result)
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn handle_write(
         server_name: &str,
         tag_id: &str,
@@ -506,11 +1106,151 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         Ok(write_result)
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn handle_write_values(
+        server_name: &str,
+        items: &[(String, OpcValue)],
+        opc_server: &C::Server,
+    ) -> OpcResult<Vec<WriteResult>> {
+        let span = tracing::info_span!(
+            "opc.write_tag_values",
+            server = %server_name,
+            count = items.len()
+        );
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut revised_update_rate = 0u32;
+        let mut server_handle = GroupHandle::default();
+        let group = opc_server.add_group(
+            "opc-da-client-write-multi",
+            true,
+            1000,
+            GroupHandle(0),
+            0,
+            0.0,
+            0,
+            &mut revised_update_rate,
+            &mut server_handle,
+        )?;
+
+        let item_id_wides: Vec<Vec<u16>> = items
+            .iter()
+            .map(|(id, _)| id.encode_utf16().chain(std::iter::once(0)).collect())
+            .collect();
+        let item_defs: Vec<tagOPCITEMDEF> = item_id_wides
+            .iter()
+            .enumerate()
+            .map(|(idx, wide)| tagOPCITEMDEF {
+                szAccessPath: windows::core::PWSTR::null(),
+                szItemID: windows::core::PWSTR(wide.as_ptr().cast_mut()),
+                bActive: windows::Win32::Foundation::TRUE,
+                #[allow(clippy::cast_possible_truncation)]
+                hClient: idx as u32,
+                dwBlobSize: 0,
+                pBlob: std::ptr::null_mut(),
+                vtRequestedDataType: 0,
+                wReserved: 0,
+            })
+            .collect();
+
+        let (results, errors) = group.add_items(&item_defs)?;
+        if results.len() as usize != items.len() || errors.len() as usize != items.len() {
+            if let Err(e) = opc_server.remove_group(server_handle, true) {
+                tracing::warn!(error = ?e, operation = "write_tag_values", "Failed to remove OPC group during cleanup");
+            }
+            return Err(OpcError::Internal(
+                "OPC server returned mismatched result array sizes".into(),
+            ));
+        }
+
+        // Default every result to a failure; successful writes overwrite below.
+        let mut write_results: Vec<WriteResult> = items
+            .iter()
+            .map(|(id, _)| WriteResult {
+                tag_id: id.clone(),
+                success: false,
+                error: Some("Failed to add tag".to_string()),
+            })
+            .collect();
+
+        let mut handles: Vec<ItemHandle> = Vec::new();
+        let mut valid_indices: Vec<usize> = Vec::new();
+        for (idx, (item_result, error)) in results
+            .as_slice()
+            .iter()
+            .zip(errors.as_slice().iter())
+            .enumerate()
+        {
+            if error.is_ok() {
+                handles.push(ItemHandle(item_result.hServer));
+                valid_indices.push(idx);
+            } else {
+                write_results[idx].error =
+                    Some(format!("Failed to add tag: {}", format_hresult(*error)));
+            }
+        }
+
+        if handles.is_empty() {
+            if let Err(e) = opc_server.remove_group(server_handle, true) {
+                tracing::warn!(error = ?e, operation = "write_tag_values", "Failed to remove OPC group during cleanup");
+            }
+            return Ok(write_results);
+        }
+
+        let variants: Vec<_> = valid_indices
+            .iter()
+            .map(|&i| opc_value_to_variant(&items[i].1))
+            .collect();
+        let write_errors = group.write(&handles, &variants)?;
+        if write_errors.len() as usize != handles.len() {
+            if let Err(e) = opc_server.remove_group(server_handle, true) {
+                tracing::warn!(error = ?e, operation = "write_tag_values", "Failed to remove OPC group during cleanup");
+            }
+            return Err(OpcError::Internal(
+                "OPC server returned mismatched write error array size".into(),
+            ));
+        }
+
+        let write_errors_slice = write_errors.as_slice();
+        for (k, &i) in valid_indices.iter().enumerate() {
+            let we = &write_errors_slice[k];
+            if we.is_ok() {
+                write_results[i] = WriteResult {
+                    tag_id: items[i].0.clone(),
+                    success: true,
+                    error: None,
+                };
+            } else {
+                write_results[i] = WriteResult {
+                    tag_id: items[i].0.clone(),
+                    success: false,
+                    error: Some(format_hresult(*we)),
+                };
+            }
+        }
+
+        tracing::info!(
+            elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "write_tag_values completed"
+        );
+        if let Err(e) = opc_server.remove_group(server_handle, true) {
+            tracing::warn!(error = ?e, operation = "write_tag_values", "Failed to remove OPC group during cleanup");
+        }
+        Ok(write_results)
+    }
+
     fn handle_browse(
         server_name: &str,
         max_tags: usize,
         progress: &Arc<AtomicUsize>,
         tags_sink: &Arc<std::sync::Mutex<Vec<String>>>,
+        data_type: u16,
+        access_rights: u32,
         opc_server: &C::Server,
     ) -> OpcResult<Vec<String>> {
         let span = tracing::info_span!("opc.browse_tags", server = %server_name, max_tags);
@@ -521,7 +1261,12 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         let mut tags = Vec::new();
 
         if org == OPC_NS_FLAT.0 as u32 {
-            let string_iter = opc_server.browse_opc_item_ids(OPC_LEAF.0 as u32, Some(""), 0, 0)?;
+            let string_iter = opc_server.browse_opc_item_ids(
+                OPC_LEAF.0 as u32,
+                Some(""),
+                data_type,
+                access_rights,
+            )?;
             for tag_res in string_iter {
                 if tags.len() >= max_tags {
                     break;
@@ -534,7 +1279,12 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 progress.fetch_add(1, Ordering::Relaxed);
             }
         } else {
-            let use_flat = match opc_server.browse_opc_item_ids(OPC_FLAT.0 as u32, Some(""), 0, 0) {
+            let use_flat = match opc_server.browse_opc_item_ids(
+                OPC_FLAT.0 as u32,
+                Some(""),
+                data_type,
+                access_rights,
+            ) {
                 Ok(mut flat_enum) => match flat_enum.next() {
                     Some(Ok(first_tag)) => {
                         tracing::info!("OPC_FLAT browse supported — using fast flat enumeration");
@@ -579,7 +1329,16 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             };
 
             if !use_flat {
-                Self::browse_recursive(opc_server, &mut tags, max_tags, progress, tags_sink, 0)?;
+                Self::browse_recursive(
+                    opc_server,
+                    &mut tags,
+                    max_tags,
+                    progress,
+                    tags_sink,
+                    data_type,
+                    access_rights,
+                    0,
+                )?;
             }
         }
         tracing::info!(
@@ -590,12 +1349,15 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         Ok(tags)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn browse_recursive(
         server: &C::Server,
         tags: &mut Vec<String>,
         max_tags: usize,
         progress: &Arc<AtomicUsize>,
         tags_sink: &Arc<std::sync::Mutex<Vec<String>>>,
+        data_type: u16,
+        access_rights: u32,
         depth: usize,
     ) -> OpcResult<()> {
         const MAX_DEPTH: usize = 50;
@@ -606,7 +1368,8 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             return Ok(());
         }
 
-        let branch_enum = server.browse_opc_item_ids(OPC_BRANCH.0 as u32, Some(""), 0, 0)?;
+        let branch_enum =
+            server.browse_opc_item_ids(OPC_BRANCH.0 as u32, Some(""), data_type, access_rights)?;
 
         let branches: Vec<String> = branch_enum
             .filter_map(|r| match r {
@@ -618,7 +1381,8 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             })
             .collect();
 
-        let leaf_enum = server.browse_opc_item_ids(OPC_LEAF.0 as u32, Some(""), 0, 0)?;
+        let leaf_enum =
+            server.browse_opc_item_ids(OPC_LEAF.0 as u32, Some(""), data_type, access_rights)?;
         for tag_res in leaf_enum {
             if tags.len() >= max_tags {
                 return Ok(());
@@ -655,9 +1419,16 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 continue;
             }
 
-            if let Err(e) =
-                Self::browse_recursive(server, tags, max_tags, progress, tags_sink, depth + 1)
-            {
+            if let Err(e) = Self::browse_recursive(
+                server,
+                tags,
+                max_tags,
+                progress,
+                tags_sink,
+                data_type,
+                access_rights,
+                depth + 1,
+            ) {
                 tracing::warn!(error = ?e, "browse_recursive error");
             }
 
@@ -667,6 +1438,191 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             }
         }
 
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn handle_subscribe(
+        server_name: &str,
+        tag_ids: &[String],
+        update_rate: u32,
+        opc_server: &C::Server,
+        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+    ) -> OpcResult<SubscriptionHandle> {
+        let span = tracing::info_span!(
+            "opc.subscribe",
+            server = %server_name,
+            count = tag_ids.len(),
+            update_rate
+        );
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
+        let mut revised_update_rate = 0u32;
+        let mut server_handle = GroupHandle::default();
+        let group = opc_server.add_group(
+            "opc-da-client-subscribe",
+            true,
+            update_rate,
+            GroupHandle(0),
+            0,
+            0.0,
+            0,
+            &mut revised_update_rate,
+            &mut server_handle,
+        )?;
+
+        let item_id_wides: Vec<Vec<u16>> = tag_ids
+            .iter()
+            .map(|id| id.encode_utf16().chain(std::iter::once(0)).collect())
+            .collect();
+        let item_defs: Vec<tagOPCITEMDEF> = item_id_wides
+            .iter()
+            .enumerate()
+            .map(|(idx, wide)| tagOPCITEMDEF {
+                szAccessPath: windows::core::PWSTR::null(),
+                szItemID: windows::core::PWSTR(wide.as_ptr().cast_mut()),
+                bActive: windows::Win32::Foundation::TRUE,
+                #[allow(clippy::cast_possible_truncation)]
+                hClient: idx as u32,
+                dwBlobSize: 0,
+                pBlob: std::ptr::null_mut(),
+                vtRequestedDataType: 0,
+                wReserved: 0,
+            })
+            .collect();
+
+        let (results, errors) = group.add_items(&item_defs)?;
+        if results.len() as usize != tag_ids.len() || errors.len() as usize != tag_ids.len() {
+            let _ = opc_server.remove_group(server_handle, true);
+            return Err(OpcError::Internal(
+                "OPC server returned mismatched result array sizes".into(),
+            ));
+        }
+
+        let (tx, rx) = mpsc::channel(256);
+        let sink = DataCallbackSink {
+            tag_ids: tag_ids.to_vec(),
+            tx: std::sync::Mutex::new(tx),
+        };
+        // SAFETY: `cast` performs QueryInterface on a locally-owned COM object.
+        let sink_callback: crate::bindings::da::IOPCDataCallback = sink.into();
+        let sink_iunknown: windows::core::IUnknown = sink_callback.cast()?;
+        let cookie = match group.advise_data_callback(&sink_iunknown) {
+            Ok(c) => c,
+            Err(e) => {
+                // Cleanup the freshly-created group if advising the callback fails.
+                let _ = opc_server.remove_group(server_handle, true);
+                return Err(e);
+            }
+        };
+
+        subscriptions.insert(
+            cookie,
+            SubscriptionEntry {
+                server_name: server_name.to_string(),
+                server_handle,
+                group,
+                sink: sink_iunknown,
+            },
+        );
+
+        tracing::info!(
+            cookie,
+            elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "subscribe established"
+        );
+        Ok(SubscriptionHandle { cookie, rx })
+    }
+
+    fn handle_subscribe_request(
+        connector: &Arc<C>,
+        cache: &mut HashMap<String, C::Server>,
+        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+        server_name: &str,
+        tag_ids: &[String],
+        update_rate: u32,
+    ) -> OpcResult<SubscriptionHandle> {
+        let srv = match cache.entry(server_name.to_string()) {
+            std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(connector.connect(server_name)?)
+            }
+        };
+        Self::handle_subscribe(server_name, tag_ids, update_rate, srv, subscriptions)
+    }
+
+    fn handle_unsubscribe(
+        cookie: u32,
+        cache: &HashMap<String, C::Server>,
+        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+    ) -> OpcResult<()> {
+        let span = tracing::info_span!("opc.unsubscribe", cookie);
+        let _enter = span.enter();
+
+        let Some(entry) = subscriptions.remove(&cookie) else {
+            return Err(OpcError::InvalidState(format!(
+                "unknown subscription cookie {cookie}"
+            )));
+        };
+        // Unadvise first (group still alive), then remove the group.
+        if let Err(e) = entry.group.unadvise_data_callback(cookie) {
+            tracing::warn!(error = ?e, "unsubscribe: unadvise failed");
+        }
+        if let Some(server) = cache.get(&entry.server_name)
+            && let Err(e) = server.remove_group(entry.server_handle, true)
+        {
+            tracing::warn!(error = ?e, "unsubscribe: remove_group failed");
+        }
+        // entry drops here → sink IUnknown releases.
+        Ok(())
+    }
+
+    fn handle_subscribe_shutdown(
+        server_name: &str,
+        opc_server: &C::Server,
+        shutdown_subs: &mut HashMap<u32, ShutdownEntry>,
+    ) -> OpcResult<ShutdownHandle> {
+        let span = tracing::info_span!("opc.subscribe_shutdown", server = %server_name);
+        let _enter = span.enter();
+
+        let (tx, rx) = mpsc::channel(8);
+        let sink = ShutdownSink {
+            tx: std::sync::Mutex::new(tx),
+        };
+        // SAFETY: `cast` performs QueryInterface on a locally-owned COM object.
+        let sink_callback: crate::bindings::comn::IOPCShutdown = sink.into();
+        let sink_iunknown: windows::core::IUnknown = sink_callback.cast()?;
+        let cookie = opc_server.advise_shutdown(&sink_iunknown)?;
+        shutdown_subs.insert(
+            cookie,
+            ShutdownEntry {
+                server_name: server_name.to_string(),
+                sink: sink_iunknown,
+            },
+        );
+        tracing::info!(cookie, server = %server_name, "shutdown subscription established");
+        Ok(ShutdownHandle { cookie, rx })
+    }
+
+    fn handle_unsubscribe_shutdown(
+        cookie: u32,
+        cache: &HashMap<String, C::Server>,
+        shutdown_subs: &mut HashMap<u32, ShutdownEntry>,
+    ) -> OpcResult<()> {
+        let span = tracing::info_span!("opc.unsubscribe_shutdown", cookie);
+        let _enter = span.enter();
+
+        let Some(entry) = shutdown_subs.remove(&cookie) else {
+            return Err(OpcError::InvalidState(format!(
+                "unknown shutdown cookie {cookie}"
+            )));
+        };
+        if let Some(server) = cache.get(&entry.server_name)
+            && let Err(e) = server.unadvise_shutdown(cookie)
+        {
+            tracing::warn!(error = ?e, "unsubscribe_shutdown: unadvise failed");
+        }
         Ok(())
     }
 }
@@ -682,6 +1638,7 @@ mod tests {
     #![allow(
         clippy::single_char_pattern,
         clippy::cast_possible_wrap,
+        clippy::cast_possible_truncation,
         clippy::ptr_as_ptr,
         clippy::borrow_as_ptr,
         clippy::mixed_attributes_style,
@@ -721,41 +1678,50 @@ mod tests {
     impl ConnectedGroup for ConfigurableMockGroup {
         fn add_items(
             &self,
-            _items: &[tagOPCITEMDEF],
+            items: &[tagOPCITEMDEF],
         ) -> OpcResult<(
             RemoteArray<tagOPCITEMRESULT>,
             RemoteArray<windows::core::HRESULT>,
         )> {
             use windows::Win32::Foundation::S_OK;
 
-            let res = tagOPCITEMRESULT {
-                hServer: 1,
-                vtCanonicalDataType: 0,
-                wReserved: 0,
-                dwAccessRights: 1,
-                dwBlobSize: 0,
-                pBlob: std::ptr::null_mut(),
-            };
+            let n = items.len();
+            if n == 0 {
+                return Ok((RemoteArray::empty(), RemoteArray::empty()));
+            }
 
             let res_ptr = unsafe {
-                windows::Win32::System::Com::CoTaskMemAlloc(std::mem::size_of::<tagOPCITEMRESULT>())
+                windows::Win32::System::Com::CoTaskMemAlloc(
+                    std::mem::size_of::<tagOPCITEMRESULT>() * n,
+                )
             } as *mut tagOPCITEMRESULT;
-            unsafe {
-                std::ptr::write(res_ptr, res);
-            }
-            let res_array = RemoteArray::from_mut_ptr(res_ptr, 1);
-
             let err_ptr = unsafe {
-                windows::Win32::System::Com::CoTaskMemAlloc(std::mem::size_of::<
-                    windows::core::HRESULT,
-                >())
+                windows::Win32::System::Com::CoTaskMemAlloc(
+                    std::mem::size_of::<windows::core::HRESULT>() * n,
+                )
             } as *mut windows::core::HRESULT;
-            unsafe {
-                std::ptr::write(err_ptr, S_OK);
+            for i in 0..n {
+                // SAFETY: `i < n` and both arrays were allocated for `n` elements.
+                unsafe {
+                    std::ptr::write(
+                        res_ptr.add(i),
+                        tagOPCITEMRESULT {
+                            hServer: (i as u32) + 1,
+                            vtCanonicalDataType: 0,
+                            wReserved: 0,
+                            dwAccessRights: 1,
+                            dwBlobSize: 0,
+                            pBlob: std::ptr::null_mut(),
+                        },
+                    );
+                    std::ptr::write(err_ptr.add(i), S_OK);
+                }
             }
-            let err_array = RemoteArray::from_mut_ptr(err_ptr, 1);
 
-            Ok((res_array, err_array))
+            Ok((
+                RemoteArray::from_mut_ptr(res_ptr, n as u32),
+                RemoteArray::from_mut_ptr(err_ptr, n as u32),
+            ))
         }
 
         fn read(
@@ -771,7 +1737,7 @@ mod tests {
 
         fn write(
             &self,
-            _server_handles: &[crate::opc_da::typedefs::ItemHandle],
+            server_handles: &[crate::opc_da::typedefs::ItemHandle],
             _values: &[windows::Win32::System::Variant::VARIANT],
         ) -> OpcResult<RemoteArray<windows::core::HRESULT>> {
             if self
@@ -787,6 +1753,11 @@ mod tests {
                 });
             }
 
+            let n = server_handles.len();
+            if n == 0 {
+                return Ok(RemoteArray::empty());
+            }
+
             let hr = if self.state.should_fail_write.load(Ordering::Relaxed) {
                 windows::Win32::Foundation::E_FAIL
             } else {
@@ -794,15 +1765,18 @@ mod tests {
             };
 
             let hr_ptr = unsafe {
-                windows::Win32::System::Com::CoTaskMemAlloc(std::mem::size_of::<
-                    windows::core::HRESULT,
-                >())
+                windows::Win32::System::Com::CoTaskMemAlloc(
+                    std::mem::size_of::<windows::core::HRESULT>() * n,
+                )
             } as *mut windows::core::HRESULT;
-            unsafe {
-                std::ptr::write(hr_ptr, hr);
+            for i in 0..n {
+                // SAFETY: `i < n` and the array was allocated for `n` elements.
+                unsafe {
+                    std::ptr::write(hr_ptr.add(i), hr);
+                }
             }
 
-            Ok(RemoteArray::from_mut_ptr(hr_ptr, 1))
+            Ok(RemoteArray::from_mut_ptr(hr_ptr, n as u32))
         }
     }
 
@@ -863,7 +1837,7 @@ mod tests {
     impl ServerConnector for ConfigurableMockConnector {
         type Server = ConfigurableMockServer;
 
-        fn enumerate_servers(&self) -> OpcResult<Vec<String>> {
+        fn enumerate_servers(&self, _host: &str) -> OpcResult<Vec<String>> {
             if self.state.should_fail_connect.load(Ordering::Relaxed) {
                 Err(OpcError::Internal("Server enumeration failed".into()))
             } else {
@@ -961,7 +1935,7 @@ mod tests {
 
     impl ServerConnector for WorkerMockConnector {
         type Server = WorkerMockServer;
-        fn enumerate_servers(&self) -> OpcResult<Vec<String>> {
+        fn enumerate_servers(&self, _host: &str) -> OpcResult<Vec<String>> {
             Ok(vec!["Mock.Server.1".into()])
         }
         fn connect(&self, _server_name: &str) -> OpcResult<Self::Server> {
@@ -1076,7 +2050,7 @@ mod tests {
 
     impl ServerConnector for MismatchedConnector {
         type Server = MismatchedServer;
-        fn enumerate_servers(&self) -> OpcResult<Vec<String>> {
+        fn enumerate_servers(&self, _host: &str) -> OpcResult<Vec<String>> {
             Ok(vec![])
         }
         fn connect(&self, _server_name: &str) -> OpcResult<Self::Server> {
@@ -1134,6 +2108,38 @@ mod tests {
         assert_eq!(result.tag_id, "Random.Int4");
         assert!(result.success, "Write should be successful");
         assert!(result.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_worker_write_tag_values_multi() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let items = vec![
+            ("Tag1".to_string(), OpcValue::Int(1)),
+            ("Tag2".to_string(), OpcValue::Int(2)),
+            ("Tag3".to_string(), OpcValue::Int(3)),
+        ];
+
+        let results = worker
+            .send_request(|reply| ComRequest::WriteTagValues {
+                server: "Mock.Server.1".to_string(),
+                items,
+                reply,
+            })
+            .await
+            .expect("multi-write should succeed");
+
+        assert_eq!(results.len(), 3);
+        assert!(
+            results.iter().all(|r| r.success),
+            "all writes should succeed: {results:?}"
+        );
+        assert_eq!(results[0].tag_id, "Tag1");
+        assert_eq!(results[2].tag_id, "Tag3");
     }
 
     #[tokio::test]
@@ -1211,10 +2217,10 @@ mod tests {
             })
             .await;
 
-        assert_eq!(
-            state.connect_count.load(Ordering::Relaxed),
-            2,
-            "Stale connection should be evicted and reconnected"
+        assert!(
+            state.connect_count.load(Ordering::Relaxed) >= 2,
+            "Stale connection should be evicted and reconnected at least once: {}",
+            state.connect_count.load(Ordering::Relaxed)
         );
     }
 
@@ -1271,7 +2277,7 @@ mod tests {
         struct FailingInitConnector;
         impl ServerConnector for FailingInitConnector {
             type Server = ConfigurableMockServer;
-            fn enumerate_servers(&self) -> OpcResult<Vec<String>> {
+            fn enumerate_servers(&self, _host: &str) -> OpcResult<Vec<String>> {
                 Err(OpcError::Internal("COM subsystem failed".into()))
             }
             fn connect(&self, _name: &str) -> OpcResult<Self::Server> {
@@ -1295,6 +2301,213 @@ mod tests {
         assert!(
             result.is_err(),
             "ListServers request should fail when connector enumeration fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_server_status_routes_to_default() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::GetServerStatus {
+                server: "Mock.Server.1".to_string(),
+                reply,
+            })
+            .await;
+
+        // ConfigurableMockServer inherits ConnectedServer::get_status default impl,
+        // which returns NotImplemented — proves the request routes through the
+        // worker channel to the server facade (not silently dropped).
+        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_item_properties_routes_to_default() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::GetItemProperties {
+                server: "Mock.Server.1".to_string(),
+                tag_id: "Random.Int4".to_string(),
+                reply,
+            })
+            .await;
+
+        // ConfigurableMockServer inherits ConnectedServer::get_item_properties default
+        // impl (NotImplemented) — proves routing to the server facade.
+        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn test_read_max_age_routes_to_group_default() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::ReadMaxAge {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                max_age_ms: 1000,
+                reply,
+            })
+            .await;
+
+        // add_items succeeds on ConfigurableMockGroup, then read_max_age hits the
+        // ConnectedGroup default (NotImplemented) — proves routing into the group facade.
+        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn test_write_vqt_routes_to_group_default() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::WriteTagValueVqt {
+                server: "Mock.Server.1".to_string(),
+                tag_id: "T1".to_string(),
+                value: OpcValue::Int(7),
+                quality: Some(0xC0),
+                timestamp: None,
+                reply,
+            })
+            .await;
+
+        // add_items succeeds, then write_vqt hits the ConnectedGroup default (NotImplemented).
+        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_error_string_routes_to_default() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::GetErrorString {
+                server: "Mock.Server.1".to_string(),
+                hresult: 0,
+                reply,
+            })
+            .await;
+
+        // ConfigurableMockServer inherits ConnectedServer::get_error_string default (NotImplemented).
+        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn test_explicit_reconnect_re_establishes_connection() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        // initial op connects once
+        let _ = worker
+            .send_request(|reply| ComRequest::WriteTagValue {
+                server: "Mock.Server.1".to_string(),
+                tag_id: "T1".to_string(),
+                value: OpcValue::Int(1),
+                reply,
+            })
+            .await
+            .unwrap();
+        assert_eq!(state.connect_count.load(Ordering::Relaxed), 1);
+
+        // explicit reconnect forces a fresh connect (count -> 2)
+        let r = worker
+            .send_request(|reply| ComRequest::Reconnect {
+                server: "Mock.Server.1".to_string(),
+                reply,
+            })
+            .await;
+        assert!(r.is_ok(), "reconnect should succeed: {r:?}");
+        assert_eq!(
+            state.connect_count.load(Ordering::Relaxed),
+            2,
+            "explicit reconnect must re-establish the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_routes_to_advise() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 1000,
+                reply,
+            })
+            .await;
+
+        // add_group + add_items succeed on the mock; advise_data_callback then hits the
+        // ConnectedGroup default (NotImplemented) — proves routing into the group facade.
+        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_shutdown_routes_to_advise() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::SubscribeShutdown {
+                server: "Mock.Server.1".to_string(),
+                reply,
+            })
+            .await;
+
+        // ConfigurableMockServer inherits ConnectedServer::advise_shutdown default (NotImplemented).
+        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+    }
+
+    #[tokio::test]
+    async fn test_set_subscription_rate_unknown_cookie() {
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::SetSubscriptionRate {
+                cookie: 999,
+                update_rate: 500,
+                reply,
+            })
+            .await;
+
+        assert!(
+            matches!(result, Err(OpcError::InvalidState(_))),
+            "unknown cookie must yield InvalidState, got {result:?}"
         );
     }
 }

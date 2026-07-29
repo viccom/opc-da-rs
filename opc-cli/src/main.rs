@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
     // COM initialization is handled transparently by the OpcDaClient worker thread.
 
     // Create OPC client BEFORE entering TUI mode so init errors are visible
-    let opc_wrapper = Arc::new(OpcDaClient::new(ComConnector)?);
+    let opc_wrapper = Arc::new(OpcDaClient::new(ComConnector::default())?);
 
     // Setup terminal
     enable_raw_mode()?;

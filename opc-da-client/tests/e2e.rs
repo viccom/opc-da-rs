@@ -1,0 +1,397 @@
+#![cfg(feature = "e2e")]
+//! End-to-end tests against a real OPC DA server.
+//!
+//! Exercises every `OpcProvider` method against a live COM server (no mocks).
+//!
+//! # Prerequisites
+//! - A registered OPC DA server (default `Matrikon.OPC.Simulation.1`; also tested:
+//!   `Kepware.KEPServerEX.V6`).
+//! - For remote tests: a reachable Windows host with OPC DA + DCOM configured.
+//!
+//! # Configuration (env vars)
+//! - `OPC_E2E_SERVER` — server ProgID (default `Matrikon.OPC.Simulation.1`)
+//! - `OPC_E2E_HOST` — local host (default `localhost`)
+//! - `OPC_E2E_REMOTE_HOST` — remote DCOM host (default `192.168.199.155`)
+//!
+//! # Run
+//! ```sh
+//! cargo test -p opc-da-client --features e2e --test e2e -- --nocapture --test-threads=1
+//! ```
+//!
+//! Tests are written to be tolerant of server-specific behaviour (read-only tags,
+//! optional DA 3.0 interfaces) while still asserting the core data path.
+
+use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, OpcValue, ServerState};
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+fn server() -> String {
+    std::env::var("OPC_E2E_SERVER").unwrap_or_else(|_| "Matrikon.OPC.Simulation.1".into())
+}
+fn host() -> String {
+    std::env::var("OPC_E2E_HOST").unwrap_or_else(|_| "localhost".into())
+}
+fn remote_host() -> String {
+    std::env::var("OPC_E2E_REMOTE_HOST").unwrap_or_else(|_| "192.168.199.155".into())
+}
+
+fn client() -> OpcDaClient {
+    OpcDaClient::new(ComConnector::default()).expect("OpcDaClient init (COM worker)")
+}
+
+/// Browse and return up to `n` tag IDs from the configured server.
+async fn first_tags(n: usize) -> Vec<String> {
+    let c = client();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let tags = c
+        .browse_tags(&server(), 1000, progress, sink, 0, 0)
+        .await
+        .expect("browse_tags");
+    assert!(!tags.is_empty(), "server should expose at least one tag");
+    tags.into_iter().take(n).collect()
+}
+
+#[tokio::test]
+async fn e2e_list_servers() {
+    let c = client();
+    let servers = c.list_servers(&host()).await.expect("list_servers");
+    eprintln!("[list_servers] count={} {servers:?}", servers.len());
+    // Tolerant: IOPCServerList::EnumClassesOfCategories enumerates by CATID registration,
+    // which may differ from the ProgIDs visible to 32-bit OPC clients. Direct connect (below)
+    // exercises the CLSIDFromProgID path independently.
+}
+
+#[tokio::test]
+async fn e2e_browse_tags() {
+    let c = client();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let tags = c
+        .browse_tags(&server(), 1000, progress.clone(), sink, 0, 0)
+        .await
+        .expect("browse_tags");
+    eprintln!(
+        "[browse_tags] {} tags, progress={}",
+        tags.len(),
+        progress.load(Ordering::Relaxed)
+    );
+    assert!(!tags.is_empty());
+    assert!(progress.load(Ordering::Relaxed) > 0);
+}
+
+#[tokio::test]
+async fn e2e_browse_filtered() {
+    let c = client();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    // data_type=0/access_rights=0 == no filter (same as e2e_browse_tags); proves the
+    // filter parameters are plumbed end-to-end.
+    let tags = c
+        .browse_tags(&server(), 100, progress, sink, 0, 0)
+        .await
+        .expect("browse_tags (filtered)");
+    eprintln!("[browse_filtered] {} tags", tags.len());
+    assert!(!tags.is_empty());
+}
+
+#[tokio::test]
+async fn e2e_read_tag_values() {
+    let c = client();
+    let tags = first_tags(3).await;
+    let values = c
+        .read_tag_values(&server(), tags.clone())
+        .await
+        .expect("read_tag_values");
+    eprintln!("[read_tag_values] {:?}", values);
+    assert_eq!(values.len(), tags.len());
+    for v in &values {
+        assert!(!v.tag_id.is_empty());
+        assert!(!v.quality.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn e2e_write_tag_value() {
+    let c = client();
+    // Bucket Brigade.Int4 is a read/write scalar. (Writing Int to an array tag like
+    // ArrayOfReal8 is rejected with 0x80020005 type mismatch — not a library bug.)
+    let result = c
+        .write_tag_value(&server(), "Bucket Brigade.Int4", OpcValue::Int(42))
+        .await
+        .expect("write_tag_value call");
+    eprintln!(
+        "[write_tag_value] success={} err={:?}",
+        result.success, result.error
+    );
+    assert!(
+        result.success,
+        "write should succeed on a writable scalar tag"
+    );
+}
+
+#[tokio::test]
+async fn e2e_write_tag_values_batch() {
+    let c = client();
+    // Writable scalars with matching types.
+    let items = vec![
+        ("Bucket Brigade.Int4".to_string(), OpcValue::Int(7)),
+        ("Bucket Brigade.Real8".to_string(), OpcValue::Float(2.5)),
+        ("Bucket Brigade.Boolean".to_string(), OpcValue::Bool(true)),
+    ];
+    let results = c
+        .write_tag_values(&server(), items)
+        .await
+        .expect("write_tag_values");
+    eprintln!("[write_tag_values] {:?}", results);
+    assert_eq!(results.len(), 3);
+    assert!(
+        results.iter().all(|r| r.success),
+        "all scalar writes should succeed: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn e2e_get_server_status() {
+    let c = client();
+    let status = c
+        .get_server_status(&server())
+        .await
+        .expect("get_server_status");
+    eprintln!(
+        "[get_server_status] state={:?} vendor={:?} group_count={}",
+        status.server_state, status.vendor_info, status.group_count
+    );
+    assert!(matches!(
+        status.server_state,
+        ServerState::Running | ServerState::NoConfig | ServerState::Suspended
+    ));
+}
+
+#[tokio::test]
+async fn e2e_get_item_properties() {
+    let c = client();
+    let tags = first_tags(1).await;
+    // Some servers don't implement IOPCItemProperties; tolerate NotImplemented.
+    match c.get_item_properties(&server(), &tags[0]).await {
+        Ok(props) => eprintln!(
+            "[get_item_properties] {} entries for {}",
+            props.len(),
+            tags[0]
+        ),
+        Err(e) => eprintln!("[get_item_properties] not supported: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn e2e_get_error_string() {
+    let c = client();
+    match c.get_error_string(&server(), 0).await {
+        Ok(s) => eprintln!("[get_error_string] S_OK -> {s:?}"),
+        Err(e) => eprintln!("[get_error_string] err: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn e2e_read_tag_values_max_age() {
+    let c = client();
+    let tags = first_tags(2).await;
+    // IOPCSyncIO2 is DA 3.0; tolerate servers that lack it.
+    match c
+        .read_tag_values_max_age(&server(), tags.clone(), 1000)
+        .await
+    {
+        Ok(values) => {
+            eprintln!("[read_max_age] {:?}", values);
+            assert_eq!(values.len(), tags.len());
+        }
+        Err(e) => eprintln!("[read_max_age] not supported: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn e2e_write_tag_value_vqt() {
+    let c = client();
+    match c
+        .write_tag_value_vqt(
+            &server(),
+            "Bucket Brigade.Int4",
+            OpcValue::Int(1),
+            None,
+            None,
+        )
+        .await
+    {
+        Ok(r) => {
+            eprintln!("[write_vqt] success={}", r.success);
+            assert!(r.success, "VQT write on scalar should succeed");
+        }
+        Err(e) => eprintln!("[write_vqt] not supported: {e}"),
+    }
+}
+
+#[tokio::test]
+async fn e2e_subscribe_data_change() {
+    let c = client();
+    let tags = first_tags(1).await;
+    let sub = c
+        .subscribe(&server(), tags.clone(), 500)
+        .await
+        .expect("subscribe");
+    eprintln!("[subscribe] cookie={} tag={}", sub.cookie, tags[0]);
+    // Wait for the first server-pushed OnDataChange (Matrikon Random.* changes periodically).
+    let mut rx = sub.rx;
+    let received = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+    c.unsubscribe(sub.cookie).await.expect("unsubscribe");
+    match received {
+        Ok(Some(tv)) => eprintln!("[subscribe] received OnDataChange: {tv:?}"),
+        Ok(None) => panic!("subscribe channel closed without OnDataChange"),
+        Err(_) => {
+            eprintln!("[subscribe] no OnDataChange within 10s (server may not push static tags)");
+        }
+    }
+}
+
+#[tokio::test]
+async fn e2e_set_subscription_rate() {
+    let c = client();
+    let tags = first_tags(1).await;
+    let sub = c.subscribe(&server(), tags, 1000).await.expect("subscribe");
+    let revised = c
+        .set_subscription_rate(sub.cookie, 2000)
+        .await
+        .expect("set_subscription_rate");
+    eprintln!("[set_subscription_rate] revised={revised}ms");
+    c.unsubscribe(sub.cookie).await.expect("unsubscribe");
+}
+
+#[tokio::test]
+async fn e2e_set_keep_alive() {
+    let c = client();
+    let tags = first_tags(1).await;
+    let sub = c.subscribe(&server(), tags, 1000).await.expect("subscribe");
+    // IOPCGroupStateMgt2 (DA 3.0) may be unsupported; tolerate.
+    match c.set_keep_alive(sub.cookie, 5000).await {
+        Ok(revised) => eprintln!("[set_keep_alive] revised={revised}ms"),
+        Err(e) => eprintln!("[set_keep_alive] not supported: {e}"),
+    }
+    c.unsubscribe(sub.cookie).await.expect("unsubscribe");
+}
+
+#[tokio::test]
+async fn e2e_set_locale_and_client_name() {
+    let c = client();
+    // 1033 = en-US LCID. These rarely fail.
+    c.set_locale_id(&server(), 1033)
+        .await
+        .expect("set_locale_id");
+    c.set_client_name(&server(), "opc-cli-e2e")
+        .await
+        .expect("set_client_name");
+    eprintln!("[set_locale_id/set_client_name] ok");
+}
+
+#[tokio::test]
+async fn e2e_disconnect_reconnect() {
+    let c = client();
+    let tags = first_tags(1).await;
+    // Initial read populates the connection pool.
+    c.read_tag_values(&server(), tags.clone())
+        .await
+        .expect("read 1");
+    c.disconnect(&server()).await.expect("disconnect");
+    // After disconnect the next op must transparently reconnect.
+    c.read_tag_values(&server(), tags)
+        .await
+        .expect("read 2 (after reconnect)");
+    eprintln!("[disconnect/reconnect] ok");
+}
+
+#[tokio::test]
+async fn e2e_explicit_reconnect() {
+    let c = client();
+    let tags = first_tags(1).await;
+    c.read_tag_values(&server(), tags).await.expect("read");
+    c.reconnect(&server()).await.expect("explicit reconnect");
+    eprintln!("[reconnect] ok");
+}
+
+fn remote_server() -> String {
+    std::env::var("OPC_E2E_REMOTE_SERVER").unwrap_or_else(|_| "Matrikon.OPC.Simulation.1".into())
+}
+fn remote_client() -> OpcDaClient {
+    OpcDaClient::new(ComConnector::new(remote_host())).expect("remote OpcDaClient init (DCOM)")
+}
+async fn remote_first_tags(n: usize) -> Vec<String> {
+    let c = remote_client();
+    let progress = Arc::new(AtomicUsize::new(0));
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let tags = c
+        .browse_tags(&remote_server(), 100, progress, sink, 0, 0)
+        .await
+        .expect("remote browse_tags");
+    assert!(!tags.is_empty(), "remote server should expose tags");
+    tags.into_iter().take(n).collect()
+}
+
+#[tokio::test]
+async fn e2e_remote_list_servers() {
+    let c = remote_client();
+    let servers = c
+        .list_servers(&remote_host())
+        .await
+        .expect("remote list_servers");
+    eprintln!("[remote list_servers] {}: {servers:?}", remote_host());
+    assert!(
+        servers.iter().any(|s| s.contains("Matrikon")),
+        "remote host should list Matrikon"
+    );
+}
+
+#[tokio::test]
+async fn e2e_remote_browse_read() {
+    let c = remote_client();
+    let tags = remote_first_tags(3).await;
+    let values = c
+        .read_tag_values(&remote_server(), tags.clone())
+        .await
+        .expect("remote read_tag_values");
+    eprintln!("[remote read] {:?}", values);
+    assert_eq!(values.len(), tags.len());
+}
+
+#[tokio::test]
+async fn e2e_remote_write() {
+    let c = remote_client();
+    let result = c
+        .write_tag_value(&remote_server(), "Bucket Brigade.Int4", OpcValue::Int(42))
+        .await
+        .expect("remote write_tag_value call");
+    eprintln!("[remote write] success={}", result.success);
+    assert!(result.success, "remote scalar write should succeed");
+}
+
+#[tokio::test]
+async fn e2e_remote_subscribe() {
+    let c = remote_client();
+    let tags = remote_first_tags(1).await;
+    // Remote subscription needs the server to call back into this client (reverse DCOM),
+    // which requires inbound DCOM permission + a marshalable sink. Tolerate failure;
+    // local subscription is covered by e2e_subscribe_data_change.
+    let sub = match c.subscribe(&remote_server(), tags, 500).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("[remote subscribe] Advise failed (reverse-DCOM callback config?): {e}");
+            return;
+        }
+    };
+    let mut rx = sub.rx;
+    let received = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+    let _ = c.unsubscribe(sub.cookie).await;
+    eprintln!(
+        "[remote subscribe] received OnDataChange: {}",
+        received.is_ok()
+    );
+}

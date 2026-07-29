@@ -287,9 +287,8 @@ pub fn opc_value_to_variant(value: &OpcValue) -> VARIANT {
 ///
 /// Returns `Err` if the `ProgID` cannot be resolved or the server
 /// cannot be instantiated.
-pub fn connect_server(server_name: &str) -> OpcResult<crate::bindings::da::IOPCServer> {
-    // SAFETY: `server_wide` is null-terminated and lives until the end
-    // of this scope, so the PCWSTR pointer is valid for the duration of the call.
+pub fn connect_server(server_name: &str, host: &str) -> OpcResult<crate::bindings::da::IOPCServer> {
+    // SAFETY: `server_wide` is null-terminated and lives until the end of this scope.
     let clsid_raw = unsafe {
         let server_wide: Vec<u16> = server_name
             .encode_utf16()
@@ -301,24 +300,36 @@ pub fn connect_server(server_name: &str) -> OpcResult<crate::bindings::da::IOPCS
             ))
         })?
     };
-    // SAFETY: `opc_da::GUID` and `windows::core::GUID` are binary compatible
-    // 128-bit structures with identical field layouts (4-2-2-8 byte segments).
+    // SAFETY: `opc_da::GUID` and `windows::core::GUID` are binary compatible 128-bit structs.
     let clsid = unsafe { std::mem::transmute_copy(&clsid_raw) };
 
     let client = crate::opc_da::client::v2::Client;
-    let server = client
-        .create_server(clsid, crate::opc_da::typedefs::ClassContext::All)
-        .map_err(|e| {
-            let hint = if let OpcError::Com { ref source } = e {
-                friendly_com_hresult_hint(source.code())
-            } else {
-                None
-            }
-            .unwrap_or("Check DCOM configuration and server status");
-            tracing::error!(error = ?e, server = %server_name, hint, "create_server failed");
-            e
-        })?;
-    tracing::debug!(server = %server_name, "Connected to OPC DA server");
+    let is_remote = !host.is_empty() && !host.eq_ignore_ascii_case("localhost");
+    let server_result = if is_remote {
+        let info = crate::opc_da::typedefs::ServerInfo {
+            name: host.to_string(),
+            auth_info: crate::opc_da::typedefs::AuthInfo::default_dcom(),
+        };
+        tracing::debug!(server = %server_name, host = %host, "Connecting via remote DCOM (create_server2)");
+        client.create_server2(
+            clsid,
+            crate::opc_da::typedefs::ClassContext::All,
+            Some(info),
+        )
+    } else {
+        client.create_server(clsid, crate::opc_da::typedefs::ClassContext::All)
+    };
+    let server = server_result.map_err(|e| {
+        let hint = if let OpcError::Com { ref source } = e {
+            friendly_com_hresult_hint(source.code())
+        } else {
+            None
+        }
+        .unwrap_or("Check DCOM configuration and server status");
+        tracing::error!(error = ?e, server = %server_name, host = %host, hint, "create_server failed");
+        e
+    })?;
+    tracing::debug!(server = %server_name, host = %host, "Connected to OPC DA server");
     Ok(server.server)
 }
 

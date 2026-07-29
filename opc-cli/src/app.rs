@@ -307,7 +307,7 @@ impl App {
             let timeout_duration = std::time::Duration::from_secs(OPC_TIMEOUT_SECS);
             let result = tokio::time::timeout(
                 timeout_duration,
-                provider.browse_tags(&server, MAX_BROWSE_TAGS, progress, sink_for_task),
+                provider.browse_tags(&server, MAX_BROWSE_TAGS, progress, sink_for_task, 0, 0),
             )
             .await;
 
@@ -655,7 +655,7 @@ impl App {
                 }
                 Ok(Err(e)) => {
                     tracing::error!(error = %e, "Write tag values failed");
-                    self.add_message(format!("Browse error: {e:#}"));
+                    self.add_message(format!("Write error: {e:#}"));
                     self.current_screen = CurrentScreen::TagValues;
                     self.write_result_rx = None;
                 }
@@ -1003,8 +1003,15 @@ mod tests {
     async fn test_enter_selected_server_navigation() {
         let mut mock = MockOpcProvider::new();
         mock.expect_browse_tags()
-            .with(eq("S1"), eq(MAX_BROWSE_TAGS), always(), always())
-            .returning(|_, _, _, _| Ok(vec!["T1".into()]));
+            .with(
+                eq("S1"),
+                eq(MAX_BROWSE_TAGS),
+                always(),
+                always(),
+                always(),
+                always(),
+            )
+            .returning(|_, _, _, _, _, _| Ok(vec!["T1".into()]));
 
         let mut app = App::new(Arc::new(mock));
         app.servers = vec!["S1".into()];

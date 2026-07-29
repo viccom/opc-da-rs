@@ -47,14 +47,19 @@ mod opc_da;
 #[cfg(feature = "opc-da-backend")]
 mod backend;
 
+#[cfg(feature = "opc-da-backend")]
+mod subscription;
+
 // Stable public API
 pub use helpers::{format_hresult, friendly_com_hint};
-pub use provider::{OpcProvider, OpcValue, TagValue, WriteResult};
+pub use provider::{
+    ItemProperty, OpcProvider, OpcValue, ShutdownHandle, SubscriptionHandle, TagValue, WriteResult,
+};
 
 #[cfg(feature = "opc-da-backend")]
 pub use opc_da::{
     errors::{OpcError, OpcResult},
-    typedefs::{GroupHandle, ItemHandle},
+    typedefs::{GroupHandle, ItemHandle, ServerState, ServerStatus},
 };
 
 // Backend re-exports (conditional)

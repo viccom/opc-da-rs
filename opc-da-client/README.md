@@ -126,7 +126,9 @@ async fn main() -> anyhow::Result<()> {
         server_progid,
         100, // Max tags to discover
         progress,
-        sink
+        sink,
+        0, // data_type filter (0 = any)
+        0, // access_rights filter (0 = any)
     ).await?;
 
     println!("Found {} tags", discovered_tags.len());

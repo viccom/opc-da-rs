@@ -60,5 +60,4 @@ define the OPC Data Access 2.05a/3.0 COM interfaces.
 | `tracing` | MIT | https://github.com/tokio-rs/tracing |
 | `thiserror` | MIT OR Apache-2.0 | https://github.com/dtolnay/thiserror |
 | `anyhow` | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
-| `clap` | MIT OR Apache-2.0 | https://github.com/clap-rs/clap |
 | `mockall` | MIT OR Apache-2.0 | https://github.com/asomers/mockall |

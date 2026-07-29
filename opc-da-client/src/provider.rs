@@ -1,4 +1,5 @@
 use crate::opc_da::errors::OpcResult;
+use crate::opc_da::typedefs::ServerStatus;
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -81,6 +82,45 @@ pub struct WriteResult {
     pub error: Option<String>,
 }
 
+/// A single property of an OPC DA item (e.g. engineering unit, data type, access rights).
+///
+/// Returned by [`OpcProvider::get_item_properties`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ItemProperty {
+    /// Server-assigned property ID.
+    pub id: u32,
+    /// Human-readable property description (e.g. "EU", "Access Rights").
+    pub description: String,
+    /// Property data type as a `VT_*` value.
+    pub data_type: u16,
+    /// Current property value as a display string.
+    pub value: String,
+}
+
+/// Handle for an active OPC DA subscription.
+///
+/// Produced by [`OpcProvider::subscribe`]. The caller drains `rx` for server-pushed
+/// [`TagValue`]s and passes `cookie` to [`OpcProvider::unsubscribe`] to tear it down.
+#[derive(Debug)]
+pub struct SubscriptionHandle {
+    /// Connection cookie from `IConnectionPoint::Advise`; pass to `unsubscribe`.
+    pub cookie: u32,
+    /// Receiver for server-pushed tag values (`rx.recv().await`).
+    pub rx: tokio::sync::mpsc::Receiver<TagValue>,
+}
+
+/// Handle for a server-shutdown notification subscription.
+///
+/// Produced by [`OpcProvider::subscribe_shutdown`]. The receiver yields the shutdown reason
+/// string when the server calls `IOPCShutdown::ShutdownRequest`.
+#[derive(Debug)]
+pub struct ShutdownHandle {
+    /// Connection cookie from `IConnectionPoint::Advise`; pass to `unsubscribe_shutdown`.
+    pub cookie: u32,
+    /// Receiver for the shutdown reason string(s).
+    pub rx: tokio::sync::mpsc::Receiver<String>,
+}
+
 /// Async trait for OPC DA operations.
 ///
 /// This is the stable public API. Backend implementations provide
@@ -106,6 +146,8 @@ pub trait OpcProvider: Send + Sync {
         max_tags: usize,
         progress: Arc<AtomicUsize>,
         tags_sink: Arc<std::sync::Mutex<Vec<String>>>,
+        data_type: u16,
+        access_rights: u32,
     ) -> OpcResult<Vec<String>>;
 
     /// Read current values for the given tag IDs.
@@ -127,4 +169,126 @@ pub trait OpcProvider: Send + Sync {
         tag_id: &str,
         value: OpcValue,
     ) -> OpcResult<WriteResult>;
+
+    /// Query the current status of an OPC DA server.
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails or `IOPCServer::GetStatus` fails.
+    async fn get_server_status(&self, server: &str) -> OpcResult<ServerStatus>;
+
+    /// Write typed values to multiple OPC DA tags in one operation.
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails or group creation fails entirely.
+    /// Per-tag failures are reported as individual `WriteResult` entries, not as errors.
+    async fn write_tag_values(
+        &self,
+        server: &str,
+        items: Vec<(String, OpcValue)>,
+    ) -> OpcResult<Vec<WriteResult>>;
+
+    /// Query the available properties of an OPC DA item (EU, data type, access rights, ...).
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails or `IOPCItemProperties` is unsupported.
+    async fn get_item_properties(&self, server: &str, tag_id: &str)
+    -> OpcResult<Vec<ItemProperty>>;
+
+    /// Read current values with a maximum-age constraint (`IOPCSyncIO2::ReadMaxAge`).
+    ///
+    /// `max_age_ms` is the maximum acceptable age (ms) of a cached value before the server
+    /// re-reads from the device. Applies the same `max_age_ms` to every requested tag.
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails, the server lacks `IOPCSyncIO2`, or no items validate.
+    async fn read_tag_values_max_age(
+        &self,
+        server: &str,
+        tag_ids: Vec<String>,
+        max_age_ms: u32,
+    ) -> OpcResult<Vec<TagValue>>;
+
+    /// Write a value with optional quality and timestamp (`IOPCSyncIO2::WriteVQT`).
+    ///
+    /// Used for historical back-fill and test injection where the caller controls the value's
+    /// quality and/or timestamp. `None` fields are left unset (server keeps its own).
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails, the server lacks `IOPCSyncIO2`, or the tag cannot be added.
+    async fn write_tag_value_vqt(
+        &self,
+        server: &str,
+        tag_id: &str,
+        value: OpcValue,
+        quality: Option<u16>,
+        timestamp: Option<std::time::SystemTime>,
+    ) -> OpcResult<WriteResult>;
+
+    /// Get a server-localized error description for an HRESULT (`IOPCCommon::GetErrorString`).
+    ///
+    /// `hresult` is the raw HRESULT as a signed 32-bit integer. Useful for vendor-specific
+    /// codes not covered by `friendly_com_hint`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails or `IOPCCommon` is unsupported.
+    async fn get_error_string(&self, server: &str, hresult: i32) -> OpcResult<String>;
+
+    /// Subscribe to data-change notifications for a set of tags (`IOPCDataCallback`).
+    ///
+    /// The server pushes updated values at roughly `update_rate`-ms intervals (or on change).
+    /// The sink forwards non-blocking; drain `rx` promptly to avoid dropped updates.
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails, the server lacks subscription support,
+    /// or items cannot be added.
+    async fn subscribe(
+        &self,
+        server: &str,
+        tag_ids: Vec<String>,
+        update_rate: u32,
+    ) -> OpcResult<SubscriptionHandle>;
+
+    /// Tear down a subscription previously returned by [`Self::subscribe`].
+    ///
+    /// # Errors
+    /// Returns `Err` if the cookie is unknown or server teardown fails.
+    async fn unsubscribe(&self, cookie: u32) -> OpcResult<()>;
+
+    /// Subscribe to server shutdown notifications (`IOPCShutdown`).
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails or the server lacks shutdown notification support.
+    async fn subscribe_shutdown(&self, server: &str) -> OpcResult<ShutdownHandle>;
+
+    /// Tear down a shutdown subscription by cookie.
+    ///
+    /// # Errors
+    /// Returns `Err` if the cookie is unknown or server teardown fails.
+    async fn unsubscribe_shutdown(&self, cookie: u32) -> OpcResult<()>;
+
+    /// Adjust the update rate of an active subscription at runtime (`IOPCGroupStateMgt::SetState`).
+    ///
+    /// `cookie` is from [`Self::subscribe`]. Returns the server-revised update rate in ms.
+    ///
+    /// # Errors
+    /// Returns `Err` if the cookie is unknown or `SetState` fails.
+    async fn set_subscription_rate(&self, cookie: u32, update_rate: u32) -> OpcResult<u32>;
+
+    /// Set the keep-alive interval for an active subscription (`IOPCGroupStateMgt2::SetKeepAlive`).
+    ///
+    /// # Errors
+    /// Returns `Err` if the cookie is unknown or `SetKeepAlive` fails.
+    async fn set_keep_alive(&self, cookie: u32, keep_alive_ms: u32) -> OpcResult<u32>;
+
+    /// Set the server locale for string localization (`IOPCCommon::SetLocaleID`).
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails or `IOPCCommon` is unsupported.
+    async fn set_locale_id(&self, server: &str, locale_id: u32) -> OpcResult<()>;
+
+    /// Set the client application name (`IOPCCommon::SetClientName`).
+    ///
+    /// # Errors
+    /// Returns `Err` if the connection fails or `IOPCCommon` is unsupported.
+    async fn set_client_name(&self, server: &str, name: &str) -> OpcResult<()>;
 }
