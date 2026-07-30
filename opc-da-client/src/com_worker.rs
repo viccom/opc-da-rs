@@ -1,7 +1,7 @@
 use crate::backend::connector::{ConnectedGroup, ConnectedServer, ServerConnector};
 use crate::bindings::da::{
-    OPC_BRANCH, OPC_BROWSE_DOWN, OPC_BROWSE_UP, OPC_DS_DEVICE, OPC_FLAT, OPC_LEAF, OPC_NS_FLAT,
-    tagOPCITEMDEF,
+    OPC_BRANCH, OPC_BROWSE_DOWN, OPC_BROWSE_TO, OPC_BROWSE_UP, OPC_DS_DEVICE, OPC_FLAT, OPC_LEAF,
+    OPC_NS_FLAT, tagOPCITEMDEF,
 };
 use crate::helpers::{
     filetime_to_string, format_hresult, opc_value_to_variant, quality_to_string, variant_to_string,
@@ -10,7 +10,10 @@ use crate::opc_da::com_utils::clear_item_states;
 use crate::opc_da::errors::{OpcError, OpcResult};
 use crate::opc_da::typedefs::ServerStatus;
 use crate::opc_da::typedefs::{GroupHandle, ItemHandle};
-use crate::provider::{OpcValue, ShutdownHandle, SubscriptionHandle, TagValue, WriteResult};
+use crate::provider::{
+    BranchNode, BrowseChildren, LeafNode, OpcValue, ShutdownHandle, SubscriptionHandle, TagValue,
+    WriteResult,
+};
 use crate::subscription::{DataCallbackSink, ShutdownSink};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,6 +69,19 @@ pub enum ComRequest {
         access_rights: u32,
         /// One-shot channel to send back the complete tag discovery list.
         reply: oneshot::Sender<OpcResult<Vec<String>>>,
+    },
+    /// Request to browse one namespace level (direct child branches + leaves).
+    BrowseChildren {
+        /// OPC server ProgID.
+        server: String,
+        /// Branch path to browse (`None` or empty = root).
+        branch_path: Option<String>,
+        /// Filter: requested canonical data type (0 = any).
+        data_type: u16,
+        /// Filter: required access rights (0 = any).
+        access_rights: u32,
+        /// One-shot channel to send back the direct children.
+        reply: oneshot::Sender<OpcResult<BrowseChildren>>,
     },
     /// Request to query the current server status (`IOPCServer::GetStatus`).
     GetServerStatus {
@@ -616,6 +632,29 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                                         max_tags,
                                         &progress,
                                         &tags_sink,
+                                        data_type,
+                                        access_rights,
+                                        opc_server,
+                                    )
+                                },
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::BrowseChildren {
+                            server,
+                            branch_path,
+                            data_type,
+                            access_rights,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| {
+                                    Self::handle_browse_children(
+                                        &server,
+                                        branch_path.as_deref(),
                                         data_type,
                                         access_rights,
                                         opc_server,
@@ -1798,6 +1837,82 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         Ok(())
     }
 
+    /// Browse one namespace level: the direct child branches + leaves under
+    /// `branch_path` (`None`/empty = root). Used by the desktop tree browser.
+    ///
+    /// Jumps to the target branch with `OPC_BROWSE_TO` (absolute, self-contained —
+    /// the connection cursor is shared, but every call resets to root afterwards,
+    /// so no call depends on a prior call's position). Child branch ids are built
+    /// as `parent + "." + name`; child leaves are resolved to full item IDs via
+    /// `GetItemID`.
+    fn handle_browse_children(
+        server_name: &str,
+        branch_path: Option<&str>,
+        data_type: u16,
+        access_rights: u32,
+        opc_server: &C::Server,
+    ) -> OpcResult<BrowseChildren> {
+        let span = tracing::info_span!(
+            "opc.browse_children",
+            server = %server_name,
+            branch = ?branch_path
+        );
+        let _enter = span.enter();
+
+        let parent = branch_path.unwrap_or("");
+        // Absolute jump to the target branch (root if empty).
+        opc_server.change_browse_position(OPC_BROWSE_TO.0 as u32, parent)?;
+
+        // Child branches: enumerator yields relative names; build full ids.
+        let mut branches = Vec::new();
+        let branch_enum = opc_server.browse_opc_item_ids(
+            OPC_BRANCH.0 as u32,
+            Some(""),
+            data_type,
+            access_rights,
+        )?;
+        for res in branch_enum {
+            let name = res?;
+            let id = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}.{name}")
+            };
+            branches.push(BranchNode { id, name });
+        }
+
+        // Child leaves: resolve each browse name to its full item ID.
+        let mut leaves = Vec::new();
+        let leaf_enum = opc_server.browse_opc_item_ids(
+            OPC_LEAF.0 as u32,
+            Some(""),
+            data_type,
+            access_rights,
+        )?;
+        for res in leaf_enum {
+            let name = res?;
+            let item_id = match opc_server.get_item_id(&name) {
+                Ok(id) => id,
+                Err(e) => {
+                    tracing::warn!(
+                        browse_name = %name,
+                        error = ?e,
+                        "get_item_id failed, using browse name as fallback"
+                    );
+                    name.clone()
+                }
+            };
+            leaves.push(LeafNode { item_id, name });
+        }
+
+        // Reset cursor to root so the shared connection is left clean for the next op.
+        if let Err(e) = opc_server.change_browse_position(OPC_BROWSE_TO.0 as u32, "") {
+            tracing::warn!(error = ?e, "failed to reset browse position to root");
+        }
+
+        Ok(BrowseChildren { branches, leaves })
+    }
+
     /// Build the `IOPCDataCallback` sink, cast it to `IUnknown`, and advise it on `group`.
     ///
     /// Returns the sink `IUnknown` (the caller must retain it for the subscription's lifetime —
@@ -2287,13 +2402,19 @@ mod tests {
         clippy::mixed_attributes_style,
         clippy::unreadable_literal,
         clippy::undocumented_unsafe_blocks,
-        clippy::manual_assert
+        clippy::manual_assert,
+        clippy::inline_always,
+        clippy::ref_as_ptr,
+        clippy::useless_conversion,
+        clippy::needless_range_loop
     )]
     use super::*;
     use crate::backend::connector::{
         ConnectedGroup, ConnectedServer, RemoteArray, ServerConnector, StringIterator,
     };
     use crate::bindings::da::{tagOPCDATASOURCE, tagOPCITEMDEF, tagOPCITEMRESULT, tagOPCITEMSTATE};
+    use windows::Win32::System::Com::{IEnumString, IEnumString_Impl};
+    use windows::core::{PWSTR, implement};
 
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -2326,6 +2447,12 @@ mod tests {
         /// P0-1 增强：前 N 次 `advise_data_callback` 返回 `0x800706BA`（RPC server unavailable），
         /// 模拟死代理（server 进程死），驱动 rebuild 的重连路径测试。每次失败 dec；到 0 走正常 advise。
         advise_fail_remaining: AtomicUsize,
+        /// `browse_children` 测试：`OPC_BRANCH` 枚举返回的子 branch 名。
+        browse_branches: std::sync::Mutex<Vec<String>>,
+        /// `browse_children` 测试：`OPC_LEAF` 枚举返回的子 leaf 名。
+        browse_leaves: std::sync::Mutex<Vec<String>>,
+        /// `browse_children` 测试：最后一次 `OPC_BROWSE_TO` 设定的位置（验证复位到 root）。
+        last_browse_position: std::sync::Mutex<String>,
     }
 
     struct ConfigurableMockConnector {
@@ -2339,6 +2466,64 @@ mod tests {
     impl Drop for ConfigurableMockServer {
         fn drop(&mut self) {
             self.state.server_drop_count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Test-only `IEnumString` backed by a `Vec<String>`, so mock
+    /// `browse_opc_item_ids` can return a real iterable `StringIterator`.
+    #[allow(clippy::ref_as_ptr, clippy::inline_always)]
+    #[implement(IEnumString)]
+    struct MockEnumString {
+        items: Vec<String>,
+        index: AtomicUsize,
+    }
+
+    impl IEnumString_Impl for MockEnumString_Impl {
+        fn Next(
+            &self,
+            celt: u32,
+            rgelt: *mut PWSTR,
+            pceltfetched: *mut u32,
+        ) -> windows::core::HRESULT {
+            let mut fetched = 0;
+            let index = self.index.load(Ordering::Relaxed);
+            // SAFETY: caller-provided output buffer of `celt` slots.
+            let rgelt = unsafe { std::slice::from_raw_parts_mut(rgelt, celt as usize) };
+            for i in 0..celt as usize {
+                if index + i < self.items.len() {
+                    let s = &self.items[index + i];
+                    let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+                    // SAFETY: allocate via the COM allocator; StringIterator frees with CoTaskMemFree.
+                    let ptr = unsafe { windows::Win32::System::Com::CoTaskMemAlloc(w.len() * 2) };
+                    unsafe { std::ptr::copy_nonoverlapping(w.as_ptr(), ptr as *mut u16, w.len()) };
+                    rgelt[i] = PWSTR(ptr as *mut u16);
+                    fetched += 1;
+                } else {
+                    break;
+                }
+            }
+            self.index.store(index + fetched, Ordering::Relaxed);
+            if !pceltfetched.is_null() {
+                // SAFETY: caller-provided optional fetched counter.
+                unsafe { *pceltfetched = fetched as u32 };
+            }
+            if fetched == celt as usize {
+                windows::Win32::Foundation::S_OK.into()
+            } else {
+                windows::Win32::Foundation::S_FALSE.into()
+            }
+        }
+        fn Skip(&self, _celt: u32) -> windows::core::HRESULT {
+            windows::Win32::Foundation::E_NOTIMPL.into()
+        }
+        fn Reset(&self) -> windows::core::Result<()> {
+            self.index.store(0, Ordering::Relaxed);
+            Ok(())
+        }
+        fn Clone(&self) -> windows::core::Result<IEnumString> {
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_NOTIMPL,
+            ))
         }
     }
 
@@ -2509,20 +2694,35 @@ mod tests {
 
         fn browse_opc_item_ids(
             &self,
-            _browse_type: u32,
+            browse_type: u32,
             _filter: Option<&str>,
             _data_type: u16,
             _access_rights: u32,
         ) -> OpcResult<StringIterator> {
-            Err(OpcError::NotImplemented("mock".into()))
+            let names = if browse_type == OPC_BRANCH.0 as u32 {
+                self.state.browse_branches.lock().unwrap().clone()
+            } else if browse_type == OPC_LEAF.0 as u32 {
+                self.state.browse_leaves.lock().unwrap().clone()
+            } else {
+                Vec::new()
+            };
+            let enum_str: IEnumString = MockEnumString {
+                items: names,
+                index: AtomicUsize::new(0),
+            }
+            .into();
+            Ok(StringIterator::new(enum_str))
         }
 
-        fn change_browse_position(&self, _direction: u32, _name: &str) -> OpcResult<()> {
+        fn change_browse_position(&self, direction: u32, name: &str) -> OpcResult<()> {
+            if direction == OPC_BROWSE_TO.0 as u32 {
+                *self.state.last_browse_position.lock().unwrap() = name.to_string();
+            }
             Ok(())
         }
 
-        fn get_item_id(&self, _item_name: &str) -> OpcResult<String> {
-            Ok(String::new())
+        fn get_item_id(&self, item_name: &str) -> OpcResult<String> {
+            Ok(item_name.to_string())
         }
 
         fn add_group(
@@ -2865,6 +3065,77 @@ mod tests {
         );
         assert_eq!(results[0].tag_id, "Tag1");
         assert_eq!(results[2].tag_id, "Tag3");
+    }
+
+    #[tokio::test]
+    async fn test_browse_children_returns_branches_and_leaves() {
+        // browse_children(None) = root：返回 mock 预设的 branches + leaves，
+        // leaf 经 get_item_id 解析，游标复位到 root。
+        let state = Arc::new(MockState::default());
+        *state.browse_branches.lock().unwrap() =
+            vec!["Random".to_string(), "Bucket Brigade".to_string()];
+        *state.browse_leaves.lock().unwrap() = vec!["_System.Time".to_string()];
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let children = worker
+            .send_request(|reply| ComRequest::BrowseChildren {
+                server: "Mock.Server.1".to_string(),
+                branch_path: None,
+                data_type: 0,
+                access_rights: 0,
+                reply,
+            })
+            .await
+            .expect("browse_children(root) should succeed");
+
+        // Root parent = ""，故 branch id == name。
+        assert_eq!(children.branches.len(), 2);
+        assert_eq!(children.branches[0].name, "Random");
+        assert_eq!(children.branches[0].id, "Random");
+        assert_eq!(children.branches[1].name, "Bucket Brigade");
+        assert_eq!(children.branches[1].id, "Bucket Brigade");
+        // Leaf：mock get_item_id 返回 name 本身。
+        assert_eq!(children.leaves.len(), 1);
+        assert_eq!(children.leaves[0].name, "_System.Time");
+        assert_eq!(children.leaves[0].item_id, "_System.Time");
+        // 游标必须复位到 root（共享连接，不能留给下次操作一个偏移位置）。
+        assert_eq!(
+            *state.last_browse_position.lock().unwrap(),
+            "",
+            "browse cursor must be reset to root after browse_children"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_browse_children_builds_nested_branch_ids() {
+        // branch_path = "Random"：子 branch id 应为 "Random.<name>"（parent + 分隔符 + name）。
+        let state = Arc::new(MockState::default());
+        *state.browse_branches.lock().unwrap() = vec!["Int1".to_string(), "Real4".to_string()];
+        let connector = Arc::new(ConfigurableMockConnector { state });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let children = worker
+            .send_request(|reply| ComRequest::BrowseChildren {
+                server: "Mock.Server.1".to_string(),
+                branch_path: Some("Random".to_string()),
+                data_type: 0,
+                access_rights: 0,
+                reply,
+            })
+            .await
+            .expect("browse_children(Random) should succeed");
+
+        assert_eq!(children.branches[0].name, "Int1");
+        assert_eq!(children.branches[0].id, "Random.Int1");
+        assert_eq!(children.branches[1].name, "Real4");
+        assert_eq!(children.branches[1].id, "Random.Real4");
     }
 
     #[tokio::test]

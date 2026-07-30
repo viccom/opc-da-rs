@@ -3,7 +3,8 @@ use crate::com_worker::{ComRequest, ComWorker};
 use crate::opc_da::errors::OpcResult;
 use crate::opc_da::typedefs::ServerStatus;
 use crate::provider::{
-    ItemProperty, OpcProvider, OpcValue, ShutdownHandle, SubscriptionHandle, TagValue, WriteResult,
+    BrowseChildren, ItemProperty, OpcProvider, OpcValue, ShutdownHandle, SubscriptionHandle,
+    TagValue, WriteResult,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -99,6 +100,25 @@ impl<C: ServerConnector + 'static> OpcProvider for OpcDaClient<C> {
                 max_tags,
                 progress,
                 tags_sink,
+                data_type,
+                access_rights,
+                reply,
+            })
+            .await
+    }
+
+    async fn browse_children(
+        &self,
+        server: &str,
+        branch_path: Option<String>,
+        data_type: u16,
+        access_rights: u32,
+    ) -> OpcResult<BrowseChildren> {
+        let server_owned = server.to_string();
+        self.worker
+            .send_request(|reply| ComRequest::BrowseChildren {
+                server: server_owned,
+                branch_path,
                 data_type,
                 access_rights,
                 reply,

@@ -53,7 +53,8 @@ mod subscription;
 // Stable public API
 pub use helpers::{format_hresult, friendly_com_hint};
 pub use provider::{
-    ItemProperty, OpcProvider, OpcValue, ShutdownHandle, SubscriptionHandle, TagValue, WriteResult,
+    BranchNode, BrowseChildren, ItemProperty, LeafNode, OpcProvider, OpcValue, ShutdownHandle,
+    SubscriptionHandle, TagValue, WriteResult,
 };
 
 #[cfg(feature = "opc-da-backend")]

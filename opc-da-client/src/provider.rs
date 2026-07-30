@@ -58,6 +58,44 @@ pub enum OpcValue {
     Bool(bool),
 }
 
+/// One direct child branch of an OPC DA namespace node.
+///
+/// Result of [`OpcProvider::browse_children`]. A branch may itself contain
+/// further branches and leaves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchNode {
+    /// Fully-qualified branch path: parent id + separator + [`Self::name`]
+    /// (root-level branches have `id == name`). The separator is
+    /// server-specific (commonly `.`).
+    pub id: String,
+    /// Branch browse name, relative to its parent.
+    pub name: String,
+}
+
+/// One direct leaf (data tag) of an OPC DA namespace node.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeafNode {
+    /// Fully-qualified item ID, server-resolved via
+    /// `IOPCBrowseServerAddressSpace::GetItemID`.
+    pub item_id: String,
+    /// Leaf browse name, relative to its parent.
+    pub name: String,
+}
+
+/// The direct children of one namespace node — a single lazy browse level.
+///
+/// Drives the desktop UI's "left branch tree + right leaf list" browser:
+/// the user expands a branch, the UI calls
+/// [`OpcProvider::browse_children`] for that branch's path, and renders
+/// `branches` as expandable nodes and `leaves` as selectable tags.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BrowseChildren {
+    /// Child branches (each may itself have children).
+    pub branches: Vec<BranchNode>,
+    /// Child leaves (data tags).
+    pub leaves: Vec<LeafNode>,
+}
+
 /// Result of a single write operation.
 ///
 /// # Examples
@@ -152,6 +190,26 @@ pub trait OpcProvider: Send + Sync {
         data_type: u16,
         access_rights: u32,
     ) -> OpcResult<Vec<String>>;
+
+    /// Browse one namespace level: the direct child branches and leaves
+    /// under `branch_path` (`None` or empty = root).
+    ///
+    /// Unlike [`browse_tags`](Self::browse_tags), this does NOT recurse —
+    /// it returns only the immediate children, letting the caller expand
+    /// branches lazily (one round-trip per tree-node click). Child branch
+    /// ids are built as `parent + "." + name`.
+    ///
+    /// # Errors
+    /// Returns `Err` if the server connection fails,
+    /// `ChangeBrowsePosition(OPC_BROWSE_TO)` is unsupported for the given
+    /// path, or the browse enumeration fails.
+    async fn browse_children(
+        &self,
+        server: &str,
+        branch_path: Option<String>,
+        data_type: u16,
+        access_rights: u32,
+    ) -> OpcResult<BrowseChildren>;
 
     /// Read current values for the given tag IDs.
     ///
