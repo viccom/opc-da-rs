@@ -238,10 +238,30 @@ struct ShutdownEntry {
 
 pub struct ComWorker<C: ServerConnector + 'static> {
     /// Channel sender for dispatching requests to the worker loop.
-    pub sender: mpsc::Sender<ComRequest>,
-    /// Thread join handle for clean worker thread teardown.
-    pub handle: Option<std::thread::JoinHandle<()>>,
+    ///
+    /// `pub(crate)` on purpose: `Drop` joins the worker thread, which only
+    /// terminates once every sender is dropped. An externally cloned sender
+    /// would keep the channel open and deadlock `join` — all requests must go
+    /// through [`ComWorker::send_request`].
+    pub(crate) sender: Option<mpsc::Sender<ComRequest>>,
+    /// Thread join handle, joined in `Drop` for deterministic teardown.
+    pub(crate) handle: Option<std::thread::JoinHandle<()>>,
+    /// Last panic payload captured from the worker thread (if any). See
+    /// [`ComWorker::captured_panic`].
+    last_panic: Arc<std::sync::Mutex<Option<String>>>,
     _phantom: std::marker::PhantomData<C>,
+}
+
+/// Extract a human-readable message from a panic payload captured by
+/// `catch_unwind` / `JoinHandle::join`.
+fn stringify_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -262,6 +282,11 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
     pub fn start(connector: Arc<C>) -> Result<Self, OpcError> {
         let (tx, mut rx) = mpsc::channel(32);
         let (init_tx, init_rx) = std::sync::mpsc::channel();
+        // Shared cell capturing the worker thread's last panic payload (P0-3/P0-4).
+        // Cross-thread so `captured_panic()` can report worker health to callers.
+        let last_panic: Arc<std::sync::Mutex<Option<String>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let worker_last_panic = Arc::clone(&last_panic);
 
         let handle = std::thread::spawn(move || {
             tracing::debug!("COM worker thread spawned, initializing COM (MTA)");
@@ -284,278 +309,303 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             let mut shutdown_subscriptions: HashMap<u32, ShutdownEntry> = HashMap::new();
 
             while let Some(req) = rx.blocking_recv() {
-                match req {
-                    ComRequest::ListServers { host, reply } => {
-                        let span = tracing::info_span!("opc.list_servers", host = %host);
-                        let _enter = span.enter();
-                        let start = std::time::Instant::now();
-                        let servers = connector.enumerate_servers(&host);
-                        if let Ok(s) = &servers {
-                            tracing::info!(
-                                count = s.len(),
-                                elapsed_ms =
-                                    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                                "list_servers completed"
-                            );
-                        } else if let Err(e) = &servers {
-                            tracing::error!(
-                                error = ?e,
-                                elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                                "list_servers failed"
-                            );
+                // P0-4: catch panics inside the request handler so the root-cause
+                // message is preserved (written to `worker_last_panic` + logged)
+                // instead of tearing down the worker thread and losing all context.
+                // SAFETY: `AssertUnwindSafe` is sound because on panic we `break`
+                // and abandon `cache`/`subscriptions`/COM pointers — we never reuse
+                // the possibly-corrupted mutable state afterwards.
+                let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match req {
+                        ComRequest::ListServers { host, reply } => {
+                            let span = tracing::info_span!("opc.list_servers", host = %host);
+                            let _enter = span.enter();
+                            let start = std::time::Instant::now();
+                            let servers = connector.enumerate_servers(&host);
+                            if let Ok(s) = &servers {
+                                tracing::info!(
+                                    count = s.len(),
+                                    elapsed_ms = u64::try_from(start.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    "list_servers completed"
+                                );
+                            } else if let Err(e) = &servers {
+                                tracing::error!(
+                                    error = ?e,
+                                    elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                                    "list_servers failed"
+                                );
+                            }
+                            let _ = reply.send(servers);
                         }
-                        let _ = reply.send(servers);
-                    }
-                    ComRequest::ReadTagValues {
-                        server,
-                        tag_ids,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| Self::handle_read(&server, &tag_ids, opc_server),
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::WriteTagValue {
-                        server,
-                        tag_id,
-                        value,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| Self::handle_write(&server, &tag_id, &value, opc_server),
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::BrowseTags {
-                        server,
-                        max_tags,
-                        progress,
-                        tags_sink,
-                        data_type,
-                        access_rights,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| {
-                                Self::handle_browse(
-                                    &server,
-                                    max_tags,
-                                    &progress,
-                                    &tags_sink,
-                                    data_type,
-                                    access_rights,
-                                    opc_server,
-                                )
-                            },
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::GetServerStatus { server, reply } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            <C::Server as ConnectedServer>::get_status,
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::WriteTagValues {
-                        server,
-                        items,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| Self::handle_write_values(&server, &items, opc_server),
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::GetItemProperties {
-                        server,
-                        tag_id,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| opc_server.get_item_properties(&tag_id),
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::ReadMaxAge {
-                        server,
-                        tag_ids,
-                        max_age_ms,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| {
-                                Self::handle_read_max_age(&server, &tag_ids, max_age_ms, opc_server)
-                            },
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::WriteTagValueVqt {
-                        server,
-                        tag_id,
-                        value,
-                        quality,
-                        timestamp,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| {
-                                Self::handle_write_vqt(
-                                    &server, &tag_id, &value, quality, timestamp, opc_server,
-                                )
-                            },
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::GetErrorString {
-                        server,
-                        hresult,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| opc_server.get_error_string(hresult),
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::Disconnect { server, reply } => {
-                        tracing::debug!(server = %server, "Explicit disconnect: evicting cached connection");
-                        cache.remove(&server);
-                        let _ = reply.send(Ok(()));
-                    }
-                    ComRequest::Reconnect { server, reply } => {
-                        tracing::debug!(server = %server, "Explicit reconnect: re-establishing connection");
-                        cache.remove(&server);
-                        let result = connector.connect(&server).map(|srv| {
+                        ComRequest::ReadTagValues {
+                            server,
+                            tag_ids,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| Self::handle_read(&server, &tag_ids, opc_server),
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::WriteTagValue {
+                            server,
+                            tag_id,
+                            value,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| {
+                                    Self::handle_write(&server, &tag_id, &value, opc_server)
+                                },
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::BrowseTags {
+                            server,
+                            max_tags,
+                            progress,
+                            tags_sink,
+                            data_type,
+                            access_rights,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| {
+                                    Self::handle_browse(
+                                        &server,
+                                        max_tags,
+                                        &progress,
+                                        &tags_sink,
+                                        data_type,
+                                        access_rights,
+                                        opc_server,
+                                    )
+                                },
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::GetServerStatus { server, reply } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                <C::Server as ConnectedServer>::get_status,
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::WriteTagValues {
+                            server,
+                            items,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| Self::handle_write_values(&server, &items, opc_server),
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::GetItemProperties {
+                            server,
+                            tag_id,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| opc_server.get_item_properties(&tag_id),
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::ReadMaxAge {
+                            server,
+                            tag_ids,
+                            max_age_ms,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| {
+                                    Self::handle_read_max_age(
+                                        &server, &tag_ids, max_age_ms, opc_server,
+                                    )
+                                },
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::WriteTagValueVqt {
+                            server,
+                            tag_id,
+                            value,
+                            quality,
+                            timestamp,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| {
+                                    Self::handle_write_vqt(
+                                        &server, &tag_id, &value, quality, timestamp, opc_server,
+                                    )
+                                },
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::GetErrorString {
+                            server,
+                            hresult,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| opc_server.get_error_string(hresult),
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::Disconnect { server, reply } => {
+                            tracing::debug!(server = %server, "Explicit disconnect: evicting cached connection");
+                            cache.remove(&server);
+                            let _ = reply.send(Ok(()));
+                        }
+                        ComRequest::Reconnect { server, reply } => {
+                            tracing::debug!(server = %server, "Explicit reconnect: re-establishing connection");
+                            cache.remove(&server);
+                            let result = connector.connect(&server).map(|srv| {
                             cache.insert(server.clone(), srv);
                         }).map_err(|e| {
                             tracing::warn!(error = ?e, server = %server, "explicit reconnect failed");
                             e
                         });
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::Subscribe {
-                        server,
-                        tag_ids,
-                        update_rate,
-                        reply,
-                    } => {
-                        let result = Self::handle_subscribe_request(
-                            &connector,
-                            &mut cache,
-                            &mut subscriptions,
-                            &server,
-                            &tag_ids,
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::Subscribe {
+                            server,
+                            tag_ids,
                             update_rate,
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::Unsubscribe { cookie, reply } => {
-                        let result = Self::handle_unsubscribe(cookie, &cache, &mut subscriptions);
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::SubscribeShutdown { server, reply } => {
-                        let result = (|| {
-                            let srv = match cache.entry(server.clone()) {
-                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-                                std::collections::hash_map::Entry::Vacant(e) => {
-                                    e.insert(connector.connect(&server)?)
-                                }
-                            };
-                            Self::handle_subscribe_shutdown(
+                            reply,
+                        } => {
+                            let result = Self::handle_subscribe_request(
+                                &connector,
+                                &mut cache,
+                                &mut subscriptions,
                                 &server,
-                                srv,
+                                &tag_ids,
+                                update_rate,
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::Unsubscribe { cookie, reply } => {
+                            let result =
+                                Self::handle_unsubscribe(cookie, &cache, &mut subscriptions);
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::SubscribeShutdown { server, reply } => {
+                            let result = (|| {
+                                let srv = match cache.entry(server.clone()) {
+                                    std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                    std::collections::hash_map::Entry::Vacant(e) => {
+                                        e.insert(connector.connect(&server)?)
+                                    }
+                                };
+                                Self::handle_subscribe_shutdown(
+                                    &server,
+                                    srv,
+                                    &mut shutdown_subscriptions,
+                                )
+                            })();
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::UnsubscribeShutdown { cookie, reply } => {
+                            let result = Self::handle_unsubscribe_shutdown(
+                                cookie,
+                                &cache,
                                 &mut shutdown_subscriptions,
-                            )
-                        })();
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::UnsubscribeShutdown { cookie, reply } => {
-                        let result = Self::handle_unsubscribe_shutdown(
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::SetSubscriptionRate {
                             cookie,
-                            &cache,
-                            &mut shutdown_subscriptions,
-                        );
-                        let _ = reply.send(result);
+                            update_rate,
+                            reply,
+                        } => {
+                            let result = match subscriptions.get_mut(&cookie) {
+                                Some(entry) => entry.group.set_update_rate(update_rate),
+                                None => Err(OpcError::InvalidState(format!(
+                                    "unknown subscription cookie {cookie}"
+                                ))),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::SetKeepAlive {
+                            cookie,
+                            keep_alive_ms,
+                            reply,
+                        } => {
+                            let result = match subscriptions.get_mut(&cookie) {
+                                Some(entry) => entry.group.set_keep_alive(keep_alive_ms),
+                                None => Err(OpcError::InvalidState(format!(
+                                    "unknown subscription cookie {cookie}"
+                                ))),
+                            };
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::SetLocaleId {
+                            server,
+                            locale_id,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| opc_server.set_locale_id(locale_id),
+                            );
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::SetClientName {
+                            server,
+                            name,
+                            reply,
+                        } => {
+                            let result = Self::dispatch_with_retry(
+                                &mut cache,
+                                &connector,
+                                &server,
+                                |opc_server| opc_server.set_client_name(&name),
+                            );
+                            let _ = reply.send(result);
+                        }
                     }
-                    ComRequest::SetSubscriptionRate {
-                        cookie,
-                        update_rate,
-                        reply,
-                    } => {
-                        let result = match subscriptions.get_mut(&cookie) {
-                            Some(entry) => entry.group.set_update_rate(update_rate),
-                            None => Err(OpcError::InvalidState(format!(
-                                "unknown subscription cookie {cookie}"
-                            ))),
-                        };
-                        let _ = reply.send(result);
+                }));
+                if let Err(payload) = panic_result {
+                    let msg = stringify_panic_payload(&payload);
+                    if let Ok(mut guard) = worker_last_panic.lock() {
+                        *guard = Some(msg.clone());
                     }
-                    ComRequest::SetKeepAlive {
-                        cookie,
-                        keep_alive_ms,
-                        reply,
-                    } => {
-                        let result = match subscriptions.get_mut(&cookie) {
-                            Some(entry) => entry.group.set_keep_alive(keep_alive_ms),
-                            None => Err(OpcError::InvalidState(format!(
-                                "unknown subscription cookie {cookie}"
-                            ))),
-                        };
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::SetLocaleId {
-                        server,
-                        locale_id,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| opc_server.set_locale_id(locale_id),
-                        );
-                        let _ = reply.send(result);
-                    }
-                    ComRequest::SetClientName {
-                        server,
-                        name,
-                        reply,
-                    } => {
-                        let result = Self::dispatch_with_retry(
-                            &mut cache,
-                            &connector,
-                            &server,
-                            |opc_server| opc_server.set_client_name(&name),
-                        );
-                        let _ = reply.send(result);
-                    }
+                    tracing::error!(
+                        panic = %msg,
+                        "COM worker panic captured; shutting down worker loop cleanly \
+                         (see ComWorker::captured_panic)"
+                    );
+                    break;
                 }
             }
 
@@ -569,8 +619,9 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         tracing::debug!("COM worker thread started");
 
         Ok(Self {
-            sender: tx,
+            sender: Some(tx),
             handle: Some(handle),
+            last_panic,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -591,13 +642,25 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         let (tx, rx) = oneshot::channel();
         let req = req_builder(tx);
 
-        self.sender
+        let Some(sender) = self.sender.as_ref() else {
+            return Err(OpcError::Internal("COM worker already shut down".into()));
+        };
+        sender
             .send(req)
             .await
             .map_err(|_| OpcError::Internal("COM worker channel closed (worker stopped)".into()))?;
 
         rx.await
             .map_err(|_| OpcError::Internal("COM worker shut down during request".into()))?
+    }
+
+    /// Returns the last panic message captured from the worker thread, if any.
+    ///
+    /// A `Some` value means the worker previously panicked and has shut down —
+    /// useful for health checks and incident root-cause. Populated by the
+    /// `catch_unwind` boundary in the worker loop (and the `Drop` join fallback).
+    pub fn captured_panic(&self) -> Option<String> {
+        self.last_panic.lock().ok().and_then(|guard| guard.clone())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1652,7 +1715,28 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
 
 impl<C: ServerConnector + 'static> Drop for ComWorker<C> {
     fn drop(&mut self) {
-        tracing::debug!("ComWorker dropping — channel closing, signaling thread shutdown");
+        tracing::debug!("ComWorker dropping — closing channel and joining worker thread");
+        // Close the request channel first so the worker loop exits cleanly.
+        self.sender.take();
+        // P0-3: join the worker thread for deterministic teardown so cached COM
+        // resources are released before drop returns (no orphaned thread still
+        // mid-request). On a panic that escaped the catch_unwind boundary, also
+        // capture the payload as a fallback to `last_panic`.
+        if let Some(handle) = self.handle.take() {
+            match handle.join() {
+                Ok(()) => {}
+                Err(payload) => {
+                    let msg = stringify_panic_payload(&payload);
+                    if let Ok(mut guard) = self.last_panic.lock() {
+                        *guard = Some(msg.clone());
+                    }
+                    tracing::error!(
+                        panic = %msg,
+                        "COM worker thread panicked outside the catch boundary during teardown"
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -1675,7 +1759,7 @@ mod tests {
     };
     use crate::bindings::da::{tagOPCDATASOURCE, tagOPCITEMDEF, tagOPCITEMRESULT, tagOPCITEMSTATE};
 
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct MockState {
@@ -1684,6 +1768,10 @@ mod tests {
         should_fail_write: AtomicBool,
         should_fail_with_connection_error: AtomicBool,
         should_panic_on_request: AtomicBool,
+        /// Simulated slow write latency (ms) to force the worker into a busy state.
+        slow_write_ms: AtomicU64,
+        /// Incremented when a mock server is dropped (worker thread teardown).
+        server_drop_count: AtomicUsize,
     }
 
     struct ConfigurableMockConnector {
@@ -1692,6 +1780,12 @@ mod tests {
 
     struct ConfigurableMockServer {
         state: Arc<MockState>,
+    }
+
+    impl Drop for ConfigurableMockServer {
+        fn drop(&mut self) {
+            self.state.server_drop_count.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     struct ConfigurableMockGroup {
@@ -1763,6 +1857,10 @@ mod tests {
             server_handles: &[crate::opc_da::typedefs::ItemHandle],
             _values: &[windows::Win32::System::Variant::VARIANT],
         ) -> OpcResult<RemoteArray<windows::core::HRESULT>> {
+            let delay = self.state.slow_write_ms.load(Ordering::Relaxed);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
             if self
                 .state
                 .should_fail_with_connection_error
@@ -1986,6 +2084,8 @@ mod tests {
         let (reply, _rx) = oneshot::channel();
         worker
             .sender
+            .as_ref()
+            .expect("sender present")
             .send(ComRequest::ListServers {
                 host: "localhost".into(),
                 reply,
@@ -2279,6 +2379,85 @@ mod tests {
         } else {
             panic!("Expected OpcError::Internal, got {:?}", result);
         }
+    }
+
+    #[tokio::test]
+    async fn test_worker_panic_payload_is_captured() {
+        // P0-4: a panic inside the worker loop must be captured into a shared,
+        // cross-thread observable cell — not silently dropped — so production
+        // incidents retain a root-cause message.
+        let state = Arc::new(MockState::default());
+        state.should_panic_on_request.store(true, Ordering::Relaxed);
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        // `add_group` panics inside the worker thread.
+        let _ = worker
+            .send_request(|reply| ComRequest::WriteTagValue {
+                server: "Mock.Server.1".to_string(),
+                tag_id: "Tag1".to_string(),
+                value: OpcValue::Int(1),
+                reply,
+            })
+            .await;
+
+        let captured = worker.captured_panic();
+        assert!(
+            captured.is_some(),
+            "worker panic payload must be captured, not silently lost"
+        );
+        assert!(
+            captured
+                .as_deref()
+                .is_some_and(|m| m.contains("Simulated worker panic")),
+            "captured payload must preserve the original panic message, got: {captured:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_drop_joins_worker_until_thread_exits() {
+        // P0-3: ComWorker::drop must join the worker thread so cached COM
+        // resources are released before drop returns — no detached worker
+        // still mid-request.
+        let state = Arc::new(MockState::default());
+        state.slow_write_ms.store(100, Ordering::Relaxed);
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        // Drive the worker into a slow in-flight write via a cloned sender,
+        // without borrowing `worker` (so we can drop it next).
+        let sender = worker.sender.clone().expect("worker sender present");
+        let (tx, _rx) = oneshot::channel();
+        sender
+            .send(ComRequest::WriteTagValue {
+                server: "Mock.Server.1".to_string(),
+                tag_id: "Tag1".to_string(),
+                value: OpcValue::Int(1),
+                reply: tx,
+            })
+            .await
+            .unwrap();
+        // Release the cloned sender so the channel closes once `worker.sender`
+        // is taken in Drop — otherwise the worker blocks on `blocking_recv`
+        // forever and `join()` deadlocks.
+        drop(sender);
+        // Let the worker enter the slow write.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        drop(worker);
+
+        assert!(
+            state.server_drop_count.load(Ordering::Relaxed) >= 1,
+            "drop must join the worker until it exits and releases the cached server"
+        );
     }
 
     #[tokio::test]
