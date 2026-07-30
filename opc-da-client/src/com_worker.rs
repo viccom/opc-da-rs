@@ -1791,6 +1791,30 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         Ok(())
     }
 
+    /// Build the `IOPCDataCallback` sink, cast it to `IUnknown`, and advise it on `group`.
+    ///
+    /// Returns the sink `IUnknown` (the caller must retain it for the subscription's lifetime —
+    /// dropping it releases the callback) plus the advise cookie. The caller owns group cleanup
+    /// on `Err`: this runs after the group is already added, and a failure (cast or advise)
+    /// leaves an empty group that must be torn down via `remove_group`.
+    fn build_and_advise_data_callback(
+        group: &<C::Server as ConnectedServer>::Group,
+        tag_ids: Vec<String>,
+        tx: mpsc::Sender<TagValue>,
+        last_update: Arc<AtomicU64>,
+    ) -> OpcResult<(windows::core::IUnknown, u32)> {
+        let sink = DataCallbackSink {
+            tag_ids,
+            tx: std::sync::Mutex::new(tx),
+            last_update,
+        };
+        // SAFETY: `cast` performs QueryInterface on a locally-owned COM object.
+        let sink_callback: crate::bindings::da::IOPCDataCallback = sink.into();
+        let sink_iunknown: windows::core::IUnknown = sink_callback.cast()?;
+        let cookie = group.advise_data_callback(&sink_iunknown)?;
+        Ok((sink_iunknown, cookie))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn handle_subscribe(
         server_name: &str,
@@ -1861,18 +1885,16 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
         let last_update = Arc::new(AtomicU64::new(now_ms));
-        let sink = DataCallbackSink {
-            tag_ids: tag_ids.to_vec(),
-            tx: std::sync::Mutex::new(tx.clone()),
-            last_update: Arc::clone(&last_update),
-        };
-        // SAFETY: `cast` performs QueryInterface on a locally-owned COM object.
-        let sink_callback: crate::bindings::da::IOPCDataCallback = sink.into();
-        let sink_iunknown: windows::core::IUnknown = sink_callback.cast()?;
-        let cookie = match group.advise_data_callback(&sink_iunknown) {
-            Ok(c) => c,
+        // Build the sink + advise on the group. Either failing leaves a fresh empty group, so
+        // clean it up (P0-1 fix ①: a cast failure previously leaked the group).
+        let (sink_iunknown, cookie) = match Self::build_and_advise_data_callback(
+            &group,
+            tag_ids.to_vec(),
+            tx.clone(),
+            Arc::clone(&last_update),
+        ) {
+            Ok((iu, c)) => (iu, c),
             Err(e) => {
-                // Cleanup the freshly-created group if advising the callback fails.
                 let _ = opc_server.remove_group(server_handle, true);
                 return Err(e);
             }
@@ -2172,6 +2194,9 @@ mod tests {
         /// P0-1 step E: when set, advise_data_callback returns NotImplemented — simulates a
         /// rebuild whose re-advise fails (e.g. remote DCOM sink unreachable / 0x800706BA).
         should_fail_advise: AtomicBool,
+        /// Counts `remove_group` calls so a test can assert a subscribe failure cleans up its
+        /// freshly-added group instead of leaking it (P0-1 review fix ①).
+        remove_group_count: AtomicUsize,
     }
 
     struct ConfigurableMockConnector {
@@ -2383,6 +2408,9 @@ mod tests {
             _server_group: crate::opc_da::typedefs::GroupHandle,
             _force: bool,
         ) -> OpcResult<()> {
+            self.state
+                .remove_group_count
+                .fetch_add(1, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -3296,6 +3324,46 @@ mod tests {
             state.keep_alive_count.load(Ordering::Relaxed),
             1,
             "set_keep_alive must still be invoked (and its failure absorbed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_cleans_up_group_when_sink_creation_fails() {
+        // P0-1 review fix ①: when the sink-creation step (cast/advise) fails after the group
+        // was added, handle_subscribe must remove the group so it doesn't leak. Observed via the
+        // mock's remove_group counter.
+        //
+        // Note: a `cast::<IUnknown>()` failure is not directly injectable — IUnknown QI on a
+        // `#[implement]` object always succeeds — so we drive the shared cleanup path via an
+        // advise failure, which after the fix routes through the same cleanup arm as a cast
+        // failure would.
+        let state = Arc::new(MockState::default());
+        state.should_fail_advise.store(true, Ordering::Relaxed);
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "subscribe must fail when advise fails: {result:?}"
+        );
+        assert_eq!(
+            state.remove_group_count.load(Ordering::Relaxed),
+            1,
+            "subscribe must remove the group on sink-creation failure (no leak)"
         );
     }
 
