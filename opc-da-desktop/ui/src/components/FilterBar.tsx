@@ -5,7 +5,8 @@
 import { useSubscriptionStore } from "../stores/subscription";
 
 export function FilterBar() {
-  const { filter, setFilter } = useSubscriptionStore();
+  const filter = useSubscriptionStore((s) => s.filter);
+  const setFilter = useSubscriptionStore((s) => s.setFilter);
   return (
     <div style={{ padding: "4px 8px", borderBottom: "1px solid #3c3c3c" }}>
       <input

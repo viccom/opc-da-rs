@@ -26,13 +26,134 @@ body,
   height: 100vh;
 }
 
-.strips {
+.topbar {
   display: grid;
-  grid-template-columns: 1fr 1fr 1fr;
+  grid-template-columns: 1fr 1fr;
   gap: 4px;
   padding: 4px;
   border-bottom: 1px solid #3c3c3c;
   background: #252526;
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.main-content {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 4px;
+  gap: 4px;
+}
+
+.empty {
+  padding: 24px;
+  color: #858585;
+}
+
+.group-editor {
+  flex-shrink: 0;
+}
+
+/* Sidebar — subscription group list */
+.sidebar {
+  width: 200px;
+  flex-shrink: 0;
+  border-right: 1px solid #3c3c3c;
+  background: #252526;
+  display: flex;
+  flex-direction: column;
+}
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 8px;
+  border-bottom: 1px solid #3c3c3c;
+  color: #9cdcfe;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.sidebar-add {
+  background: #0e639c;
+  color: white;
+  border: none;
+  width: 20px;
+  height: 20px;
+  border-radius: 2px;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0;
+}
+
+.sidebar-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.sidebar-empty {
+  padding: 8px;
+  color: #858585;
+  font-size: 11px;
+}
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px;
+  border-radius: 2px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.sidebar-item:hover {
+  background: #2a2d2e;
+}
+
+.sidebar-item.active {
+  background: #094771;
+}
+
+.sidebar-item-name {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-item-meta {
+  font-size: 10px;
+  color: #858585;
+}
+
+.sidebar-dot {
+  color: #4ec9b0;
+  margin-right: 2px;
+}
+
+.sidebar-del {
+  background: transparent;
+  color: #858585;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  line-height: 1;
+  padding: 0 2px;
+}
+
+.sidebar-del:hover {
+  color: #f48771;
 }
 
 .panel {
@@ -105,38 +226,52 @@ button.danger {
   background: #a1260d;
 }
 
-table {
+/* Tag table: div + CSS grid (NOT a <table> — see TagTable.tsx for why).
+   The header row and every virtualized data row share the same
+   grid-template-columns, so column alignment is structural and does not
+   depend on per-row content. */
+.tag-scroll {
+  height: 100%;
+  overflow: auto;
+  position: relative;
+}
+
+.tag-grid {
+  --tag-cols: 2fr 1fr 1.2fr 1.5fr 0.8fr;
   width: 100%;
-  border-collapse: collapse;
   font-size: 12px;
 }
 
-thead {
-  background: #2d2d30;
+.tag-row {
+  display: grid;
+  grid-template-columns: var(--tag-cols);
+  align-items: center;
+}
+
+.tag-row.tag-header {
   position: sticky;
   top: 0;
   z-index: 1;
-}
-
-th,
-td {
-  padding: 3px 8px;
-  text-align: left;
-  border-bottom: 1px solid #2d2d30;
-  white-space: nowrap;
-}
-
-th {
+  background: #2d2d30;
   color: #9cdcfe;
   font-weight: 600;
+  border-bottom: 1px solid #3c3c3c;
 }
 
-tbody tr:hover {
+.tag-cell {
+  padding: 3px 8px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-bottom: 1px solid #2d2d30;
+}
+
+.tag-cell.tag-muted {
+  color: #858585;
+}
+
+.tag-row:not(.tag-header):hover {
   background: #2a2d2e;
-}
-
-tbody tr.active {
-  background: #094771;
 }
 
 .modal-backdrop {
@@ -186,6 +321,24 @@ tbody tr.active {
 .leaf-list {
   overflow-y: auto;
   padding: 4px;
+}
+
+.leaf-pane {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.leaf-list {
+  flex: 1;
+}
+
+.tree-twisty {
+  display: inline-block;
+  width: 12px;
+    cursor: pointer;
+  user-select: none;
+  text-align: center;
 }
 
 .tree-node {

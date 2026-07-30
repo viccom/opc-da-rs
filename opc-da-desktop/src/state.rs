@@ -84,11 +84,6 @@ impl AppState {
     pub async fn forget_cookie(&self, cookie: u32) -> bool {
         self.active_cookies.lock().await.remove(&cookie)
     }
-
-    /// Snapshot the currently-active cookies (for overlap checks).
-    pub async fn active_cookies_snapshot(&self) -> Vec<u32> {
-        self.active_cookies.lock().await.iter().copied().collect()
-    }
 }
 
 impl Default for AppState {

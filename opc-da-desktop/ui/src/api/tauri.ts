@@ -106,3 +106,37 @@ export async function subscribeTags(
 export async function unsubscribeTags(cookie: number): Promise<void> {
   return invoke<void>("unsubscribe_tags", { cookie });
 }
+
+// ── browse_children: lazy single-level namespace browse (tree browser) ──
+
+/** One child branch of a namespace node (expandable). */
+export interface BranchNode {
+    /** Fully-qualified branch path (e.g. `"Random"` or `"Bucket Brigade"`). */
+    id: string;
+    /** Branch browse name, relative to its parent. */
+    name: string;
+}
+
+/** One child leaf (data tag) of a namespace node. */
+export interface LeafNode {
+    /** Fully-qualified item ID (the value passed to `subscribe`/`read`/`write`). */
+    item_id: string;
+    /** Leaf browse name, relative to its parent. */
+    name: string;
+}
+
+/** Direct children of one namespace node — one lazy browse level. */
+export interface BrowseChildren {
+    branches: BranchNode[];
+    leaves: LeafNode[];
+}
+
+/**
+ * Browse one namespace level: the direct child branches + leaves under
+ * `branchPath` (`null` = root). One round-trip per tree-node click.
+ */
+export async function browseChildren(
+    branchPath: string | null,
+): Promise<BrowseChildren> {
+    return invoke<BrowseChildren>("browse_children", { branchPath });
+}

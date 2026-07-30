@@ -47,8 +47,9 @@ pub struct SubscriptionCreated {
 /// Subscribe to a set of tags. Tag updates flow over `channel` as a
 /// stream of [`TagUpdate`] messages.
 ///
-/// Refuses to start a second subscription while one is already active —
-/// the UI is single-subscription by design (one group, one table).
+/// Multiple concurrent subscriptions are supported — each gets its own
+/// OPC group + cookie + `Channel`. The frontend associates each with a
+/// client group id (see the desktop UI's group sidebar).
 #[tauri::command]
 pub async fn subscribe_tags(
     state: State<'_, AppState>,
@@ -56,18 +57,6 @@ pub async fn subscribe_tags(
     update_rate_ms: u32,
     channel: Channel<TagUpdate>,
 ) -> DesktopResult<SubscriptionCreated> {
-    // P1-12: refuse overlapping subscriptions to avoid the dual-runner
-    // scenario where one UI subscription "wins" while a hidden runner
-    // continues consuming server resources.
-    {
-        let active = state.inner().active_cookies_snapshot().await;
-        if !active.is_empty() {
-            return Err(DesktopError::Other(format!(
-                "a subscription is already active (cookies: {active:?}); stop it first"
-            )));
-        }
-    }
-
     let client = state.client();
     let prog_id = state.prog_id().await?;
     let handle = client

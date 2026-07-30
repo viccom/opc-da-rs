@@ -1,118 +1,132 @@
 /**
- * TagTable — high-frequency tag table with name filter.
+ * TagTable — high-frequency tag table with name filter + column sort.
  *
- * Columns (5, per the agreed spec):
- *   tag id | data type (placeholder) | value | timestamp | quality
+ * Rendered as div + CSS grid (NOT a <table>): react-virtual positions each
+ * data row with `position:absolute`, which forces `display:table-row` to
+ * compute as `block` (CSS 2.1 §9.7). Under `table-layout:auto` every
+ * absolute row then sized its own columns from its content, so the header
+ * grid and body grids never agreed → columns misaligned. A shared
+ * `grid-template-columns` on every row (header + body) makes alignment
+ * structural, independent of content.
  *
- * Uses `@tanstack/react-table` for sorting + `@tanstack/react-virtual`
- * for windowing; `useMemo` ensures only the filter change re-iterates.
+ * Columns (5): tag id | data type (placeholder) | value | timestamp | quality.
+ * `@tanstack/react-virtual` still drives windowing.
  */
 
-import { useMemo } from "react";
-import {
-  createColumnHelper,
-  flexRender,
-  getCoreRowModel,
-  getSortedRowModel,
-  useReactTable,
-  type SortingState,
-} from "@tanstack/react-table";
+import { useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
-import { useRef, useState } from "react";
 import { useSubscriptionStore } from "../stores/subscription";
-import type { TagUpdate } from "../api/tauri";
 
-const helper = createColumnHelper<TagUpdate>();
+type SortKey = "tag_id" | "value" | "timestamp" | "quality";
+type SortDir = "asc" | "desc";
 
-const columns = [
-  helper.accessor("tag_id", { header: "Tag ID" }),
-  helper.accessor(() => "(unknown)", { id: "data_type", header: "Data Type" }),
-  helper.accessor("value", { header: "Value" }),
-  helper.accessor("timestamp", { header: "Timestamp" }),
-  helper.accessor("quality", { header: "Quality" }),
+interface Column {
+    key: SortKey | "data_type";
+    label: string;
+    sortable: boolean;
+}
+
+const COLUMNS: Column[] = [
+    { key: "tag_id", label: "Tag ID", sortable: true },
+    { key: "data_type", label: "Data Type", sortable: false },
+    { key: "value", label: "Value", sortable: true },
+    { key: "timestamp", label: "Timestamp", sortable: true },
+    { key: "quality", label: "Quality", sortable: true },
 ];
 
 export function TagTable() {
-  const { rows, filter, cookie } = useSubscriptionStore();
-  const list = useMemo(() => Array.from(rows.values()), [rows]);
-  const visible = useMemo(() => {
-    const f = filter.trim().toLowerCase();
-    if (!f) return list;
-    return list.filter((r) => r.tag_id.toLowerCase().includes(f));
-  }, [list, filter]);
-
-  const [sorting, setSorting] = useState<SortingState>([]);
-  const table = useReactTable({
-    data: visible,
-    columns,
-    state: { sorting },
-    onSortingChange: setSorting,
-    getCoreRowModel: getCoreRowModel(),
-    getSortedRowModel: getSortedRowModel(),
-  });
-
-  const rows2 = table.getRowModel().rows;
-  const parentRef = useRef<HTMLDivElement>(null);
-  const virtualizer = useVirtualizer({
-    count: rows2.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => 24,
-    overscan: 12,
-  });
-
-  if (cookie === null) {
-    return (
-      <div style={{ padding: 16, color: "#858585" }}>
-        No active subscription. Use “Add Tags…” then “Start” to begin streaming.
-      </div>
+    const group = useSubscriptionStore((s) =>
+        s.activeGroupId ? s.groups.get(s.activeGroupId) : undefined,
     );
-  }
+    const filter = useSubscriptionStore((s) => s.filter);
+    const rowsMap = group?.rows;
+    const cookie = group?.cookie ?? null;
 
-  return (
-    <div
-      ref={parentRef}
-      style={{ height: "100%", overflow: "auto", position: "relative" }}
-    >
-      <table>
-        <thead>
-          {table.getHeaderGroups().map((hg) => (
-            <tr key={hg.id}>
-              {hg.headers.map((h) => (
-                <th
-                  key={h.id}
-                  onClick={h.column.getToggleSortingHandler()}
-                  style={{ cursor: "pointer" }}
+    const list = useMemo(() => (rowsMap ? Array.from(rowsMap.values()) : []), [rowsMap]);
+    const [sortKey, setSortKey] = useState<SortKey | null>(null);
+    const [sortDir, setSortDir] = useState<SortDir>("asc");
+
+    const visible = useMemo(() => {
+        const f = filter.trim().toLowerCase();
+        const arr = f ? list.filter((r) => r.tag_id.toLowerCase().includes(f)) : list;
+        if (!sortKey) return arr;
+        const sorted = [...arr].sort((a, b) => {
+            const cmp = a[sortKey].localeCompare(b[sortKey]);
+            return sortDir === "asc" ? cmp : -cmp;
+        });
+        return sorted;
+    }, [list, filter, sortKey, sortDir]);
+
+    const parentRef = useRef<HTMLDivElement>(null);
+    const virtualizer = useVirtualizer({
+        count: visible.length,
+        getScrollElement: () => parentRef.current,
+        estimateSize: () => 24,
+        overscan: 12,
+    });
+
+    if (cookie === null) {
+        return (
+            <div style={{ padding: 16, color: "#858585" }}>
+                No active subscription. Use “Add Tags…” then “Start” to begin streaming.
+            </div>
+        );
+    }
+
+    const toggleSort = (key: SortKey) => {
+        if (sortKey === key) {
+            setSortDir(sortDir === "asc" ? "desc" : "asc");
+        } else {
+            setSortKey(key);
+            setSortDir("asc");
+        }
+    };
+
+    return (
+        <div ref={parentRef} className="tag-scroll">
+            <div className="tag-grid">
+                <div className="tag-row tag-header">
+                    {COLUMNS.map((c) => (
+                        <div
+                            key={c.key}
+                            className="tag-cell"
+                            onClick={c.sortable ? () => toggleSort(c.key as SortKey) : undefined}
+                            style={c.sortable ? { cursor: "pointer" } : undefined}
+                        >
+                            {c.label}
+                            {sortKey === c.key ? (sortDir === "asc" ? " ▲" : " ▼") : ""}
+                        </div>
+                    ))}
+                </div>
+                <div
+                    className="tag-body"
+                    style={{ height: virtualizer.getTotalSize(), position: "relative" }}
                 >
-                  {flexRender(h.column.columnDef.header, h.getContext())}
-                  {h.column.getIsSorted() === "asc" ? " ▲" : h.column.getIsSorted() === "desc" ? " ▼" : ""}
-                </th>
-              ))}
-            </tr>
-          ))}
-        </thead>
-        <tbody style={{ height: `${virtualizer.getTotalSize()}px`, position: "relative" }}>
-          {virtualizer.getVirtualItems().map((vi) => {
-            const row = rows2[vi.index];
-            return (
-              <tr
-                key={row.id}
-                style={{
-                  position: "absolute",
-                  top: 0,
-                  left: 0,
-                  width: "100%",
-                  height: `${vi.size}px`,
-                  transform: `translateY(${vi.start}px)`,
-                }}
-              >
-                {row.getVisibleCells().map((cell) => (
-                  <td key={cell.id}>{flexRender(cell.column.columnDef.cell, cell.getContext())}</td>
-                ))}
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
-  );
+                    {virtualizer.getVirtualItems().map((vi) => {
+                        const row = visible[vi.index];
+                        return (
+                            <div
+                                key={row.tag_id}
+                                className="tag-row"
+                                style={{
+                                    position: "absolute",
+                                    top: 0,
+                                    left: 0,
+                                    width: "100%",
+                                    height: `${vi.size}px`,
+                                    transform: `translateY(${vi.start}px)`,
+                                }}
+                            >
+                                <div className="tag-cell">{row.tag_id}</div>
+                                <div className="tag-cell tag-muted">(unknown)</div>
+                                <div className="tag-cell">{row.value}</div>
+                                <div className="tag-cell">{row.timestamp}</div>
+                                <div className="tag-cell">{row.quality}</div>
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+        </div>
+    );
 }

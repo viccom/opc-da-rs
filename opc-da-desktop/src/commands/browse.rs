@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tauri::State;
 use tauri::ipc::Channel;
 
-use opc_da_client::OpcProvider;
+use opc_da_client::{BranchNode, BrowseChildren, LeafNode, OpcProvider};
 
 use crate::error::{DesktopError, DesktopResult};
 use crate::state::AppState;
@@ -127,4 +127,80 @@ pub async fn browse_tags(
     }
 
     result.map(|_| ())
+}
+
+// ── browse_children: lazy single-level browse for the tree browser ─────
+
+/// Wire view of [`opc_da_client::BranchNode`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchNodeDto {
+    /// Fully-qualified branch path.
+    pub id: String,
+    /// Branch browse name (relative to its parent).
+    pub name: String,
+}
+
+/// Wire view of [`opc_da_client::LeafNode`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LeafNodeDto {
+    /// Fully-qualified item ID.
+    pub item_id: String,
+    /// Leaf browse name (relative to its parent).
+    pub name: String,
+}
+
+/// Wire view of [`opc_da_client::BrowseChildren`] — the direct children of
+/// one namespace node, returned by `browse_children`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BrowseChildrenDto {
+    /// Child branches (expandable in the tree).
+    pub branches: Vec<BranchNodeDto>,
+    /// Child leaves (selectable tags).
+    pub leaves: Vec<LeafNodeDto>,
+}
+
+impl From<BranchNode> for BranchNodeDto {
+    fn from(b: BranchNode) -> Self {
+        Self {
+            id: b.id,
+            name: b.name,
+        }
+    }
+}
+
+impl From<LeafNode> for LeafNodeDto {
+    fn from(l: LeafNode) -> Self {
+        Self {
+            item_id: l.item_id,
+            name: l.name,
+        }
+    }
+}
+
+impl From<BrowseChildren> for BrowseChildrenDto {
+    fn from(c: BrowseChildren) -> Self {
+        Self {
+            branches: c.branches.into_iter().map(BranchNodeDto::from).collect(),
+            leaves: c.leaves.into_iter().map(LeafNodeDto::from).collect(),
+        }
+    }
+}
+
+/// Browse one namespace level under `branch_path` (`None` = root).
+///
+/// Returns the direct child branches + leaves. Non-streaming (lazy — one
+/// round-trip per tree-node click). Drives the modal browser's left branch
+/// tree + right leaf list.
+#[tauri::command]
+pub async fn browse_children(
+    state: State<'_, AppState>,
+    branch_path: Option<String>,
+) -> DesktopResult<BrowseChildrenDto> {
+    let client = state.client();
+    let prog_id = state.prog_id().await?;
+    let children = client
+        .browse_children(&prog_id, branch_path, 0, 0)
+        .await
+        .map_err(DesktopError::from)?;
+    Ok(BrowseChildrenDto::from(children))
 }
