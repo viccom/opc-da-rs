@@ -53,6 +53,7 @@ pub fn guid_to_progid(guid: &windows::core::GUID) -> OpcResult<String> {
 /// Convert OPC DA VARIANT to a displayable string.
 #[allow(clippy::too_many_lines)]
 pub fn variant_to_string(variant: &VARIANT) -> String {
+    use std::mem::ManuallyDrop;
     // SAFETY: Accessing the VARIANT union fields. The caller (OpcDaClient)
     // guarantees the VARIANT was produced by COM (e.g., from `group.read()`),
     // so the `vt` discriminant correctly identifies which union arm is active.
@@ -96,7 +97,11 @@ pub fn variant_to_string(variant: &VARIANT) -> String {
                     let mut data_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
                     if SafeArrayAccessData(parray, &raw mut data_ptr).is_ok() {
                         for i in 0..display_count {
-                            let mut temp_var = VARIANT::default();
+                            // ManuallyDrop：temp_var 只借 SafeArray 元素的资源（BSTR/接口指针）
+                            // 递归渲染，drop 时绝不能 VariantClear——这些资源归 SafeArray 所有。
+                            // VARIANT::drop 会 VariantClear（VT_BSTR→SysFreeString，
+                            // VT_UNKNOWN→Release），会导致 double-free/堆损坏 (0xc0000374)。
+                            let mut temp_var = ManuallyDrop::new(VARIANT::default());
                             (*temp_var.Anonymous.Anonymous).vt =
                                 windows::Win32::System::Variant::VARENUM(base_type);
 
@@ -352,9 +357,37 @@ mod tests {
         clippy::ptr_as_ptr,
         clippy::borrow_as_ptr,
         clippy::mixed_attributes_style,
-        clippy::unreadable_literal
+        clippy::unreadable_literal,
+        clippy::inline_always,
+        clippy::ref_as_ptr,
+        clippy::needless_pass_by_ref_mut,
+        clippy::undocumented_unsafe_blocks
     )]
     use super::*;
+    use crate::bindings::comn::{IOPCShutdown, IOPCShutdown_Impl};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use windows::core::PCWSTR;
+    use windows::core::implement;
+
+    // 测试用 COM 对象：Drop 时翻转 flag，用来可靠检测它是否被过早 Release。
+    // 用于验证 variant_to_string 不会对借来的 SafeArray IUnknown 元素 double-Release。
+    #[implement(IOPCShutdown)]
+    struct TrackedUnknown {
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl IOPCShutdown_Impl for TrackedUnknown_Impl {
+        fn ShutdownRequest(&self, _reason: &PCWSTR) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Drop for TrackedUnknown {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn test_is_remote_host() {
@@ -723,6 +756,55 @@ mod tests {
             };
 
             assert_eq!(variant_to_string(&v), "[10, 20, 30]");
+        }
+    }
+
+    #[test]
+    fn variant_to_string_safearray_does_not_release_borrowed_elements() {
+        // variant_to_string 接收 `&VARIANT`（只读借用），绝不能释放 SafeArray 元素持有的
+        // 资源。windows-rs 的 `VARIANT::drop` 调用 `VariantClear`：若 SafeArray 分支构造的
+        // 临时 VARIANT 拷贝了元素（VT_BSTR/VT_UNKNOWN/VT_DISPATCH），drop 时会
+        // `SysFreeString`/`Release` 借来的指针 → double-free → 堆损坏 (0xc0000374)。
+        // 用 Drop flag 可靠检测：VariantClear→Release→refcount=0→Drop（不依赖堆检测器）。
+        use windows::Win32::System::Ole::{
+            SafeArrayAccessData, SafeArrayCreateVector, SafeArrayDestroy, SafeArrayUnaccessData,
+        };
+        use windows::Win32::System::Variant::{VARENUM, VT_ARRAY, VT_UNKNOWN};
+        use windows::core::IUnknown;
+        use windows::core::Interface;
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let shutdown: IOPCShutdown = TrackedUnknown {
+            dropped: dropped.clone(),
+        }
+        .into();
+        let obj: IUnknown = shutdown
+            .cast()
+            .expect("cast IOPCShutdown -> IUnknown must succeed");
+
+        unsafe {
+            let sa = SafeArrayCreateVector(VT_UNKNOWN, 0, 1);
+            assert!(!sa.is_null(), "SafeArrayCreateVector failed");
+            let mut data: *mut std::ffi::c_void = std::ptr::null_mut();
+            SafeArrayAccessData(sa, &mut data).unwrap();
+            // ptr::write：跳过对 zeroed 初始 IUnknown 的 Drop（Release(null) 会崩）。
+            std::ptr::write(data as *mut IUnknown, obj); // move 指针进数组；refcount 仍 = 1
+            SafeArrayUnaccessData(sa).unwrap();
+
+            let mut variant = VARIANT::default();
+            (*variant.Anonymous.Anonymous).vt = VARENUM(VT_UNKNOWN.0 | VT_ARRAY.0);
+            (*variant.Anonymous.Anonymous).Anonymous.parray = sa;
+
+            let rendered = variant_to_string(&variant);
+            assert!(
+                !dropped.load(Ordering::SeqCst),
+                "variant_to_string must NOT Release borrowed SafeArray IUnknown elements \
+                 (rendered={rendered:?}); this double-Release corrupts the COM heap (0xc0000374)"
+            );
+
+            // 清理：销毁数组（正常 Release 一次释放元素）；forget variant 防 VariantClear 再次 Destroy。
+            std::mem::forget(variant);
+            let _ = SafeArrayDestroy(sa);
         }
     }
 
