@@ -464,13 +464,13 @@ async fn e2e_kill_process_read_reconnects() {
     );
 }
 
-/// P0-1 boundary probe: with the server *process* killed (NOT P0-1's designed scenario — P0-1
-/// targets a silently-dead callback while the server stays alive), the rebuild re-advises on the
-/// stale group proxy and fails, surfacing on the subscription's error channel. Documents that P0-1
-/// does not self-heal a dead server process (by design); recovery needs a fresh subscribe.
+/// P0-1 增强：杀掉 server 进程后订阅必须自愈——监测线程检测 callback 静默死亡 → rebuild 轻量
+/// re-advise 失败（死代理 0x800706BA）→ 触发重连（DCOM/SCM 重启 OPCSim）→ 新 group/items/sink →
+/// `rx` 收到新的 OnDataChange。区别于应用层 reconnect（read/write 经 dispatch_with_retry），这里
+/// 验证订阅级自愈。
 #[tokio::test]
 #[ignore = "kills the real OPCSim.exe process; run with --ignored"]
-async fn e2e_kill_process_subscription_reports_failure() {
+async fn e2e_kill_process_subscription_self_heals() {
     let c = client();
     let tags = first_tags(1).await;
     let sub = c
@@ -478,27 +478,33 @@ async fn e2e_kill_process_subscription_reports_failure() {
         .await
         .expect("subscribe");
     let mut rx = sub.rx;
-    let mut errors = sub.errors;
 
     // Confirm the callback is alive before killing the server.
-    let live = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
-    eprintln!("[kill/sub] initial OnDataChange received: {}", live.is_ok());
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+    assert!(
+        first.is_ok_and(|o| o.is_some()),
+        "must receive an initial OnDataChange before killing the server"
+    );
+    eprintln!("[kill/self-heal] initial OnDataChange received");
 
     assert!(kill_opc_sim(), "failed to kill OPCSim.exe");
-    eprintln!("[kill/sub] killed OPCSim.exe; waiting for monitor threshold + rebuild");
-
-    // Monitor threshold = max(update_rate*3, min_timeout=30s) = 30s. The rebuild re-advises on
-    // the stale group proxy (dead server) and must fail visibly on the error channel — P0-1
-    // step E guarantees a rebuild after a dead callback is never silent, even when (as here) the
-    // server process itself is gone and the rebuild cannot succeed.
-    let err = tokio::time::timeout(Duration::from_secs(50), errors.recv())
-        .await
-        .expect("a rebuild failure must surface on the error channel within 50s (not silent)")
-        .expect("the error channel must stay open");
     assert!(
-        format!("{err}").contains("rebuild failed"),
-        "error should describe the rebuild failure, got: {err}"
+        !opc_sim_running(),
+        "OPCSim.exe should be gone after taskkill"
     );
-    eprintln!("[kill/sub] rebuild failure surfaced: {err}");
+    eprintln!("[kill/self-heal] killed OPCSim.exe; waiting for monitor + reconnect");
+
+    // Monitor threshold ~30s; the rebuild then reconnects (DCOM relaunches OPCSim) and the new
+    // sink pushes a fresh OnDataChange. The subscription must self-heal within this window.
+    let healed = tokio::time::timeout(Duration::from_secs(70), rx.recv()).await;
+    assert!(
+        matches!(healed, Ok(Some(_))),
+        "subscription did not self-heal within 70s after server kill: {healed:?}"
+    );
+    eprintln!("[kill/self-heal] self-healed: new OnDataChange received");
+    assert!(
+        opc_sim_running(),
+        "OPCSim.exe should have been relaunched by the rebuild reconnect"
+    );
     let _ = c.unsubscribe(sub.cookie).await;
 }

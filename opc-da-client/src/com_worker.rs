@@ -257,6 +257,9 @@ struct SubscriptionEntry<C: ServerConnector + 'static> {
     /// Original error-channel sender (P0-1 step E): the worker pushes a rebuild-failure
     /// `OpcError` here so the client's `SubscriptionHandle.errors` can surface it. Best-effort.
     error_tx: mpsc::Sender<OpcError>,
+    /// Original requested update rate (P0-1 增强): rebuild's reconnect path re-creates the
+    /// group with this same cadence after a dead-server reconnect.
+    update_rate: u32,
 }
 
 /// Worker-side tracked state for a shutdown subscription (server-level; no group).
@@ -750,8 +753,12 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                             let _ = reply.send(result);
                         }
                         ComRequest::RebuildSubscription { cookie, reply } => {
-                            let result =
-                                Self::handle_rebuild_subscription(cookie, &mut subscriptions);
+                            let result = Self::handle_rebuild_subscription(
+                                cookie,
+                                &mut subscriptions,
+                                &mut cache,
+                                &connector,
+                            );
                             // P0-1 step E: surface a rebuild failure on the subscription's
                             // error channel so consumers can see it (not silent). Unknown cookie
                             // (entry gone) yields no signal — nothing to report to.
@@ -1815,24 +1822,22 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         Ok((sink_iunknown, cookie))
     }
 
-    #[allow(clippy::too_many_lines)]
-    fn handle_subscribe(
-        server_name: &str,
+    /// Create a subscription group on `opc_server`, add the items, build + advise the callback
+    /// sink, and set keep-alive. Returns `(server_handle, group, sink, advise_cookie)`. Shared
+    /// by `handle_subscribe` (fresh subscribe) and `reconnect_subscription` (rebuild after a
+    /// dead server). Any failure after `add_group` cleans up via `remove_group`.
+    fn create_group_and_advise(
+        opc_server: &C::Server,
         tag_ids: &[String],
         update_rate: u32,
-        opc_server: &C::Server,
-        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
-        registry: &Arc<Mutex<HashMap<u32, MonitorEntry>>>,
-    ) -> OpcResult<SubscriptionHandle> {
-        let span = tracing::info_span!(
-            "opc.subscribe",
-            server = %server_name,
-            count = tag_ids.len(),
-            update_rate
-        );
-        let _enter = span.enter();
-        let start = std::time::Instant::now();
-
+        tx: mpsc::Sender<TagValue>,
+        last_update: &Arc<AtomicU64>,
+    ) -> OpcResult<(
+        GroupHandle,
+        <C::Server as ConnectedServer>::Group,
+        windows::core::IUnknown,
+        u32,
+    )> {
         let mut revised_update_rate = 0u32;
         let mut server_handle = GroupHandle::default();
         let group = opc_server.add_group(
@@ -1875,6 +1880,50 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             ));
         }
 
+        // Build the sink + advise on the group. Either failing leaves a fresh empty group, so
+        // clean it up (P0-1 fix ①: a cast failure previously leaked the group).
+        let (sink_iunknown, cookie) = match Self::build_and_advise_data_callback(
+            &group,
+            tag_ids.to_vec(),
+            tx,
+            Arc::clone(last_update),
+        ) {
+            Ok((iu, c)) => (iu, c),
+            Err(e) => {
+                let _ = opc_server.remove_group(server_handle, true);
+                return Err(e);
+            }
+        };
+
+        // P0-1 step D-6: best-effort keep-alive so a live DA 3.0 server periodically refreshes
+        // last_update (via dwcount=0 OnDataChange). DA 2.0 returns NotImplemented — ignored.
+        if let Err(e) = group.set_keep_alive(update_rate) {
+            tracing::debug!(
+                error = ?e,
+                "set_keep_alive unavailable; relying on min_timeout"
+            );
+        }
+
+        Ok((server_handle, group, sink_iunknown, cookie))
+    }
+
+    fn handle_subscribe(
+        server_name: &str,
+        tag_ids: &[String],
+        update_rate: u32,
+        opc_server: &C::Server,
+        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+        registry: &Arc<Mutex<HashMap<u32, MonitorEntry>>>,
+    ) -> OpcResult<SubscriptionHandle> {
+        let span = tracing::info_span!(
+            "opc.subscribe",
+            server = %server_name,
+            count = tag_ids.len(),
+            update_rate
+        );
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
         let (tx, rx) = mpsc::channel(256);
         // P0-1 step E: separate error channel for subscription-level failures (e.g. rebuild
         // failed after a dead callback). `error_tx` stays in the entry; `errors` goes to client.
@@ -1885,31 +1934,16 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
         let last_update = Arc::new(AtomicU64::new(now_ms));
-        // Build the sink + advise on the group. Either failing leaves a fresh empty group, so
-        // clean it up (P0-1 fix ①: a cast failure previously leaked the group).
-        let (sink_iunknown, cookie) = match Self::build_and_advise_data_callback(
-            &group,
-            tag_ids.to_vec(),
-            tx.clone(),
-            Arc::clone(&last_update),
-        ) {
-            Ok((iu, c)) => (iu, c),
-            Err(e) => {
-                let _ = opc_server.remove_group(server_handle, true);
-                return Err(e);
-            }
-        };
 
-        // P0-1 step D-6: best-effort keep-alive so a live DA 3.0 server periodically
-        // refreshes last_update (via dwcount=0 OnDataChange). On DA 2.0 (or any server
-        // without IOPCGroupStateMgt2) this returns NotImplemented — logged and ignored;
-        // we then rely on the monitor's min_timeout floor to avoid false rebuilds.
-        if let Err(e) = group.set_keep_alive(update_rate) {
-            tracing::debug!(
-                error = ?e,
-                "subscribe: set_keep_alive unavailable; relying on min_timeout"
-            );
-        }
+        // add_group + add_items + build sink + advise + keep-alive (shared with rebuild's
+        // reconnect path). Cleans up the group on any failure.
+        let (server_handle, group, sink_iunknown, cookie) = Self::create_group_and_advise(
+            opc_server,
+            tag_ids,
+            update_rate,
+            tx.clone(),
+            &last_update,
+        )?;
 
         // P0-1 step D: register for health monitoring. Uses the same `last_update` Arc as
         // the entry below, so a rebuild's `store` automatically refreshes the monitor's view.
@@ -1938,6 +1972,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 com_cookie: cookie,
                 tag_ids: tag_ids.to_vec(),
                 error_tx,
+                update_rate,
             },
         );
 
@@ -2014,8 +2049,31 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
     fn handle_rebuild_subscription(
         cookie: u32,
         subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+        cache: &mut HashMap<String, C::Server>,
+        connector: &Arc<C>,
     ) -> OpcResult<()> {
         let span = tracing::info_span!("opc.rebuild_subscription", cookie);
+        let _enter = span.enter();
+
+        // Phase 1: lightweight re-advise on the existing group (server alive, callback dead).
+        match Self::readvise_existing(cookie, subscriptions) {
+            Ok(()) => Ok(()),
+            Err(e) if is_connection_error(&e) => {
+                // Phase 2: server unreachable (e.g. process killed) → full reconnect.
+                tracing::warn!(error = ?e, "rebuild: server unreachable; full reconnect");
+                Self::reconnect_subscription(cookie, subscriptions, cache, connector)
+            }
+            Err(e) => Err(e), // non-connection error: report, don't reconnect
+        }
+    }
+
+    /// Lightweight rebuild (P0-1 original): unadvise the stale sink + re-advise a fresh sink on
+    /// the existing group. Fixes "callback dead, server alive". Does not touch the connection.
+    fn readvise_existing(
+        cookie: u32,
+        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+    ) -> OpcResult<()> {
+        let span = tracing::info_span!("opc.rebuild_readvise", cookie);
         let _enter = span.enter();
         let start = std::time::Instant::now();
 
@@ -2025,15 +2083,14 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             )));
         };
 
-        // Unadvise the stale sink first — the group still owns the items, only the callback
-        // is dead. A failure here (e.g. the server already dropped the connection point on
-        // RPC loss) is logged but not fatal: we still re-advise a fresh sink below.
+        // Unadvise the stale sink first — the group still owns the items, only the callback is
+        // dead. A failure here (server already dropped the connection point) is non-fatal.
         if let Err(e) = entry.group.unadvise_data_callback(entry.com_cookie) {
             tracing::warn!(error = ?e, "rebuild: unadvise of stale sink failed");
         }
 
-        // Build a fresh sink reusing the SAME channel: clone the entry's original tx so the
-        // client rx stays open, and reset the liveness clock for the new callback.
+        // Fresh sink reusing the SAME channel: clone the entry's original tx so the client rx
+        // stays open, and reset the liveness clock for the new callback.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
@@ -2048,15 +2105,84 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         let fresh_iunknown: windows::core::IUnknown = fresh_callback.cast()?;
         let new_cookie = entry.group.advise_data_callback(&fresh_iunknown)?;
 
-        // Swap the sink (dropping the old IUnknown releases the old callback object — its tx
-        // was only a clone, so the channel survives) and record the new COM cookie.
+        // Swap the sink (dropping the old IUnknown releases the old callback; its tx was only a
+        // clone, so the channel survives) and record the new COM cookie.
         entry.sink = fresh_iunknown;
         entry.com_cookie = new_cookie;
 
         tracing::info!(
             new_cookie,
             elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "subscription rebuilt"
+            "subscription rebuilt (lightweight re-advise)"
+        );
+        Ok(())
+    }
+
+    /// Full reconnect after a dead server (P0-1 增强): evict the stale server, reconnect
+    /// (DCOM/SCM relaunches it), and re-create group/items/sink with the SAME client `tx` (rx
+    /// stays open). Fixes "server process dead".
+    fn reconnect_subscription(
+        cookie: u32,
+        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+        cache: &mut HashMap<String, C::Server>,
+        connector: &Arc<C>,
+    ) -> OpcResult<()> {
+        let span = tracing::info_span!("opc.rebuild_reconnect", cookie);
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
+        // Clone rebuild materials, then release the entry borrow before connecting (avoid
+        // holding &mut entry across connector.connect / create_group_and_advise).
+        let (server_name, tag_ids, update_rate, tx_clone, last_update) = {
+            let Some(entry) = subscriptions.get(&cookie) else {
+                return Err(OpcError::InvalidState(format!(
+                    "reconnect: unknown subscription cookie {cookie}"
+                )));
+            };
+            (
+                entry.server_name.clone(),
+                entry.tag_ids.clone(),
+                entry.update_rate,
+                entry.tx.clone(),
+                Arc::clone(&entry.last_update),
+            )
+        };
+
+        // Reconnect: evict the stale server and create a fresh one (DCOM/SCM relaunches it).
+        cache.remove(&server_name);
+        let new_server = connector.connect(&server_name)?;
+
+        // Re-create group/items/sink on the new server (reuses the subscribe path).
+        let (server_handle, group, sink_iunknown, com_cookie) = Self::create_group_and_advise(
+            &new_server,
+            &tag_ids,
+            update_rate,
+            tx_clone,
+            &last_update,
+        )?;
+
+        // Pool the new server for subsequent read/write ops.
+        cache.insert(server_name, new_server);
+
+        // Swap into the entry (old group drops, releasing its COM interfaces; the channel
+        // survives because the new sink cloned the entry's original tx). Worker is
+        // single-threaded, so the entry cannot be unsubscribed mid-reconnect.
+        let entry = subscriptions.get_mut(&cookie).ok_or_else(|| {
+            OpcError::InvalidState(format!("reconnect: subscription {cookie} vanished"))
+        })?;
+        entry.server_handle = server_handle;
+        entry.group = group;
+        entry.sink = sink_iunknown;
+        entry.com_cookie = com_cookie;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        entry.last_update.store(now_ms, Ordering::Relaxed);
+
+        tracing::info!(
+            new_cookie = com_cookie,
+            elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "subscription rebuilt (full reconnect)"
         );
         Ok(())
     }
@@ -2197,6 +2323,9 @@ mod tests {
         /// Counts `remove_group` calls so a test can assert a subscribe failure cleans up its
         /// freshly-added group instead of leaking it (P0-1 review fix ①).
         remove_group_count: AtomicUsize,
+        /// P0-1 增强：前 N 次 `advise_data_callback` 返回 `0x800706BA`（RPC server unavailable），
+        /// 模拟死代理（server 进程死），驱动 rebuild 的重连路径测试。每次失败 dec；到 0 走正常 advise。
+        advise_fail_remaining: AtomicUsize,
     }
 
     struct ConfigurableMockConnector {
@@ -2326,7 +2455,20 @@ mod tests {
         }
 
         fn advise_data_callback(&self, _sink: &windows::core::IUnknown) -> OpcResult<u32> {
-            // P0-1 step E: simulate a rebuild whose re-advise fails (remote DCOM unreachable).
+            // P0-1 增强：模拟死代理（server 进程死）—— 前 N 次 advise 返 RPC 连接错误
+            // (0x800706BA)，驱动 rebuild 的重连路径。每次失败 dec；到 0 走正常 advise。
+            let remaining = self.state.advise_fail_remaining.load(Ordering::Relaxed);
+            if remaining > 0 {
+                self.state
+                    .advise_fail_remaining
+                    .store(remaining - 1, Ordering::Relaxed);
+                return Err(OpcError::Com {
+                    source: windows::core::Error::from_hresult(windows::core::HRESULT(
+                        0x800706BA_u32 as i32,
+                    )),
+                });
+            }
+            // P0-1 step E: simulate a rebuild whose re-advise fails (NotImplemented).
             if self.state.should_fail_advise.load(Ordering::Relaxed) {
                 return Err(OpcError::NotImplemented(
                     "advise_data_callback failed (simulated)".into(),
@@ -3443,6 +3585,100 @@ mod tests {
         assert!(
             matches!(err, OpcError::Internal(ref msg) if msg.contains("rebuild failed")),
             "error should describe the rebuild failure, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_reconnects_when_server_dead() {
+        // P0-1 增强：rebuild 的轻量 re-advise 失败且为连接错误（0x800706BA，server 死）时，
+        // 必须重连 server 并重建 group/items/sink，而非只报错。subscribe 成功后设
+        // advise_fail_remaining=1 → rebuild 轻量 re-advise 返连接错误 → 触发重连 → 新 server
+        // (connect_count 增加) + 新 group advise 成功 → rebuild Ok。
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        assert_eq!(state.advise_count.load(Ordering::Relaxed), 1);
+        let connect_after_subscribe = state.connect_count.load(Ordering::Relaxed);
+
+        // 下一次 advise（rebuild 的轻量 re-advise）返连接错误 → 触发重连。
+        state.advise_fail_remaining.store(1, Ordering::Relaxed);
+        worker
+            .send_request(|reply| ComRequest::RebuildSubscription {
+                cookie: handle.cookie,
+                reply,
+            })
+            .await
+            .expect("rebuild should succeed after reconnecting the dead server");
+
+        // 重连：connector.connect 再调一次（新 server）。
+        assert!(
+            state.connect_count.load(Ordering::Relaxed) > connect_after_subscribe,
+            "rebuild must reconnect the server after a connection error"
+        );
+        // 重连后新 group 的 advise 成功（subscribe=1 + 重连新 advise=2；轻量那次失败不计）。
+        assert_eq!(
+            state.advise_count.load(Ordering::Relaxed),
+            2,
+            "rebuild must re-advise on the new group after reconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_non_connection_error_does_not_reconnect() {
+        // P0-1：re-advise 失败但非连接错误（NotImplemented）时不重连（避免对非断线错误做无谓重连）。
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        let connect_after_subscribe = state.connect_count.load(Ordering::Relaxed);
+
+        // should_fail_advise → NotImplemented（非连接错误）。
+        state.should_fail_advise.store(true, Ordering::Relaxed);
+        let result = worker
+            .send_request(|reply| ComRequest::RebuildSubscription {
+                cookie: handle.cookie,
+                reply,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "rebuild should fail when re-advise returns a non-connection error"
+        );
+        assert_eq!(
+            state.connect_count.load(Ordering::Relaxed),
+            connect_after_subscribe,
+            "non-connection error must not trigger a reconnect"
         );
     }
 
