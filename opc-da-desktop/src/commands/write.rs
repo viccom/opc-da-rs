@@ -31,19 +31,25 @@ impl WriteRequest {
     /// as `Int` to avoid surprising the server. Arrays and objects are
     /// rejected — `opc-da-client` 0.3.0 does not expose a SafeArray write
     /// path.
+    #[allow(clippy::cast_precision_loss)] // 超 i32 的整数回退为 Float；i64→f64 精度损失可接受（OPC Float）
     fn to_opc_value(&self) -> Option<OpcValue> {
         match &self.value {
-            serde_json::Value::Null => None,
+            serde_json::Value::Null
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => None,
             serde_json::Value::Bool(b) => Some(OpcValue::Bool(*b)),
             serde_json::Value::Number(n) => {
                 if let Some(i) = n.as_i64() {
-                    Some(OpcValue::Int(i as i32))
+                    // 超 i32 范围的整数回退为 Float，避免截断。
+                    Some(match i32::try_from(i) {
+                        Ok(v) => OpcValue::Int(v),
+                        Err(_) => OpcValue::Float(i as f64),
+                    })
                 } else {
                     Some(OpcValue::Float(n.as_f64()?))
                 }
-            },
+            }
             serde_json::Value::String(s) => Some(OpcValue::String(s.clone())),
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => None,
         }
     }
 }

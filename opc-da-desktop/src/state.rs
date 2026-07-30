@@ -42,8 +42,7 @@ impl AppState {
     /// On Windows this starts the COM worker thread; on other platforms
     /// `OpcDaClient::new` returns an `Internal` error.
     pub fn new() -> DesktopResult<Self> {
-        let client = OpcDaClient::new(ComConnector::default())
-            .map_err(DesktopError::from)?;
+        let client = OpcDaClient::new(ComConnector::default()).map_err(DesktopError::from)?;
         Ok(Self {
             client: Arc::new(client),
             connected_prog_id: Mutex::new(None),

@@ -24,14 +24,14 @@
 //! natural-exit path (channel closed, stream ended).
 
 use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
 use tauri::State;
+use tauri::ipc::Channel;
 
 use opc_da_client::OpcProvider;
 
 use crate::error::{DesktopError, DesktopResult};
-use crate::ipc::subscription_runner::run_subscription;
 use crate::ipc::TagUpdate;
+use crate::ipc::subscription_runner::run_subscription;
 use crate::state::AppState;
 
 /// Result returned by `subscribe_tags`: the cookie used to identify
@@ -96,10 +96,7 @@ pub async fn subscribe_tags(
 /// releases the COM group and the runner's `rx` reaches `None` — the
 /// runner then exits on its own.
 #[tauri::command]
-pub async fn unsubscribe_tags(
-    state: State<'_, AppState>,
-    cookie: u32,
-) -> DesktopResult<()> {
+pub async fn unsubscribe_tags(state: State<'_, AppState>, cookie: u32) -> DesktopResult<()> {
     if !state.forget_cookie(cookie).await {
         return Err(DesktopError::NotFound(format!("subscription {cookie}")));
     }

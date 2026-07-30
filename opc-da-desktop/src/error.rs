@@ -45,7 +45,9 @@ impl DesktopError {
 /// Shape: `{ "kind": "opc" | "tauri" | ... , "message": "..." }`.
 impl Serialize for DesktopError {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where S: serde::Serializer {
+    where
+        S: serde::Serializer,
+    {
         #[derive(Serialize)]
         struct Repr<'a> {
             kind: &'a str,
@@ -59,13 +61,19 @@ impl Serialize for DesktopError {
             Self::NotConnected => "not_connected",
             Self::Other(_) => "other",
         };
-        Repr { kind, message: self.to_string() }.serialize(serializer)
+        Repr {
+            kind,
+            message: self.to_string(),
+        }
+        .serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for DesktopError {
     fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
-    where D: serde::Deserializer<'de> {
+    where
+        D: serde::Deserializer<'de>,
+    {
         // Inbound errors from JS are not expected; we accept any and turn into
         // `Other` so deserialization cannot fail the IPC pipeline.
         Ok(Self::Other("(deserialized from JS)".into()))

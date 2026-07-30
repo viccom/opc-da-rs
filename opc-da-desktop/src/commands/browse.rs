@@ -19,8 +19,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::ipc::Channel;
 use tauri::State;
+use tauri::ipc::Channel;
 
 use opc_da_client::OpcProvider;
 
@@ -39,6 +39,11 @@ pub struct TagDescriptor {
 /// `max_tags` caps the total result (default 1000). The handler
 /// resolves only after the browse has finished (Ok or Err) **and** the
 /// drain task has flushed everything into the channel.
+///
+/// # Panics
+///
+/// Panics if the shared tag-sink mutex is poisoned (a drain task panicked
+/// while holding the lock).
 #[tauri::command]
 pub async fn browse_tags(
     state: State<'_, AppState>,
@@ -79,10 +84,7 @@ pub async fn browse_tags(
             };
             last_seen += new.len();
             for item_id in new {
-                if channel_for_drain
-                    .send(TagDescriptor { item_id })
-                    .is_err()
-                {
+                if channel_for_drain.send(TagDescriptor { item_id }).is_err() {
                     return; // WebView dropped
                 }
             }
@@ -96,7 +98,14 @@ pub async fn browse_tags(
     });
 
     let result = client
-        .browse_tags(&prog_id, max, Arc::clone(&progress), Arc::clone(&sink), 0, 0)
+        .browse_tags(
+            &prog_id,
+            max,
+            Arc::clone(&progress),
+            Arc::clone(&sink),
+            0,
+            0,
+        )
         .await
         .map_err(DesktopError::from);
 

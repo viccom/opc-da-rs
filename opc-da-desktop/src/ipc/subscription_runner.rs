@@ -35,7 +35,7 @@ pub async fn run_subscription(
         let next = tokio::select! {
             biased;
             next = rx.recv() => next,
-            _ = tokio::time::sleep(Duration::from_millis(50)) => continue,
+            () = tokio::time::sleep(Duration::from_millis(50)) => continue,
         };
         match next {
             Some(tag_value) => {
@@ -43,11 +43,11 @@ pub async fn run_subscription(
                     tracing::warn!(cookie, "channel send failed; WebView likely disconnected");
                     break;
                 }
-            },
+            }
             None => {
                 tracing::info!(cookie, "subscription stream ended");
                 break;
-            },
+            }
         }
     }
 

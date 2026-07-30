@@ -5,6 +5,11 @@ use tauri::Manager;
 use crate::state::AppState;
 
 /// Initialize logging, build the Tauri app, register IPC handlers, run.
+///
+/// # Panics
+///
+/// Panics if the OPC COM worker fails to start (`AppState::new`), or if
+/// `tauri::generate_context!` cannot run the app (e.g. missing frontend dist).
 pub fn run() {
     init_tracing();
 
@@ -33,27 +38,22 @@ pub fn run() {
 
 /// Initialize tracing with a daily-rolling file appender + env filter.
 fn init_tracing() {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
     let file_appender = tracing_appender_localtime::rolling::daily(
         std::path::Path::new("logs"),
         "opc-da-desktop.log",
     );
-    let (file_writer, _guard) = tracing_appender_localtime::non_blocking(file_appender);
+    let (file_writer, guard) = tracing_appender_localtime::non_blocking(file_appender);
 
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new("info,opc_da_client=info,opc_da_desktop=info")
-    });
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,opc_da_client=info,opc_da_desktop=info"));
 
     tracing_subscriber::registry()
         .with(filter)
-        .with(
-            fmt::layer()
-                .with_writer(file_writer)
-                .with_ansi(false),
-        )
+        .with(fmt::layer().with_writer(file_writer).with_ansi(false))
         .init();
 
     // Keep the guard alive for the lifetime of the process.
-    Box::leak(Box::new(_guard));
+    Box::leak(Box::new(guard));
 }
