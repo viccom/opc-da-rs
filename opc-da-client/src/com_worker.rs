@@ -254,6 +254,9 @@ struct SubscriptionEntry<C: ServerConnector + 'static> {
     /// Subscribed tag IDs (P0-1 step C), kept so a rebuilt sink can rebuild its client-handle
     /// → tag-id map without re-adding items to the group.
     tag_ids: Vec<String>,
+    /// Original error-channel sender (P0-1 step E): the worker pushes a rebuild-failure
+    /// `OpcError` here so the client's `SubscriptionHandle.errors` can surface it. Best-effort.
+    error_tx: mpsc::Sender<OpcError>,
 }
 
 /// Worker-side tracked state for a shutdown subscription (server-level; no group).
@@ -295,6 +298,13 @@ impl HealthMonitorConfig {
 struct MonitorEntry {
     last_update: Arc<AtomicU64>,
     update_rate_ms: u32,
+    /// Pending rebuild reply (P0-1 step E): Some while a RebuildSubscription is in flight;
+    /// the monitor `try_recv`s it next cycle to learn success/failure for backoff.
+    pending: Option<oneshot::Receiver<OpcResult<()>>>,
+    /// Consecutive rebuild failures (P0-1 step E); drives exponential backoff.
+    consecutive_failures: u32,
+    /// Epoch-ms before which rebuild should NOT be retried (P0-1 step E backoff window).
+    next_retry_after_ms: u64,
 }
 
 pub struct ComWorker<C: ServerConnector + 'static> {
@@ -362,49 +372,71 @@ fn spawn_health_monitor(
             if shutdown.load(Ordering::Relaxed) {
                 break;
             }
-            // Snapshot under the lock; do time math + try_send outside the critical section.
-            let snapshot: Vec<(u32, Arc<AtomicU64>, u32)> = {
-                let Ok(guard) = registry.lock() else {
+            let now = now_ms();
+            let min_timeout_ms = u32::try_from(config.min_timeout.as_millis()).unwrap_or(u32::MAX);
+            // Under the lock: drain pending rebuild replies, apply backoff, collect stale
+            // cookies. Time math is cheap and non-blocking; try_send runs after the unlock.
+            let triggers: Vec<u32> = {
+                let Ok(mut guard) = registry.lock() else {
                     continue;
                 };
                 guard
-                    .iter()
-                    .map(|(&cookie, entry)| {
-                        (cookie, Arc::clone(&entry.last_update), entry.update_rate_ms)
+                    .iter_mut()
+                    .filter_map(|(&cookie, entry)| {
+                        // (1) Drain a pending rebuild reply (try_recv is non-blocking).
+                        if let Some(mut rx) = entry.pending.take() {
+                            match rx.try_recv() {
+                                Ok(Ok(())) => {
+                                    entry.consecutive_failures = 0;
+                                    entry.next_retry_after_ms = 0;
+                                }
+                                Ok(Err(_)) => {
+                                    entry.consecutive_failures =
+                                        entry.consecutive_failures.saturating_add(1);
+                                    entry.next_retry_after_ms = now
+                                        + monitor_backoff_ms(
+                                            entry.consecutive_failures,
+                                            config.period,
+                                        );
+                                }
+                                Err(_) => {
+                                    entry.pending = Some(rx); // Empty: rebuild still in flight
+                                    return None;
+                                }
+                            }
+                        }
+                        // (2) Backoff window: don't retry right after a failure.
+                        if now < entry.next_retry_after_ms {
+                            return None;
+                        }
+                        // (3) Staleness check.
+                        let threshold = entry.update_rate_ms.saturating_mul(3).max(min_timeout_ms);
+                        let stale = now.saturating_sub(entry.last_update.load(Ordering::Relaxed))
+                            > u64::from(threshold);
+                        stale.then_some(cookie)
                     })
                     .collect()
             };
-            let now = now_ms();
-            for (cookie, last_update, update_rate_ms) in snapshot {
-                let threshold = update_rate_ms
-                    .saturating_mul(3)
-                    .max(u32::try_from(config.min_timeout.as_millis()).unwrap_or(u32::MAX));
-                if now.saturating_sub(last_update.load(Ordering::Relaxed)) > u64::from(threshold) {
-                    // Fire-and-forget: drop the receiver; the worker does `let _ = reply.send`.
-                    let (reply, _reply_rx) = oneshot::channel();
-                    match tx.try_send(ComRequest::RebuildSubscription { cookie, reply }) {
-                        Ok(()) => {
-                            tracing::info!(
-                                cookie,
-                                age_ms = now.saturating_sub(last_update.load(Ordering::Relaxed)),
-                                threshold,
-                                "stale subscription detected; triggering rebuild"
-                            );
-                            // Reset so we don't fire a rebuild storm every cycle while the
-                            // worker processes the request (handle_rebuild_subscription
-                            // also resets — same Arc).
-                            last_update.store(now, Ordering::Relaxed);
+            // Outside the lock: fire rebuilds, store the reply receiver for next cycle.
+            for cookie in triggers {
+                let (reply, reply_rx) = oneshot::channel();
+                match tx.try_send(ComRequest::RebuildSubscription { cookie, reply }) {
+                    Ok(()) => {
+                        if let Ok(mut guard) = registry.lock()
+                            && let Some(entry) = guard.get_mut(&cookie)
+                        {
+                            entry.pending = Some(reply_rx);
+                            // Anti-storm: reset so we don't refire every cycle while the
+                            // rebuild is in flight (handle_rebuild_subscription also resets).
+                            entry.last_update.store(now, Ordering::Relaxed);
                         }
-                        Err(mpsc::error::TrySendError::Full(_)) => {
-                            tracing::warn!(
-                                cookie,
-                                "worker channel full; skipping rebuild this cycle"
-                            );
-                        }
-                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                            tracing::debug!("worker channel closed; health monitor exiting");
-                            return;
-                        }
+                    }
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        tracing::warn!(cookie, "worker channel full; skipping rebuild this cycle");
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tracing::debug!("worker channel closed; health monitor exiting");
+                        return;
                     }
                 }
             }
@@ -415,6 +447,14 @@ fn spawn_health_monitor(
 
 /// Sleep for `total`, checking `shutdown` every 10ms so the monitor responds to teardown
 /// within ~10ms instead of waiting a full period.
+/// Exponential backoff (ms) for repeated rebuild failures (P0-1 step E): `period * 2^n`,
+/// capped at 5 minutes so a recovering server is eventually retried.
+fn monitor_backoff_ms(consecutive_failures: u32, period: Duration) -> u64 {
+    let period_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX);
+    let n = consecutive_failures.min(8); // cap exponent
+    period_ms.saturating_mul(1u64 << n).min(5 * 60 * 1000)
+}
+
 fn segmented_sleep(shutdown: &AtomicBool, total: Duration) {
     let chunk = Duration::from_millis(10);
     let mut remaining = total;
@@ -712,6 +752,16 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                         ComRequest::RebuildSubscription { cookie, reply } => {
                             let result =
                                 Self::handle_rebuild_subscription(cookie, &mut subscriptions);
+                            // P0-1 step E: surface a rebuild failure on the subscription's
+                            // error channel so consumers can see it (not silent). Unknown cookie
+                            // (entry gone) yields no signal — nothing to report to.
+                            if let Err(ref e) = result
+                                && let Some(entry) = subscriptions.get(&cookie)
+                            {
+                                let _ = entry.error_tx.try_send(OpcError::Internal(format!(
+                                    "subscription rebuild failed: {e}"
+                                )));
+                            }
                             let _ = reply.send(result);
                         }
                         ComRequest::SubscribeShutdown { server, reply } => {
@@ -1802,6 +1852,9 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         }
 
         let (tx, rx) = mpsc::channel(256);
+        // P0-1 step E: separate error channel for subscription-level failures (e.g. rebuild
+        // failed after a dead callback). `error_tx` stays in the entry; `errors` goes to client.
+        let (error_tx, errors) = mpsc::channel(8);
         // P0-1: liveness timestamp stamped by each OnDataChange; shared with the health
         // monitor to detect a silently-dead callback and trigger rebuild.
         let now_ms = std::time::SystemTime::now()
@@ -1844,6 +1897,9 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 MonitorEntry {
                     last_update: Arc::clone(&last_update),
                     update_rate_ms: update_rate,
+                    pending: None,
+                    consecutive_failures: 0,
+                    next_retry_after_ms: 0,
                 },
             );
         }
@@ -1859,6 +1915,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 tx,
                 com_cookie: cookie,
                 tag_ids: tag_ids.to_vec(),
+                error_tx,
             },
         );
 
@@ -1867,7 +1924,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
             "subscribe established"
         );
-        Ok(SubscriptionHandle { cookie, rx })
+        Ok(SubscriptionHandle { cookie, rx, errors })
     }
 
     fn handle_subscribe_request(
@@ -2112,6 +2169,9 @@ mod tests {
         /// P0-1 step D-6: when set, set_keep_alive returns NotImplemented (simulates DA 2.0,
         /// where IOPCGroupStateMgt2 / keep-alive is unavailable).
         should_fail_keep_alive: AtomicBool,
+        /// P0-1 step E: when set, advise_data_callback returns NotImplemented — simulates a
+        /// rebuild whose re-advise fails (e.g. remote DCOM sink unreachable / 0x800706BA).
+        should_fail_advise: AtomicBool,
     }
 
     struct ConfigurableMockConnector {
@@ -2241,6 +2301,12 @@ mod tests {
         }
 
         fn advise_data_callback(&self, _sink: &windows::core::IUnknown) -> OpcResult<u32> {
+            // P0-1 step E: simulate a rebuild whose re-advise fails (remote DCOM unreachable).
+            if self.state.should_fail_advise.load(Ordering::Relaxed) {
+                return Err(OpcError::NotImplemented(
+                    "advise_data_callback failed (simulated)".into(),
+                ));
+            }
             self.state.advise_count.fetch_add(1, Ordering::Relaxed);
             // P0-1: monotonically increasing cookie so rebuild (re-advise) yields a
             // distinct cookie, mirroring real OPC IConnectionPoint::Advise.
@@ -3230,6 +3296,187 @@ mod tests {
             state.keep_alive_count.load(Ordering::Relaxed),
             1,
             "set_keep_alive must still be invoked (and its failure absorbed)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_yields_empty_error_channel() {
+        // P0-1 E-1: subscribe returns a handle with a separate error channel alongside rx
+        // (rx stays pure TagValue). Right after subscribe the error channel is empty.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let mut handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        assert!(
+            matches!(
+                handle.errors.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ),
+            "error channel should be empty right after a fresh subscribe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_failure_surfaces_on_error_channel() {
+        // P0-1 E-2: when a rebuild's re-advise fails, the worker must push an OpcError onto the
+        // subscription's error channel (not silent). The mock advises succeed at subscribe but
+        // fail on the rebuild's re-advise.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let mut handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        assert_eq!(state.advise_count.load(Ordering::Relaxed), 1);
+
+        // Make the rebuild's re-advise fail, then trigger a rebuild directly.
+        state.should_fail_advise.store(true, Ordering::Relaxed);
+        worker
+            .send_request(|reply| ComRequest::RebuildSubscription {
+                cookie: handle.cookie,
+                reply,
+            })
+            .await
+            .expect_err("rebuild should fail when re-advise fails");
+
+        // The failure must surface on the error channel (not be silent).
+        let err = tokio::time::timeout(std::time::Duration::from_millis(200), handle.errors.recv())
+            .await
+            .expect("error channel should receive the rebuild failure")
+            .expect("error channel must stay open");
+        assert!(
+            matches!(err, OpcError::Internal(ref msg) if msg.contains("rebuild failed")),
+            "error should describe the rebuild failure, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_monitor_backoff_on_repeated_rebuild_failure() {
+        // P0-1 E-3: repeated rebuild failures trigger exponential backoff. Without backoff the
+        // monitor fires roughly every (threshold+period) ≈ 150ms (~13 attempts in 2s); backoff
+        // (period*2^n) slows it to a handful. Observed via unadvise_count (ticks once per
+        // rebuild attempt — unadvise succeeds even when the subsequent re-advise fails).
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(
+                connector,
+                HealthMonitorConfig {
+                    period: std::time::Duration::from_millis(50),
+                    min_timeout: std::time::Duration::from_millis(100),
+                },
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+
+        let _handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 10,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        state.should_fail_advise.store(true, Ordering::Relaxed);
+
+        // 2s window: without backoff ~13 attempts; with exponential backoff a handful.
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let attempts = state.unadvise_count.load(Ordering::Relaxed);
+        assert!(
+            attempts <= 7,
+            "exponential backoff must slow repeated rebuild failures, got {attempts} in 2s"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_monitor_backoff_resets_on_success() {
+        // P0-1 E-4: after backoff from repeated failures, a successful rebuild resets the
+        // backoff (consecutive_failures=0) and the monitor resumes — advise_count climbs.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(
+                connector,
+                HealthMonitorConfig {
+                    period: std::time::Duration::from_millis(50),
+                    min_timeout: std::time::Duration::from_millis(100),
+                },
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+
+        let _handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 10,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        assert_eq!(state.advise_count.load(Ordering::Relaxed), 1);
+
+        // Phase 1: fail rebuilds for ~500ms → backoff kicks in (advise_count stays at 1).
+        state.should_fail_advise.store(true, Ordering::Relaxed);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(
+            state.advise_count.load(Ordering::Relaxed),
+            1,
+            "failed rebuilds must not increment advise_count"
+        );
+
+        // Phase 2: let rebuilds succeed again. After a successful rebuild the backoff window
+        // clears and the monitor resumes — advise_count climbs past 1.
+        state.should_fail_advise.store(false, Ordering::Relaxed);
+        let mut recovered = false;
+        for _ in 0..100 {
+            // ~5s ceiling
+            if state.advise_count.load(Ordering::Relaxed) >= 2 {
+                recovered = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            recovered,
+            "a successful rebuild after backoff must reset and resume (advise_count should climb)"
         );
     }
 
