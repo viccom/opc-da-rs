@@ -14,7 +14,9 @@ use crate::provider::{OpcValue, ShutdownHandle, SubscriptionHandle, TagValue, Wr
 use crate::subscription::{DataCallbackSink, ShutdownSink};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use windows::Win32::System::Variant::VariantClear;
 use windows::core::Interface as _;
@@ -261,6 +263,40 @@ struct ShutdownEntry {
     sink: windows::core::IUnknown,
 }
 
+/// Tuning parameters for the subscription health monitor thread (P0-1 step D).
+///
+/// Intentionally no `Default` impl: a zero `period` would busy-loop the monitor.
+#[derive(Clone, Copy, Debug)]
+pub struct HealthMonitorConfig {
+    /// Sleep between scans of the subscription registry.
+    pub period: Duration,
+    /// Lower bound on the staleness threshold (see the timeout formula in
+    /// `spawn_health_monitor`). Guards against false rebuilds for quiet DA 2.0 tags
+    /// that legitimately go long without data changes.
+    pub min_timeout: Duration,
+}
+
+impl HealthMonitorConfig {
+    /// Production defaults: 1s scan cadence, 30s conservative staleness floor.
+    #[must_use]
+    pub const fn production() -> Self {
+        Self {
+            period: Duration::from_secs(1),
+            min_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// Per-subscription state the health monitor observes (P0-1 step D).
+///
+/// `last_update` is the **same `Arc`** as `SubscriptionEntry::last_update` (created
+/// together in `handle_subscribe`), so the rebuild handler's `store` automatically
+/// refreshes what the monitor reads.
+struct MonitorEntry {
+    last_update: Arc<AtomicU64>,
+    update_rate_ms: u32,
+}
+
 pub struct ComWorker<C: ServerConnector + 'static> {
     /// Channel sender for dispatching requests to the worker loop.
     ///
@@ -274,6 +310,20 @@ pub struct ComWorker<C: ServerConnector + 'static> {
     /// Last panic payload captured from the worker thread (if any). See
     /// [`ComWorker::captured_panic`].
     last_panic: Arc<std::sync::Mutex<Option<String>>>,
+    /// Shared registry of active subscriptions the health monitor scans (P0-1 step D):
+    /// cookie → (liveness timestamp Arc, update_rate). Worker inserts/removes; monitor reads.
+    ///
+    /// Held on `ComWorker` only for test observability (D-2/D-5 read it through the worker);
+    /// the worker and monitor threads keep their own clones, so production code never reads
+    /// this field directly.
+    #[allow(dead_code)]
+    monitor_registry: Arc<Mutex<HashMap<u32, MonitorEntry>>>,
+    /// Health monitor thread join handle; joined in `Drop` *before* closing the worker
+    /// channel so the monitor's `tx` clone is released first (else `blocking_recv` never
+    /// returns `None` and the worker join deadlocks).
+    monitor_handle: Option<std::thread::JoinHandle<()>>,
+    /// Shutdown flag for the health monitor thread.
+    monitor_shutdown: Arc<AtomicBool>,
     _phantom: std::marker::PhantomData<C>,
 }
 
@@ -287,6 +337,102 @@ fn stringify_panic_payload(payload: &Box<dyn std::any::Any + Send>) -> String {
     } else {
         "<non-string panic payload>".to_string()
     }
+}
+
+/// Spawn the subscription health monitor thread (P0-1 step D).
+///
+/// Periodically scans the shared registry; for any subscription whose `last_update` is
+/// older than `max(update_rate*3, min_timeout)`, fires a `RebuildSubscription` request
+/// (fire-and-forget) so the worker rebuilds the dead callback sink. Touches no COM
+/// pointers — only shared atomics + the request channel.
+fn spawn_health_monitor(
+    tx: mpsc::Sender<ComRequest>,
+    registry: Arc<Mutex<HashMap<u32, MonitorEntry>>>,
+    shutdown: Arc<AtomicBool>,
+    config: HealthMonitorConfig,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        tracing::debug!(
+            period = ?config.period,
+            min_timeout = ?config.min_timeout,
+            "subscription health monitor thread spawned"
+        );
+        while !shutdown.load(Ordering::Relaxed) {
+            segmented_sleep(&shutdown, config.period);
+            if shutdown.load(Ordering::Relaxed) {
+                break;
+            }
+            // Snapshot under the lock; do time math + try_send outside the critical section.
+            let snapshot: Vec<(u32, Arc<AtomicU64>, u32)> = {
+                let Ok(guard) = registry.lock() else {
+                    continue;
+                };
+                guard
+                    .iter()
+                    .map(|(&cookie, entry)| {
+                        (cookie, Arc::clone(&entry.last_update), entry.update_rate_ms)
+                    })
+                    .collect()
+            };
+            let now = now_ms();
+            for (cookie, last_update, update_rate_ms) in snapshot {
+                let threshold = update_rate_ms
+                    .saturating_mul(3)
+                    .max(u32::try_from(config.min_timeout.as_millis()).unwrap_or(u32::MAX));
+                if now.saturating_sub(last_update.load(Ordering::Relaxed)) > u64::from(threshold) {
+                    // Fire-and-forget: drop the receiver; the worker does `let _ = reply.send`.
+                    let (reply, _reply_rx) = oneshot::channel();
+                    match tx.try_send(ComRequest::RebuildSubscription { cookie, reply }) {
+                        Ok(()) => {
+                            tracing::info!(
+                                cookie,
+                                age_ms = now.saturating_sub(last_update.load(Ordering::Relaxed)),
+                                threshold,
+                                "stale subscription detected; triggering rebuild"
+                            );
+                            // Reset so we don't fire a rebuild storm every cycle while the
+                            // worker processes the request (handle_rebuild_subscription
+                            // also resets — same Arc).
+                            last_update.store(now, Ordering::Relaxed);
+                        }
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            tracing::warn!(
+                                cookie,
+                                "worker channel full; skipping rebuild this cycle"
+                            );
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => {
+                            tracing::debug!("worker channel closed; health monitor exiting");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        tracing::debug!("subscription health monitor thread exiting");
+    })
+}
+
+/// Sleep for `total`, checking `shutdown` every 10ms so the monitor responds to teardown
+/// within ~10ms instead of waiting a full period.
+fn segmented_sleep(shutdown: &AtomicBool, total: Duration) {
+    let chunk = Duration::from_millis(10);
+    let mut remaining = total;
+    while remaining > Duration::ZERO {
+        let step = chunk.min(remaining);
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+        if shutdown.load(Ordering::Relaxed) {
+            return;
+        }
+    }
+}
+
+/// Current time as milliseconds since `UNIX_EPOCH` (0 on clock read failure).
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
 #[allow(clippy::cast_possible_wrap)]
@@ -303,8 +449,19 @@ fn is_connection_error(err: &OpcError) -> bool {
 }
 
 impl<C: ServerConnector + 'static> ComWorker<C> {
-    #[allow(clippy::too_many_lines)]
     pub fn start(connector: Arc<C>) -> Result<Self, OpcError> {
+        Self::start_with_health(connector, HealthMonitorConfig::production())
+    }
+
+    /// Like [`start`](Self::start) but with an explicit health-monitor configuration.
+    ///
+    /// Production callers use [`start`](Self::start); tests pass short tuning so the
+    /// monitor triggers within a reasonable wall-clock window.
+    #[allow(clippy::too_many_lines)]
+    pub fn start_with_health(
+        connector: Arc<C>,
+        health: HealthMonitorConfig,
+    ) -> Result<Self, OpcError> {
         let (tx, mut rx) = mpsc::channel(32);
         let (init_tx, init_rx) = std::sync::mpsc::channel();
         // Shared cell capturing the worker thread's last panic payload (P0-3/P0-4).
@@ -312,6 +469,11 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         let last_panic: Arc<std::sync::Mutex<Option<String>>> =
             Arc::new(std::sync::Mutex::new(None));
         let worker_last_panic = Arc::clone(&last_panic);
+        // P0-1 step D: shared subscription registry the health monitor scans, plus its
+        // shutdown flag. The worker inserts/removes (step D-2); the monitor reads (D-3).
+        let monitor_registry = Arc::new(Mutex::new(HashMap::<u32, MonitorEntry>::new()));
+        let worker_registry = Arc::clone(&monitor_registry);
+        let monitor_shutdown = Arc::new(AtomicBool::new(false));
 
         let handle = std::thread::spawn(move || {
             tracing::debug!("COM worker thread spawned, initializing COM (MTA)");
@@ -531,6 +693,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                                 &connector,
                                 &mut cache,
                                 &mut subscriptions,
+                                &worker_registry,
                                 &server,
                                 &tag_ids,
                                 update_rate,
@@ -538,8 +701,12 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                             let _ = reply.send(result);
                         }
                         ComRequest::Unsubscribe { cookie, reply } => {
-                            let result =
-                                Self::handle_unsubscribe(cookie, &cache, &mut subscriptions);
+                            let result = Self::handle_unsubscribe(
+                                cookie,
+                                &cache,
+                                &mut subscriptions,
+                                &worker_registry,
+                            );
                             let _ = reply.send(result);
                         }
                         ComRequest::RebuildSubscription { cookie, reply } => {
@@ -648,10 +815,27 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
 
         tracing::debug!("COM worker thread started");
 
+        // P0-1 step D: spawn the health monitor only after init succeeds, so it never
+        // fires into an already-dead worker.
+        //
+        // SAFETY: `tx.clone()` is the one intentional clone of the request sender handed
+        // to another thread. It is safe because `Drop` joins this monitor thread (which
+        // drops the clone) *before* taking `self.sender`, so the worker's `blocking_recv`
+        // still observes `None` and exits.
+        let monitor_handle = spawn_health_monitor(
+            tx.clone(),
+            Arc::clone(&monitor_registry),
+            Arc::clone(&monitor_shutdown),
+            health,
+        );
+
         Ok(Self {
             sender: Some(tx),
             handle: Some(handle),
             last_panic,
+            monitor_registry,
+            monitor_handle: Some(monitor_handle),
+            monitor_shutdown,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -1564,6 +1748,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         update_rate: u32,
         opc_server: &C::Server,
         subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+        registry: &Arc<Mutex<HashMap<u32, MonitorEntry>>>,
     ) -> OpcResult<SubscriptionHandle> {
         let span = tracing::info_span!(
             "opc.subscribe",
@@ -1640,6 +1825,29 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             }
         };
 
+        // P0-1 step D-6: best-effort keep-alive so a live DA 3.0 server periodically
+        // refreshes last_update (via dwcount=0 OnDataChange). On DA 2.0 (or any server
+        // without IOPCGroupStateMgt2) this returns NotImplemented — logged and ignored;
+        // we then rely on the monitor's min_timeout floor to avoid false rebuilds.
+        if let Err(e) = group.set_keep_alive(update_rate) {
+            tracing::debug!(
+                error = ?e,
+                "subscribe: set_keep_alive unavailable; relying on min_timeout"
+            );
+        }
+
+        // P0-1 step D: register for health monitoring. Uses the same `last_update` Arc as
+        // the entry below, so a rebuild's `store` automatically refreshes the monitor's view.
+        if let Ok(mut guard) = registry.lock() {
+            guard.insert(
+                cookie,
+                MonitorEntry {
+                    last_update: Arc::clone(&last_update),
+                    update_rate_ms: update_rate,
+                },
+            );
+        }
+
         subscriptions.insert(
             cookie,
             SubscriptionEntry {
@@ -1666,6 +1874,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         connector: &Arc<C>,
         cache: &mut HashMap<String, C::Server>,
         subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+        registry: &Arc<Mutex<HashMap<u32, MonitorEntry>>>,
         server_name: &str,
         tag_ids: &[String],
         update_rate: u32,
@@ -1676,13 +1885,21 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 e.insert(connector.connect(server_name)?)
             }
         };
-        Self::handle_subscribe(server_name, tag_ids, update_rate, srv, subscriptions)
+        Self::handle_subscribe(
+            server_name,
+            tag_ids,
+            update_rate,
+            srv,
+            subscriptions,
+            registry,
+        )
     }
 
     fn handle_unsubscribe(
         cookie: u32,
         cache: &HashMap<String, C::Server>,
         subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+        registry: &Arc<Mutex<HashMap<u32, MonitorEntry>>>,
     ) -> OpcResult<()> {
         let span = tracing::info_span!("opc.unsubscribe", cookie);
         let _enter = span.enter();
@@ -1692,6 +1909,10 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 "unknown subscription cookie {cookie}"
             )));
         };
+        // P0-1 step D: stop monitoring this subscription.
+        if let Ok(mut guard) = registry.lock() {
+            guard.remove(&cookie);
+        }
         // Unadvise first (group still alive), then remove the group. Use the tracked COM
         // cookie, which may differ from the client cookie after a P0-1 rebuild re-advised.
         if let Err(e) = entry.group.unadvise_data_callback(entry.com_cookie) {
@@ -1812,8 +2033,21 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
 
 impl<C: ServerConnector + 'static> Drop for ComWorker<C> {
     fn drop(&mut self) {
-        tracing::debug!("ComWorker dropping — closing channel and joining worker thread");
-        // Close the request channel first so the worker loop exits cleanly.
+        tracing::debug!("ComWorker dropping — shutting down health monitor, then worker");
+        // P0-1 step D: signal + join the health monitor FIRST so its `tx` clone is
+        // released. Otherwise that clone keeps the request channel open, the worker's
+        // `blocking_recv` never returns `None`, and the worker join below deadlocks.
+        self.monitor_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.monitor_handle.take()
+            && let Err(payload) = handle.join()
+        {
+            let msg = stringify_panic_payload(&payload);
+            tracing::error!(
+                panic = %msg,
+                "health monitor thread panicked during teardown"
+            );
+        }
+        // Close the request channel (now the last sender) so the worker loop exits.
         self.sender.take();
         // P0-3: join the worker thread for deterministic teardown so cached COM
         // resources are released before drop returns (no orphaned thread still
@@ -1873,6 +2107,11 @@ mod tests {
         advise_count: AtomicUsize,
         unadvise_count: AtomicUsize,
         next_cookie: AtomicUsize,
+        /// P0-1 step D-6: counts set_keep_alive invocations (success or failure).
+        keep_alive_count: AtomicUsize,
+        /// P0-1 step D-6: when set, set_keep_alive returns NotImplemented (simulates DA 2.0,
+        /// where IOPCGroupStateMgt2 / keep-alive is unavailable).
+        should_fail_keep_alive: AtomicBool,
     }
 
     struct ConfigurableMockConnector {
@@ -2014,6 +2253,17 @@ mod tests {
         fn unadvise_data_callback(&self, _cookie: u32) -> OpcResult<()> {
             self.state.unadvise_count.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+
+        fn set_keep_alive(&self, keep_alive_ms: u32) -> OpcResult<u32> {
+            self.state.keep_alive_count.fetch_add(1, Ordering::Relaxed);
+            if self.state.should_fail_keep_alive.load(Ordering::Relaxed) {
+                Err(OpcError::NotImplemented(
+                    "set_keep_alive not supported (simulated DA 2.0)".into(),
+                ))
+            } else {
+                Ok(keep_alive_ms)
+            }
         }
     }
 
@@ -2693,6 +2943,294 @@ mod tests {
         );
 
         drop(worker);
+    }
+
+    #[tokio::test]
+    async fn test_start_with_health_constructs_and_drops_cleanly() {
+        // P0-1 D-1: start_with_health constructs a worker + health monitor thread whose
+        // Drop joins the monitor *before* closing the worker channel. If the join order
+        // were wrong, `drop(worker)` would deadlock (the monitor's tx clone keeps the
+        // channel open → worker blocking_recv never returns None → worker join hangs).
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(
+                connector,
+                HealthMonitorConfig {
+                    period: std::time::Duration::from_millis(50),
+                    min_timeout: std::time::Duration::from_millis(100),
+                },
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+        assert!(
+            worker.sender.is_some(),
+            "worker should hold a request sender"
+        );
+        // Drop must return — proves the monitor join precedes channel close.
+        drop(worker);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_registers_in_monitor_registry() {
+        // P0-1 D-2: subscribe registers the cookie in the shared health-monitor registry;
+        // unsubscribe removes it. (The monitor scan itself lands in D-3.)
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+
+        let cookie = handle.cookie;
+        assert!(
+            worker
+                .monitor_registry
+                .lock()
+                .is_ok_and(|g| g.contains_key(&cookie)),
+            "subscribe must register the cookie in the monitor registry"
+        );
+
+        worker
+            .send_request(|reply| ComRequest::Unsubscribe { cookie, reply })
+            .await
+            .expect("unsubscribe should succeed");
+        assert!(
+            !worker
+                .monitor_registry
+                .lock()
+                .map_or(true, |g| g.contains_key(&cookie)),
+            "unsubscribe must remove the cookie from the monitor registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_stale_triggers_rebuild() {
+        // P0-1 D-3: when a subscription's last_update goes stale (the mock never pushes
+        // OnDataChange, so last_update freezes at subscribe time), the health monitor must
+        // fire a RebuildSubscription → advise_count climbs 1→2 and the stale sink is unadvised.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(
+                connector,
+                HealthMonitorConfig {
+                    period: std::time::Duration::from_millis(50),
+                    min_timeout: std::time::Duration::from_millis(100),
+                },
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+
+        // update_rate=10 → threshold = max(10*3, 100) = 100ms.
+        let handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 10,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        assert_eq!(state.advise_count.load(Ordering::Relaxed), 1);
+
+        // Poll for the monitor-triggered rebuild (advises a fresh sink). ~2s ceiling.
+        let mut rebuilt = false;
+        for _ in 0..200 {
+            if state.advise_count.load(Ordering::Relaxed) >= 2 {
+                rebuilt = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            rebuilt,
+            "health monitor must trigger a rebuild when a subscription goes stale"
+        );
+        assert_eq!(
+            state.unadvise_count.load(Ordering::Relaxed),
+            1,
+            "rebuild must unadvise the stale sink"
+        );
+        drop(worker);
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_no_premature_rebuild() {
+        // P0-1 D-4: the monitor must NOT rebuild before the staleness threshold elapses.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(
+                connector,
+                HealthMonitorConfig {
+                    period: std::time::Duration::from_millis(50),
+                    min_timeout: std::time::Duration::from_millis(100),
+                },
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+
+        let _handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 10,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        assert_eq!(state.advise_count.load(Ordering::Relaxed), 1);
+
+        // Sleep under the 100ms threshold → no rebuild yet.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(
+            state.advise_count.load(Ordering::Relaxed),
+            1,
+            "monitor must not rebuild before the staleness threshold"
+        );
+        drop(worker);
+    }
+
+    #[tokio::test]
+    async fn test_health_monitor_fresh_callback_no_rebuild() {
+        // P0-1 D-5: a subscription whose last_update is kept fresh (as if OnDataChange
+        // keeps arriving) must NOT be rebuilt, even well past the threshold.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(
+                connector,
+                HealthMonitorConfig {
+                    period: std::time::Duration::from_millis(50),
+                    min_timeout: std::time::Duration::from_millis(100),
+                },
+            )
+            .unwrap()
+        })
+        .await
+        .unwrap();
+
+        let handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 10,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        let cookie = handle.cookie;
+
+        // Refresh last_update ~every 30ms (simulating OnDataChange) for ~1s — well past
+        // the 100ms threshold, yet a live callback must not be rebuilt.
+        for _ in 0..33 {
+            if let Ok(g) = worker.monitor_registry.lock()
+                && let Some(entry) = g.get(&cookie)
+            {
+                entry.last_update.store(now_ms(), Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert_eq!(
+            state.advise_count.load(Ordering::Relaxed),
+            1,
+            "a freshly-stamped callback must not be rebuilt"
+        );
+        drop(worker);
+        drop(handle);
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_invokes_set_keep_alive() {
+        // P0-1 D-6: subscribe best-effort calls set_keep_alive so a DA 3.0 server refreshes
+        // last_update via keep-alive callbacks (dwcount=0 OnDataChange).
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let _handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+        assert_eq!(
+            state.keep_alive_count.load(Ordering::Relaxed),
+            1,
+            "subscribe must best-effort invoke set_keep_alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_survives_set_keep_alive_failure() {
+        // P0-1 D-6: if set_keep_alive returns NotImplemented (DA 2.0 without
+        // IOPCGroupStateMgt2), subscribe must still succeed — best-effort, not fatal.
+        let state = Arc::new(MockState::default());
+        state.should_fail_keep_alive.store(true, Ordering::Relaxed);
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "subscribe must succeed even if set_keep_alive is unsupported: {result:?}"
+        );
+        assert_eq!(
+            state.keep_alive_count.load(Ordering::Relaxed),
+            1,
+            "set_keep_alive must still be invoked (and its failure absorbed)"
+        );
     }
 
     #[tokio::test]
