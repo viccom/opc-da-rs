@@ -18,7 +18,9 @@ use crate::bindings::comn::{IOPCShutdown, IOPCShutdown_Impl};
 use crate::bindings::da::{IOPCDataCallback, IOPCDataCallback_Impl};
 use crate::helpers::{filetime_to_string, quality_to_string, variant_to_string};
 use crate::provider::TagValue;
+use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc;
 use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::Variant::VARIANT;
@@ -38,6 +40,9 @@ pub struct DataCallbackSink {
     pub tag_ids: Vec<String>,
     /// Channel forwarder guarded by a mutex (COM callbacks are external to the Rust borrow graph).
     pub tx: Mutex<mpsc::Sender<TagValue>>,
+    /// Last callback liveness timestamp (ms since UNIX_EPOCH), stamped on every data-change.
+    /// Shared with the worker's health monitor (P0-1) to detect a silently-dead callback.
+    pub last_update: Arc<AtomicU64>,
 }
 
 impl IOPCDataCallback_Impl for DataCallbackSink_Impl {
@@ -57,6 +62,7 @@ impl IOPCDataCallback_Impl for DataCallbackSink_Impl {
         forward_data_change(
             &self.tag_ids,
             &self.tx,
+            &self.last_update,
             dwcount,
             phclientitems,
             pvvalues,
@@ -83,6 +89,7 @@ impl IOPCDataCallback_Impl for DataCallbackSink_Impl {
         forward_data_change(
             &self.tag_ids,
             &self.tx,
+            &self.last_update,
             dwcount,
             phclientitems,
             pvvalues,
@@ -115,6 +122,7 @@ impl IOPCDataCallback_Impl for DataCallbackSink_Impl {
 fn forward_data_change(
     tag_ids: &[String],
     tx: &Mutex<mpsc::Sender<TagValue>>,
+    last_update: &AtomicU64,
     dwcount: u32,
     phclientitems: *const u32,
     pvvalues: *const VARIANT,
@@ -122,6 +130,13 @@ fn forward_data_change(
     pfttimestamps: *const FILETIME,
     perrors: *const windows::core::HRESULT,
 ) {
+    // P0-1: stamp liveness on every callback invocation (even dwcount=0 / null arrays)
+    // so the worker's health monitor can detect a silently-dead callback (RPC drop).
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+    last_update.store(now_ms, std::sync::atomic::Ordering::Relaxed);
+
     if dwcount == 0
         || phclientitems.is_null()
         || pvvalues.is_null()
@@ -177,5 +192,35 @@ impl IOPCShutdown_Impl for ShutdownSink_Impl {
             let _ = tx.try_send(reason);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn forward_data_change_stamps_callback_liveness() {
+        // P0-1 step A: every data-change callback must stamp a liveness timestamp
+        // so the worker can detect a silently-dead callback (RPC drop) and rebuild it.
+        let last_update = AtomicU64::new(0);
+        let (tx, _rx) = mpsc::channel::<TagValue>(1);
+        let tx = Mutex::new(tx);
+        forward_data_change(
+            &[],
+            &tx,
+            &last_update,
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+        assert!(
+            last_update.load(Ordering::Relaxed) > 0,
+            "forward_data_change must stamp last_update on every callback (even dwcount=0)"
+        );
     }
 }

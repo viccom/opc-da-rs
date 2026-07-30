@@ -14,7 +14,7 @@ use crate::provider::{OpcValue, ShutdownHandle, SubscriptionHandle, TagValue, Wr
 use crate::subscription::{DataCallbackSink, ShutdownSink};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot};
 use windows::Win32::System::Variant::VariantClear;
 use windows::core::Interface as _;
@@ -157,6 +157,17 @@ pub enum ComRequest {
         /// One-shot channel to acknowledge.
         reply: oneshot::Sender<OpcResult<()>>,
     },
+    /// Request to rebuild a subscription's callback sink after a detected RPC drop (P0-1).
+    ///
+    /// Re-uses the client `rx` (kept open by the entry's original `tx`) while swapping the
+    /// underlying COM sink. Emitted by the health monitor when `last_update` goes stale.
+    RebuildSubscription {
+        /// Connection cookie returned by `Subscribe` (stable client handle; the live COM
+        /// advise cookie is tracked separately inside the `SubscriptionEntry`).
+        cookie: u32,
+        /// One-shot channel to acknowledge (carries rebuild failure for step E).
+        reply: oneshot::Sender<OpcResult<()>>,
+    },
     /// Request to subscribe to server shutdown notifications (`IOPCShutdown`).
     SubscribeShutdown {
         /// OPC server ProgID.
@@ -227,6 +238,20 @@ struct SubscriptionEntry<C: ServerConnector + 'static> {
     /// callback object. Intentionally never read — its lifetime *is* the point.
     #[allow(dead_code)]
     sink: windows::core::IUnknown,
+    /// Shared liveness timestamp (P0-1) for dead-callback detection; stamped by each
+    /// `OnDataChange`, read by the health monitor.
+    #[allow(dead_code)] // read by the health monitor, added in P0-1 step D
+    last_update: Arc<AtomicU64>,
+    /// Original mpsc sender kept alive so the client `rx` stays open across a sink rebuild
+    /// (P0-1 step B): each `DataCallbackSink` only holds a clone, so releasing the old sink
+    /// during rebuild does not close the channel.
+    tx: mpsc::Sender<TagValue>,
+    /// Current COM `IConnectionPoint::Advise` cookie (P0-1 step C). Decoupled from the stable
+    /// client cookie (the map key) because each rebuild re-advises and gets a fresh one.
+    com_cookie: u32,
+    /// Subscribed tag IDs (P0-1 step C), kept so a rebuilt sink can rebuild its client-handle
+    /// → tag-id map without re-adding items to the group.
+    tag_ids: Vec<String>,
 }
 
 /// Worker-side tracked state for a shutdown subscription (server-level; no group).
@@ -515,6 +540,11 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                         ComRequest::Unsubscribe { cookie, reply } => {
                             let result =
                                 Self::handle_unsubscribe(cookie, &cache, &mut subscriptions);
+                            let _ = reply.send(result);
+                        }
+                        ComRequest::RebuildSubscription { cookie, reply } => {
+                            let result =
+                                Self::handle_rebuild_subscription(cookie, &mut subscriptions);
                             let _ = reply.send(result);
                         }
                         ComRequest::SubscribeShutdown { server, reply } => {
@@ -1587,9 +1617,16 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         }
 
         let (tx, rx) = mpsc::channel(256);
+        // P0-1: liveness timestamp stamped by each OnDataChange; shared with the health
+        // monitor to detect a silently-dead callback and trigger rebuild.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        let last_update = Arc::new(AtomicU64::new(now_ms));
         let sink = DataCallbackSink {
             tag_ids: tag_ids.to_vec(),
-            tx: std::sync::Mutex::new(tx),
+            tx: std::sync::Mutex::new(tx.clone()),
+            last_update: Arc::clone(&last_update),
         };
         // SAFETY: `cast` performs QueryInterface on a locally-owned COM object.
         let sink_callback: crate::bindings::da::IOPCDataCallback = sink.into();
@@ -1610,6 +1647,10 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 server_handle,
                 group,
                 sink: sink_iunknown,
+                last_update,
+                tx,
+                com_cookie: cookie,
+                tag_ids: tag_ids.to_vec(),
             },
         );
 
@@ -1651,8 +1692,9 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 "unknown subscription cookie {cookie}"
             )));
         };
-        // Unadvise first (group still alive), then remove the group.
-        if let Err(e) = entry.group.unadvise_data_callback(cookie) {
+        // Unadvise first (group still alive), then remove the group. Use the tracked COM
+        // cookie, which may differ from the client cookie after a P0-1 rebuild re-advised.
+        if let Err(e) = entry.group.unadvise_data_callback(entry.com_cookie) {
             tracing::warn!(error = ?e, "unsubscribe: unadvise failed");
         }
         if let Some(server) = cache.get(&entry.server_name)
@@ -1661,6 +1703,61 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             tracing::warn!(error = ?e, "unsubscribe: remove_group failed");
         }
         // entry drops here → sink IUnknown releases.
+        Ok(())
+    }
+
+    /// Rebuild a subscription's callback sink after a detected RPC drop (P0-1 step C).
+    ///
+    /// Unadvises the stale sink, advises a fresh one cloned from the same mpsc channel, and
+    /// updates the tracked COM cookie — all while keeping the client `rx` open (the entry
+    /// holds the original `tx`; each sink only holds a clone).
+    fn handle_rebuild_subscription(
+        cookie: u32,
+        subscriptions: &mut HashMap<u32, SubscriptionEntry<C>>,
+    ) -> OpcResult<()> {
+        let span = tracing::info_span!("opc.rebuild_subscription", cookie);
+        let _enter = span.enter();
+        let start = std::time::Instant::now();
+
+        let Some(entry) = subscriptions.get_mut(&cookie) else {
+            return Err(OpcError::InvalidState(format!(
+                "rebuild: unknown subscription cookie {cookie}"
+            )));
+        };
+
+        // Unadvise the stale sink first — the group still owns the items, only the callback
+        // is dead. A failure here (e.g. the server already dropped the connection point on
+        // RPC loss) is logged but not fatal: we still re-advise a fresh sink below.
+        if let Err(e) = entry.group.unadvise_data_callback(entry.com_cookie) {
+            tracing::warn!(error = ?e, "rebuild: unadvise of stale sink failed");
+        }
+
+        // Build a fresh sink reusing the SAME channel: clone the entry's original tx so the
+        // client rx stays open, and reset the liveness clock for the new callback.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0));
+        entry.last_update.store(now_ms, Ordering::Relaxed);
+        let fresh_sink = DataCallbackSink {
+            tag_ids: entry.tag_ids.clone(),
+            tx: std::sync::Mutex::new(entry.tx.clone()),
+            last_update: Arc::clone(&entry.last_update),
+        };
+        // SAFETY: `cast` performs QueryInterface on a locally-owned COM object.
+        let fresh_callback: crate::bindings::da::IOPCDataCallback = fresh_sink.into();
+        let fresh_iunknown: windows::core::IUnknown = fresh_callback.cast()?;
+        let new_cookie = entry.group.advise_data_callback(&fresh_iunknown)?;
+
+        // Swap the sink (dropping the old IUnknown releases the old callback object — its tx
+        // was only a clone, so the channel survives) and record the new COM cookie.
+        entry.sink = fresh_iunknown;
+        entry.com_cookie = new_cookie;
+
+        tracing::info!(
+            new_cookie,
+            elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "subscription rebuilt"
+        );
         Ok(())
     }
 
@@ -1772,6 +1869,10 @@ mod tests {
         slow_write_ms: AtomicU64,
         /// Incremented when a mock server is dropped (worker thread teardown).
         server_drop_count: AtomicUsize,
+        /// P0-1: advise/unadvise call counters + cookie source for subscription rebuild tests.
+        advise_count: AtomicUsize,
+        unadvise_count: AtomicUsize,
+        next_cookie: AtomicUsize,
     }
 
     struct ConfigurableMockConnector {
@@ -1898,6 +1999,21 @@ mod tests {
             }
 
             Ok(RemoteArray::from_mut_ptr(hr_ptr, n as u32))
+        }
+
+        fn advise_data_callback(&self, _sink: &windows::core::IUnknown) -> OpcResult<u32> {
+            self.state.advise_count.fetch_add(1, Ordering::Relaxed);
+            // P0-1: monotonically increasing cookie so rebuild (re-advise) yields a
+            // distinct cookie, mirroring real OPC IConnectionPoint::Advise.
+            let cookie = u32::try_from(self.state.next_cookie.fetch_add(1, Ordering::Relaxed))
+                .unwrap_or(0)
+                + 1;
+            Ok(cookie)
+        }
+
+        fn unadvise_data_callback(&self, _cookie: u32) -> OpcResult<()> {
+            self.state.unadvise_count.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -2405,7 +2521,18 @@ mod tests {
             })
             .await;
 
-        let captured = worker.captured_panic();
+        // The reply (oneshot) drops as the handler unwinds, so `send_request` returns
+        // before the worker writes `worker_last_panic` (which happens just after
+        // `catch_unwind` returns). Poll briefly until the payload is observable — without
+        // this the assertion races the worker thread and fails intermittently.
+        let mut captured = worker.captured_panic();
+        for _ in 0..100 {
+            if captured.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            captured = worker.captured_panic();
+        }
         assert!(
             captured.is_some(),
             "worker panic payload must be captured, not silently lost"
@@ -2471,6 +2598,100 @@ mod tests {
             .unwrap();
 
         // Dropping worker handle closes channel gracefully
+        drop(worker);
+    }
+
+    #[tokio::test]
+    async fn test_worker_subscribes_via_mock() {
+        // P0-1 prerequisite: the mock must support advise so subscription (and the
+        // upcoming rebuild path) can be exercised in unit tests. The trait default
+        // returns NotImplemented, so this fails until the mock overrides it.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["Tag1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed once mock supports advise");
+
+        assert!(handle.cookie > 0, "subscription should receive a cookie");
+        assert_eq!(
+            state.advise_count.load(Ordering::Relaxed),
+            1,
+            "advise_data_callback should be called exactly once"
+        );
+        assert_eq!(
+            state.unadvise_count.load(Ordering::Relaxed),
+            0,
+            "no unadvise during a fresh subscribe"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rebuild_subscription_keeps_rx_open() {
+        // P0-1 step B+C: rebuilding a subscription's sink (unadvise old → re-advise new)
+        // after an RPC drop must NOT close the client rx. The entry keeps the original
+        // mpsc tx; the sink only holds a clone, so releasing the old sink leaves the
+        // channel open for the fresh sink's clone to keep feeding.
+        let state = Arc::new(MockState::default());
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
+            .await
+            .unwrap();
+
+        let handle = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["Tag1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await
+            .expect("subscribe should succeed");
+
+        let cookie = handle.cookie;
+        let mut rx = handle.rx;
+
+        worker
+            .send_request(|reply| ComRequest::RebuildSubscription { cookie, reply })
+            .await
+            .expect("rebuild should succeed");
+
+        // Step C: rebuild unadvised the stale sink and re-advised a fresh one.
+        assert_eq!(
+            state.advise_count.load(Ordering::Relaxed),
+            2,
+            "rebuild must re-advise a fresh sink"
+        );
+        assert_eq!(
+            state.unadvise_count.load(Ordering::Relaxed),
+            1,
+            "rebuild must unadvise the old sink"
+        );
+
+        // Step B: rx stays open — releasing the old sink (its tx is only a clone) does not
+        // close the channel while the entry holds the original tx. An open, empty channel
+        // makes recv() await; a closed one returns None immediately.
+        let closed = tokio::time::timeout(std::time::Duration::from_millis(150), rx.recv())
+            .await
+            .is_ok_and(|opt| opt.is_none());
+        assert!(
+            !closed,
+            "rx must stay open after rebuild (entry holds the original tx)"
+        );
+
         drop(worker);
     }
 
@@ -2653,7 +2874,9 @@ mod tests {
     #[tokio::test]
     async fn test_subscribe_routes_to_advise() {
         let state = Arc::new(MockState::default());
-        let connector = Arc::new(ConfigurableMockConnector { state });
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
         let worker = tokio::task::spawn_blocking(move || ComWorker::start(connector).unwrap())
             .await
             .unwrap();
@@ -2667,9 +2890,15 @@ mod tests {
             })
             .await;
 
-        // add_group + add_items succeed on the mock; advise_data_callback then hits the
-        // ConnectedGroup default (NotImplemented) — proves routing into the group facade.
-        assert!(matches!(result, Err(OpcError::NotImplemented(_))));
+        // add_group + add_items + advise_data_callback all succeed on the mock
+        // (ConfigurableMockGroup overrides advise); the advise counter proves routing into
+        // the group facade.
+        assert!(result.is_ok(), "subscribe should succeed: {result:?}");
+        assert_eq!(
+            state.advise_count.load(Ordering::Relaxed),
+            1,
+            "subscribe must route into group.advise_data_callback"
+        );
     }
 
     #[tokio::test]
