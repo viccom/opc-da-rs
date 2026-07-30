@@ -2,6 +2,7 @@
 members = [
     "opc-cli",
     "opc-da-client",
+    "opc-da-desktop",
 ]
 exclude = [
     "compat/*",
@@ -23,6 +24,8 @@ thiserror = "2.0"
 anyhow = "1.0.95"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "sync", "macros"] }
 tracing = "0.1.41"
+chrono = { version = "0.4.43", default-features = false, features = ["std", "clock", "serde"] }
+futures = "0.3"
 windows = { version = "0.61.3", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

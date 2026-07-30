@@ -1,0 +1,20 @@
+# Tauri build output
+target/
+gen/
+
+# Vite output
+ui/dist/
+ui/node_modules/
+
+# Local logs
+logs/
+*.log
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor
+.idea/
+.vscode/
+*.swp

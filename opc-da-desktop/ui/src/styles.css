@@ -1,0 +1,229 @@
+/* OPC DA Desktop — base styles
+ *
+ * Layout follows the Matrikon/KEPServerEX client layout the user
+ * referenced: 3-column header strip (server / connect / group props)
+ * over a full-width tag table.
+ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  font-size: 13px;
+  background: #1e1e1e;
+  color: #d4d4d4;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.strips {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border-bottom: 1px solid #3c3c3c;
+  background: #252526;
+}
+
+.panel {
+  background: #2d2d30;
+  border: 1px solid #3c3c3c;
+  padding: 6px 8px;
+  border-radius: 2px;
+}
+
+.panel h3 {
+  margin: 0 0 4px 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: #9cdcfe;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.field {
+  display: flex;
+  align-items: center;
+  margin: 2px 0;
+  gap: 4px;
+}
+
+.field label {
+  min-width: 80px;
+  color: #9cdcfe;
+  font-size: 12px;
+}
+
+.field input,
+.field select {
+  flex: 1;
+  background: #1e1e1e;
+  border: 1px solid #3c3c3c;
+  color: #d4d4d4;
+  padding: 2px 6px;
+  font-size: 12px;
+  border-radius: 2px;
+}
+
+.field input:focus,
+.field select:focus {
+  outline: 1px solid #007acc;
+  border-color: #007acc;
+}
+
+button {
+  background: #0e639c;
+  color: white;
+  border: none;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 2px;
+}
+
+button:hover {
+  background: #1177bb;
+}
+
+button:disabled {
+  background: #3c3c3c;
+  color: #6d6d6d;
+  cursor: not-allowed;
+}
+
+button.danger {
+  background: #a1260d;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+thead {
+  background: #2d2d30;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+
+th,
+td {
+  padding: 3px 8px;
+  text-align: left;
+  border-bottom: 1px solid #2d2d30;
+  white-space: nowrap;
+}
+
+th {
+  color: #9cdcfe;
+  font-weight: 600;
+}
+
+tbody tr:hover {
+  background: #2a2d2e;
+}
+
+tbody tr.active {
+  background: #094771;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+
+.modal {
+  background: #252526;
+  border: 1px solid #3c3c3c;
+  width: 80vw;
+  height: 70vh;
+  display: flex;
+  flex-direction: column;
+  border-radius: 4px;
+}
+
+.modal-header {
+  padding: 8px 12px;
+  border-bottom: 1px solid #3c3c3c;
+  font-weight: 600;
+  color: #9cdcfe;
+}
+
+.modal-body {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  overflow: hidden;
+}
+
+.modal-footer {
+  padding: 8px 12px;
+  border-top: 1px solid #3c3c3c;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.tree,
+.leaf-list {
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.tree-node {
+  padding: 2px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.tree-node:hover {
+  background: #2a2d2e;
+}
+
+.tree-node.selected {
+  background: #094771;
+}
+
+.leaf {
+  padding: 2px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.leaf:hover {
+  background: #2a2d2e;
+}
+
+.leaf.selected {
+  background: #094771;
+}
+
+.statusbar {
+  padding: 4px 8px;
+  background: #007acc;
+  color: white;
+  font-size: 11px;
+  border-top: 1px solid #3c3c3c;
+}
+
+.statusbar.error {
+  background: #a1260d;
+}
