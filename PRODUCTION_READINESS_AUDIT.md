@@ -5,7 +5,8 @@
 > **原则**：本报告**只列证据**，不做"我相信是这样"——能 grep 到行号的才写。
 >
 > **结论先行**：当前实现**功能完整、API 设计干净**，但**长时间运行的鲁棒性有明显缺口**。
-> 两个 P0 阻塞生产部署：(1) 订阅断线无自动续订；(2) worker panic 信息被完全丢弃。
+> 两个 P0 阻塞生产部署：(1) 订阅运行期断线无自动续订（**仅影响使用订阅的长跑场景**，短读/写不受影响）；(2) worker panic 信息被完全丢弃（P0-3 + P0-4）。
+> 多 host 并发属**功能缺失**（架构选择），**已降为 P1，非生产阻塞**——单 host 部署完全可用。
 
 ---
 
@@ -16,7 +17,7 @@
 | 1. 断线重连（连接级） | 🟡 部分落地 | **是**（订阅路径） |
 | 2. 异常恢复（worker panic / drop） | 🟡 部分落地 | **是**（panic 信息丢失） |
 | 3. 并发订阅（多 group 持多 subscription） | 🟡 部分落地 | 否（功能可用） |
-| 4. 多连接（多 host 并发） | ❌ 缺失 | **是**（同 ProgID 跨 host 不可能） |
+| 4. 多连接（多 host 并发） | ❌ 缺失（架构限制） | 否（功能缺失而非鲁棒性 bug；单 host 部署完全可用，详见 §4） |
 | 5. 高性能（批量 / 缓存 / 锁粒度） | 🟡 部分落地 | 否（功能可用，但延迟/吞吐有上限） |
 | 6. 资源生命周期 | 🟢 落地（VARIANT 泄漏 v0.3.0 已修） | — |
 | 7. 可测试性（mock 注入） | 🟢 落地 | — |
@@ -71,10 +72,10 @@
 - 后果：一次 RPC 失效后，`IOPCDataCallback::OnDataChange` 静默死亡，应用层必须自己写 `ShutdownRequest` 监听 + `Subscribe` 重新发起循环
 - `KeepAlive` 仅作用于 group 内部（`IOPCGroupStateMgt2::SetKeepAlive`，DA 3.0），**不解决 RPC 失效后 callback 重建**
 
-**缓存 key 缺 host 维度**：
+**（已修正）cache key 用 ProgID 是正确设计，非 bug**：
 
-- `com_worker.rs:616` `cache.entry(server_name.to_string())`——`server_name` 仅 ProgID
-- 详见 §4 多连接
+- `com_worker.rs:616` `cache.entry(server_name)`——单 client 内 host 固定，ProgID 唯一，作 key 完全正确
+- 真正限制是「单 `OpcDaClient` 绑死单 host」的架构选择，详见 §4
 
 ---
 
@@ -201,29 +202,35 @@
 - 单 worker 内 `HashMap<String, C::Server>` 缓存多 server
 - 测试：`com_worker.rs:2169 test_connection_cache_reuse` 验证复用 ✅
 
-### 4.2 硬阻塞 ❌
+### 4.2 架构限制 🟡（功能缺失，非鲁棒性 bug）
 
-**缓存 key 仅 ProgID（无 host 维度）**：
+**根因：`ComConnector.host` 构造时绑死 → 单 `OpcDaClient` 绑死单 host**：
 
-- `com_worker.rs:616` `cache.entry(server_name.to_string())`——`server_name` 是 `ComRequest.server` 字段（仅 ProgID 字符串）
-- `com_worker.rs:25-30 ListServers { host, ... }` 才有 host 字段，但 worker 返回的 server list **丢掉了 host 上下文**
-- `connector.rs:377-391 connect()` 内部用 `self.host`（`ComConnector` 实例字段），意味着**每个 `ComConnector` 实例绑定一个 host**
-- 当前 `OpcDaClient` 单例 (`backend/opc_da.rs:15-17`) 只持一个 `ComWorker<C>`——**每个 client 实例只能连一个 host**
+- `connector.rs:321-323` `pub struct ComConnector { host: String }`——host 是实例字段，构造时固定
+- `connector.rs:339-342` `impl Default` → `Self::new("localhost")`——`OpcDaClient::default()` 永远只连本机
+- `connector.rs:377-378` `connect()` 内部 `connect_server(server_name, &self.host)`——**连接目标 host 取决于 connector 实例，不取自请求**
+- `backend/opc_da.rs:15-17` `OpcDaClient { worker: ComWorker<C> }`，`ComWorker` 持 `Arc<C>` 单 connector（`opc_da.rs:36`）——**一个 client = 一个固定 host**
 
-**同 ProgID 跨 host 实际行为**：
+**cache key 用 ProgID 是正确设计，不是 bug**：
 
-- `com_worker.rs:621-626` `Vacant(e) => e.insert(connector.connect(...))`——vacant 才插
-- 第二次 connect 同一 ProgID 实际是 `Occupied` 分支，**命中旧 entry，不会新建连接到第二个 host**
-- 后果：用户拿到的"多 server 列表"在 worker 内部被同一 cache 槽吞掉
+- `com_worker.rs:282` `cache: HashMap<String, C::Server>`，key = ProgID
+- 单 client 内 host 固定 → ProgID 唯一 → 用 ProgID 作 key 完全正确
+- 旧版报告「缓存 key 缺 host 维度」的表述是误导，已修正：真正缺的不是 key 维度，而是「单 client 无法承载多 host」
 
-**多 host 入口不存在**：
+**`enumerate_servers` 与 `connect` 的 host 语义不一致**（本次复核补充）：
 
-- `provider.rs` 的 `OpcProvider` trait 没有 host 维度参数（`list_servers(host)` 一次，server 没有 host 标签）
-- 要连 Matrikon (本机) + Kepware (本机) 不同 ProgID ✅
-- 要连 Matrikon (本机) + Matrikon (远程 192.168.199.155) ❌
-- 要连"同一 ProgID 在两台机器同时连" ❌
+- `connector.rs:348` `enumerate_servers(&self, host: &str)`——host 是**方法参数**，可枚举任意 host
+- `connector.rs:377` `connect(&self, server_name)`——用 `self.host` **固定值**
+- 后果：`list_servers("192.168.199.155")` 能列出远程服务器的 ProgID，但后续 `read`/`write`/`browse` 连的是 `self.host`（本机）——**能看见却连不上**（除非 client 的 connector 恰好绑了那个 host）。这是 API 层面的语义割裂，建议在文档中显式标注，或让 `connect` 也接受 host 参数（见 P1-7）
 
-**要真正多连接必须多 `OpcDaClient` 实例**（每个独立 worker 线程 + 独立连接池），Rust async runtime 下无 lifecycle 管理 API，用户在应用层要自己拼装。
+**同 ProgID 跨 host 行为**：
+
+- `com_worker.rs:616` `cache.entry(server_name)`——同一 client 内同 ProgID 命中旧 entry（设计正确）
+- 要连 Matrikon(本机) + Kepware(本机) 不同 ProgID ✅（同 host）
+- 要连 Matrikon(本机) + Matrikon(远程 192.168.199.155) ❌（需多 client 实例）
+- 要连「同一 ProgID 在两台机器同时连」 ❌（需多 client 实例）
+
+**结论**：这是**功能缺失，不是生产部署的硬阻塞**。单 host 部署（最常见场景）完全可用。要支持多 host 必须多 `OpcDaClient` 实例（每个独立 worker 线程 + 独立连接池），Rust async runtime 下无生命周期管理 API，应用层自行拼装。若业务确有多 host 并发需求，见 §10 P1-7（原 P0-2，已降级）。
 
 ---
 
@@ -351,17 +358,33 @@
 
 ## 10. 改进建议（按优先级）
 
+### 10.0 判断速览：必须修 vs 值得修 vs 可选
+
+> 复核（2026-07-30）后的执行判断。**BUG 全部属实**（逐行核实，证据见 §13），但"是否必须修"取决于部署形态。
+
+| 类别 | 项 | 判断依据 |
+| --- | --- | --- |
+| **必须修** | **P0-3 + P0-4**（panic 可观察性） | 真实、独立、工作量小（~1d）、风险低；不修则线上 worker 崩溃无 root cause（无 panic message / backtrace）。**任何生产部署都该先做这两个** |
+| **必须修（按场景）** | **P0-1**（订阅运行期续订） | 仅当**使用订阅 + 长时间运行**时是硬阻塞；纯短读/写场景不受影响。修复复杂（3-5d）且有 reverse-DCOM 外部依赖，按业务节奏排期 |
+| **值得修** | **P1-4**（try_send warn）、**P1-3**（文档单 host） | trivial（各 ~0.25d），顺手做，显著改善可观测性 / 可理解性 |
+| **值得修（按负载）** | **P1-1**（group 池） | 高频读（>数百 QPS）才成为延迟瓶颈；低频场景可缓 |
+| **可选 / 按需** | **P1-7**（多 host，原 P0-2） | 功能缺失非 bug，单 host 部署不需要；仅多 host 并发业务才做 |
+| **可选 / 按需** | **P1-2**（lock-free sink）、**P1-5**（Drop 主动 unsubscribe） | 10k+ 标签 / 严格要求订阅不泄漏才值得；P1-5 有 async drop 陷阱 |
+| **低优先级** | **P1-6**（parking_lot）、**P2-*** | 收益有限或属性能优化，非阻塞 |
+
+**一句话结论**：先做 **P0-3 + P0-4**（1 天，最高性价比）；若用订阅长跑则加 **P0-1**；其余按业务负载和场景取舍。多 host（P1-7）已从"阻塞"降级为"按需功能"。
+
 ### P0 — 阻塞生产部署（必须修）
 
 | ID | 任务 | 涉及文件 | 估时 |
 | --- | --- | --- | --- |
-| **P0-1** | `Subscribe` / `SetSubscriptionRate` / `Unsubscribe` 接入 `dispatch_with_retry` | `com_worker.rs:463-531` | 1 d |
-| **P0-2** | 缓存 key 改成 `(host, prog_id)` 元组；`ComRequest` 加 `host: Option<String>`；`ComConnector` 持 host 在 worker 内可见 | `com_worker.rs:282,616` + `backend/connector.rs:377-391` | 0.5 d |
-| **P0-3** | `ComWorker::drop` 里 `take JoinHandle + join()` 拿 panic payload，附 `tracing::error!` 完整 message + backtrace | `com_worker.rs:1653-1657` | 0.25 d |
-| **P0-4** | `catch_unwind` 包裹 worker 主循环；panic 不杀线程，转 `tracing::error!` + 关闭 channel（语义：客户端能感知但 worker 不死） | `com_worker.rs:286` | 0.5 d |
+| **P0-3** | `ComWorker::drop` 里 `take JoinHandle + join()` 拿 panic payload，附 `tracing::error!` 完整 message + backtrace。注意：drop 中 `join` 会阻塞调用方（worker 可能正卡在长 COM 调用），需 detach 或限时 join | `com_worker.rs:1653-1657` | 0.25 d |
+| **P0-4** | `catch_unwind` 包裹 worker 主循环每次迭代，捕获 panic payload 记 `tracing::error!`。**语义修正**：panic 后 `cache`/`subscriptions` 内 COM 指针状态一致性无法保证，建议「记录 payload + 关闭 channel」（保留当前 client 可感知语义，仅补回被吞的 message），**而非**「worker 不死继续跑」——后者有状态损坏风险。`catch_unwind` 需 `AssertUnwindSafe`（COM 指针非 `UnwindSafe`） | `com_worker.rs:286` | 0.5 d |
+| **P0-1** | 订阅**运行期**断线自动续订：callback 存活监测（KeepAlive 超时 / 最近 `OnDataChange` 时间戳）+ 失效后 `unadvise` → 重新 `advise` → 重新 `add_items`。**仅「建立订阅接入 `dispatch_with_retry`」不够**——那只解决建立期重连，不解决运行中 RPC 断线后 `IOPCDataCallback` 静默死亡。且 reverse-DCOM callback 重建依赖客户端允许入站 DCOM（见 CLAUDE.md 已知坑），完全自动化有外部配置前提 | `com_worker.rs:463-531, 1561-1576` + 新增监测逻辑 | 3-5 d |
 
-P0-1 + P0-2 同源（订阅 + 多 host 都依赖"连接级 key 含 host"）——**一起修**。
-P0-3 + P0-4 同源（panic 可观察性）——**一起修**。
+P0-3 + P0-4 同源（panic 可观察性）——**优先级最高，一起修**（真实、独立、工作量小、风险低）。
+P0-1 仅对**使用订阅的长时间运行**场景是硬阻塞；短读/写场景不受影响，可按业务节奏排期。
+原 P0-2（多 host）已降级为 **P1-7**（功能缺失，非阻塞）。
 
 ### P1 — 显著提升生产可用性
 
@@ -371,8 +394,9 @@ P0-3 + P0-4 同源（panic 可观察性）——**一起修**。
 | **P1-2** | tags_sink lock-free 化：用 `crossbeam::channel` 或 batch flush（每 N tag 或 50ms flush 一次） | `com_worker.rs:60` | 1 d |
 | **P1-3** | `OpcProvider` 文档 + `OpcDaClient` 文档**显式说明** "每个 client 实例绑定一个 host；多 host 需要多个 client 实例" | `provider.rs` + `backend/opc_da.rs` | 0.25 d |
 | **P1-4** | DataCallbackSink `try_send` 失败时 `tracing::warn!(dropped=N)` 而非静默吞 | `subscription.rs:134-158` | 0.25 d |
-| **P1-5** | SubscriptionHandle `Drop` 时**主动** unsubscribe（防订阅静默存活）；加测试 | `subscription.rs` + `com_worker.rs` | 0.5 d |
-| **P1-6** | 把 `parking_lot` 引入工作区（`std::sync::Mutex` → `parking_lot::Mutex`） | `Cargo.toml` + 多文件 | 0.5 d |
+| **P1-5** | SubscriptionHandle `Drop` 时**主动** unsubscribe（防订阅静默存活）。**注意 Rust 陷阱**：`Drop::drop` 不能 `.await`，无法等待 worker 完成 unsubscribe；需向 worker channel 非阻塞投递 `ComRequest::Unsubscribe`（`try_send`）或 `tokio::spawn` | `subscription.rs` + `com_worker.rs` | 1 d |
+| **P1-6** | 把 `parking_lot` 引入工作区（`std::sync::Mutex` → `parking_lot::Mutex`）。收益有限（`std::sync::Mutex` 在 Windows 用 SRWLock 已够用），优先级最低 | `Cargo.toml` + 多文件 | 0.5 d |
+| **P1-7** | 多 host 支持（**原 P0-2，降级**）：`ServerConnector::connect` 加 `host` 参数 → `ComConnector` 去 host 化（host 移入请求）→ cache key 改 `(host, prog_id)` → 所有 mock/调用点同步。**功能缺失非 bug**，单 host 部署不需要；仅当业务确有多 host 并发需求时实施 | `backend/connector.rs:321-342, 377-391` + `com_worker.rs:282,616` + trait 签名 | 2-3 d |
 
 ### P2 — 性能优化空间（非阻塞）
 
@@ -400,16 +424,16 @@ P0-3 + P0-4 同源（panic 可观察性）——**一起修**。
 
 ```
                   ┌─────────────────────────────────────────┐
-                  │ Phase 1: 消除生产硬阻塞                 │  ~3 d
-                  │   P0-1 + P0-2 (订阅重连 + host key)     │
-                  │   P0-3 + P0-4 (panic 可观察)            │
+                  │ Phase 1: 消除生产硬阻塞                 │  ~1 d 起
+                  │   P0-3 + P0-4 (panic 可观察, 先做)      │
+                  │   P0-1 (订阅运行期续订, 按需)           │
                   └────────────────────┬────────────────────┘
                                        ▼
                   ┌─────────────────────────────────────────┐
                   │ Phase 2: 鲁棒性 + 易用性               │  ~5 d
                   │   P1-1 (group 池)                       │
                   │   P1-2 (lock-free tags_sink)            │
-                  │   P1-3 / P1-4 / P1-5 / P1-6            │
+                  │   P1-3 / P1-4 / P1-5 / P1-6 / P1-7     │
                   └────────────────────┬────────────────────┘
                                        ▼
                   ┌─────────────────────────────────────────┐
@@ -424,8 +448,7 @@ P0-3 + P0-4 同源（panic 可观察性）——**一起修**。
                   └─────────────────────────────────────────┘
 ```
 
-**总估时**：Phase 1 + Phase 2 约 **8 个工作日**可达到 A 级生产就绪。
-Phase 3 视业务规模决定是否投资。
+**总估时**：Phase 1（仅 P0-3 + P0-4）约 **1 个工作日**即可消除最关键的 panic 可观察性硬阻塞；含 P0-1 约 **4-6 个工作日**。Phase 1 + Phase 2 累计约 **8-10 个工作日**达 A 级生产就绪。Phase 3 视业务规模决定是否投资。
 
 ---
 
