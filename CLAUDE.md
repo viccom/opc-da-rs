@@ -11,6 +11,61 @@ Cargo 工作区包含两个 crate：
 - **`opc-cli`** — 交互式 TUI 二进制（`ratatui` + `crossterm` + `tokio`）。整个 crate `#![forbid(unsafe_code)]`。
 - **`opc-da-client`** — OPC DA 通信库（`windows-rs`）。包含冻结的 COM 绑定与 vendor 合并代码，允许 `unsafe`。
 
+## 项目结构
+
+```
+opc-cli/                                  # Cargo 工作区根
+├── .cargo/config.toml                    # MSVC linker 路径（x64 + i686）
+├── CLAUDE.md / ROADMAP.md / README.md
+├── ARCHITECTURE_DIAGRAM.md               # 高层导航图（本仓库新增）
+├── Cargo.toml / Cargo.lock               # exclude = ["compat", "target", "vendor", …]
+├── Makefile / verify.sh / rustfmt.toml
+├── scripts/                              # verify.ps1 / commit.ps1 / package*.ps1 …
+├── logs/                                 # 按日滚动 opc-cli.log.YYYY-MM-DD
+├── vendor/redist/                        # 可再分发说明（不要 commit 实体 .dll）
+│
+├── opc-cli/                              # TUI 二进制（forbid unsafe）
+│   └── src/{main.rs, app.rs, ui.rs}
+│
+└── opc-da-client/                        # OPC DA 库（version = 0.3.0）
+    ├── Cargo.toml                        # features: opc-da-backend / test-support / e2e
+    ├── README.md / CHANGELOG.md / architecture.md / spec.md
+    ├── .winmd/                           # OPCDA.winmd + OPCCOMN.winmd
+    ├── examples/remote_list.rs           # 远程 DCOM 诊断 CLI
+    ├── tests/e2e.rs                      # 19 本地 + 4 远程 e2e（feature=e2e）
+    └── src/
+        ├── lib.rs                        # 公开导出面
+        ├── provider.rs                   # async trait OpcProvider（18 方法契约）
+        ├── subscription.rs               # SubscriptionHandle + rx 异步流
+        ├── com_guard.rs                  # RAII：CoInitializeEx(MTA)
+        ├── com_worker.rs                 # 专用 COM 线程 + mpsc/oneshot + 池化重连
+        ├── helpers.rs                    # friendly_com_hint() / format_hresult()
+        ├── backend/                      # 适配层（trait 注入）
+        │   ├── opc_da.rs                 # OpcDaClient<C: ServerConnector>
+        │   └── connector.rs              # ServerConnector trait + ComConnector
+        ├── bindings/                     # ⚠ 冻结的 winmd bindgen 产物（勿手改）
+        │   ├── comn/{mod.rs, bindings.rs}
+        │   └── da/{mod.rs, bindings.rs}
+        └── opc_da/                       # COM 类型化封装
+            ├── com_utils.rs              # VariantClear / RemotePointer（含 clear_variant_array / clear_item_states）
+            ├── errors.rs / typedefs.rs
+            └── client/
+                ├── mod.rs / iterator.rs
+                ├── v1/ v2/ v3/           # DA 版本入口
+                └── traits/               # 每个 COM 接口一文件
+                    ├── server.rs / common.rs / browse*.rs
+                    ├── item_mgt.rs / item_io.rs / item_properties.rs
+                    ├── item_deadband_mgt.rs / item_sampling_mgt.rs
+                    ├── group_state_mgt.rs / group_state_mgt2.rs / public_group_state_mgt.rs
+                    ├── sync_io.rs / sync_io2.rs / async_io*.rs
+                    ├── server_public_groups.rs
+                    └── connection_point_container.rs / data_object.rs
+```
+
+完整带 ASCII 图与请求路径的版本在 [`ARCHITECTURE_DIAGRAM.md`](./ARCHITECTURE_DIAGRAM.md)。
+更深的技术真相源在 `opc-da-client/architecture.md`；行为契约真相源在 `opc-da-client/spec.md`。
+注意：根 `README.md` 里的 `./architecture.md` 链接是错的，文件实际在 `opc-da-client/` 下。
+
 ## 常用命令
 
 所有命令从**工作区根目录**运行。质量门用 `pwsh`（PowerShell 7），不是 `powershell`。
