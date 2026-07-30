@@ -24,7 +24,9 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
         };
 
         let servers: crate::bindings::comn::IOPCServerList = match host {
-            Some(h) if !h.is_empty() && !h.eq_ignore_ascii_case("localhost") => {
+            // 非空 host（含 "localhost"）→ DCOM 路径；空 host → 本地 CoCreateInstance。
+            // localhost 走 DCOM 绕过本地 in-proc 尝试，与 helpers::is_remote_host 一致。
+            Some(h) if !h.is_empty() => {
                 // SAFETY: `host_wide` is null-terminated and outlives the CoCreateInstanceEx call.
                 let mut host_wide: Vec<u16> = h.encode_utf16().chain(core::iter::once(0)).collect();
                 let native = windows::Win32::System::Com::COSERVERINFO {

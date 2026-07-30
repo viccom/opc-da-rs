@@ -278,6 +278,17 @@ pub fn opc_value_to_variant(value: &OpcValue) -> VARIANT {
     variant
 }
 
+/// Whether `host` selects the DCOM path (`CoCreateInstanceEx` + `COSERVERINFO`) vs local
+/// `CoCreateInstance`.
+///
+/// Empty host = local; any non-empty host (including `"localhost"`) = DCOM. `"localhost"` is
+/// deliberately treated as DCOM: a local `CoCreateInstance` with `CLSCTX_ALL` may attempt an
+/// in-proc DLL and fail to launch the out-of-proc OPC server, whereas the DCOM roundtrip to the
+/// loopback reliably starts it — matching the behaviour of `127.0.0.1`.
+pub fn is_remote_host(host: &str) -> bool {
+    !host.is_empty()
+}
+
 /// Resolve an OPC DA server `ProgID` to a connected `opc_da` Server instance.
 ///
 /// Converts the `ProgID` string to a `CLSID` via the Windows registry,
@@ -304,7 +315,7 @@ pub fn connect_server(server_name: &str, host: &str) -> OpcResult<crate::binding
     let clsid = unsafe { std::mem::transmute_copy(&clsid_raw) };
 
     let client = crate::opc_da::client::v2::Client;
-    let is_remote = !host.is_empty() && !host.eq_ignore_ascii_case("localhost");
+    let is_remote = is_remote_host(host);
     let server_result = if is_remote {
         let info = crate::opc_da::typedefs::ServerInfo {
             name: host.to_string(),
@@ -344,6 +355,17 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
+
+    #[test]
+    fn test_is_remote_host() {
+        // localhost 走 DCOM（同 127.0.0.1，绕过本地 CoCreateInstance 的 in-proc 尝试）；
+        // 空 host 走本地 CoCreateInstance。
+        assert!(!is_remote_host(""));
+        assert!(is_remote_host("localhost"));
+        assert!(is_remote_host("LOCALHOST"));
+        assert!(is_remote_host("127.0.0.1"));
+        assert!(is_remote_host("192.168.1.10"));
+    }
 
     #[test]
     fn test_friendly_com_hint_known_codes() {
