@@ -395,3 +395,116 @@ async fn e2e_remote_subscribe() {
         received.is_ok()
     );
 }
+
+// ── process-kill reconnect probes (#[ignore]: kill a real system process) ─────────────
+//
+// These verify the DCOM/SCM relaunch path: killing OPCSim.exe mid-session, then checking the
+// client transparently reconnects on the next operation. Marked `#[ignore]` because killing the
+// server is a global side effect incompatible with parallel/normal test runs. Run explicitly:
+//
+//   cargo test -p opc-da-client --features e2e --test e2e e2e_kill_process_ \
+//       -- --ignored --nocapture --test-threads=1
+
+/// The OPC server image name (from the `LocalServer32` registration `D:\Tools\OPCSIM\OPCSim.exe`).
+fn opc_sim_image() -> &'static str {
+    "OPCSim.exe"
+}
+
+/// `true` if the OPC server process is currently running.
+fn opc_sim_running() -> bool {
+    let out = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("IMAGENAME eq {}", opc_sim_image()), "/NH"])
+        .output();
+    out.is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(opc_sim_image()))
+}
+
+/// Force-kill the OPC server process. Returns `true` if taskkill reported success.
+fn kill_opc_sim() -> bool {
+    std::process::Command::new("taskkill")
+        .args(["/F", "/IM", opc_sim_image()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `dispatch_with_retry` reconnect: kill the live server mid-session, then verify the next read
+/// transparently reconnects (DCOM/SCM relaunches OPCSim.exe on the re-`CoCreateInstance`).
+#[tokio::test]
+#[ignore = "kills the real OPCSim.exe process; run with --ignored"]
+async fn e2e_kill_process_read_reconnects() {
+    let c = client();
+    let tags = first_tags(1).await;
+    let v1 = c
+        .read_tag_values(&server(), tags.clone())
+        .await
+        .expect("read 1");
+    eprintln!("[kill/read] read 1 ok: {:?}", v1[0]);
+    assert!(opc_sim_running(), "OPCSim.exe must be running after read 1");
+
+    assert!(kill_opc_sim(), "failed to kill OPCSim.exe");
+    eprintln!("[kill/read] killed OPCSim.exe");
+    // Give the COM runtime a moment to observe the dead proxy.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !opc_sim_running(),
+        "OPCSim.exe should be gone after taskkill"
+    );
+
+    // The next read must auto-reconnect: dispatch_with_retry evicts the dead proxy, re-creates
+    // the server object (DCOM/SCM relaunches OPCSim.exe), and retries.
+    let v2 = c.read_tag_values(&server(), tags).await;
+    match &v2 {
+        Ok(values) => eprintln!("[kill/read] read 2 ok after reconnect: {:?}", values[0]),
+        Err(e) => panic!("[kill/read] read 2 must auto-reconnect after process kill: {e}"),
+    }
+    assert!(
+        opc_sim_running(),
+        "OPCSim.exe should have been relaunched by DCOM/SCM"
+    );
+}
+
+/// P0-1 增强：杀掉 server 进程后订阅必须自愈——监测线程检测 callback 静默死亡 → rebuild 轻量
+/// re-advise 失败（死代理 0x800706BA）→ 触发重连（DCOM/SCM 重启 OPCSim）→ 新 group/items/sink →
+/// `rx` 收到新的 OnDataChange。区别于应用层 reconnect（read/write 经 dispatch_with_retry），这里
+/// 验证订阅级自愈。
+#[tokio::test]
+#[ignore = "kills the real OPCSim.exe process; run with --ignored"]
+async fn e2e_kill_process_subscription_self_heals() {
+    let c = client();
+    let tags = first_tags(1).await;
+    let sub = c
+        .subscribe(&server(), tags.clone(), 500)
+        .await
+        .expect("subscribe");
+    let mut rx = sub.rx;
+
+    // Confirm the callback is alive before killing the server.
+    let first = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await;
+    assert!(
+        first.is_ok_and(|o| o.is_some()),
+        "must receive an initial OnDataChange before killing the server"
+    );
+    eprintln!("[kill/self-heal] initial OnDataChange received");
+
+    assert!(kill_opc_sim(), "failed to kill OPCSim.exe");
+    assert!(
+        !opc_sim_running(),
+        "OPCSim.exe should be gone after taskkill"
+    );
+    eprintln!("[kill/self-heal] killed OPCSim.exe; waiting for monitor + reconnect");
+
+    // Monitor threshold ~30s; the rebuild then reconnects (DCOM relaunches OPCSim) and the new
+    // sink pushes a fresh OnDataChange. The subscription must self-heal within this window.
+    let healed = tokio::time::timeout(Duration::from_secs(70), rx.recv()).await;
+    assert!(
+        matches!(healed, Ok(Some(_))),
+        "subscription did not self-heal within 70s after server kill: {healed:?}"
+    );
+    eprintln!("[kill/self-heal] self-healed: new OnDataChange received");
+    assert!(
+        opc_sim_running(),
+        "OPCSim.exe should have been relaunched by the rebuild reconnect"
+    );
+    let _ = c.unsubscribe(sub.cookie).await;
+}

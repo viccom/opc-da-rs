@@ -1,4 +1,4 @@
-use crate::opc_da::errors::OpcResult;
+use crate::opc_da::errors::{OpcError, OpcResult};
 use crate::opc_da::typedefs::ServerStatus;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -107,6 +107,9 @@ pub struct SubscriptionHandle {
     pub cookie: u32,
     /// Receiver for server-pushed tag values (`rx.recv().await`).
     pub rx: tokio::sync::mpsc::Receiver<TagValue>,
+    /// Receiver for subscription-level errors (P0-1 step E), e.g. a rebuild that failed
+    /// after a silently-dead callback. Drain alongside `rx`; `rx` stays pure [`TagValue`].
+    pub errors: tokio::sync::mpsc::Receiver<OpcError>,
 }
 
 /// Handle for a server-shutdown notification subscription.
