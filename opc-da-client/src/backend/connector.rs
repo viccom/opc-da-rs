@@ -9,6 +9,7 @@ pub use crate::bindings::da::{tagOPCITEMRESULT, tagOPCITEMSTATE};
 pub use crate::opc_da::client::*;
 pub use crate::opc_da::com_utils::RemoteArray;
 use crate::opc_da::com_utils::TryFromNative as _;
+use crate::opc_da::com_utils::clear_variant_array;
 pub use crate::opc_da::errors::{OpcError, OpcResult};
 use crate::opc_da::typedefs::ServerStatus;
 use crate::provider::{ItemProperty, TagValue};
@@ -542,7 +543,8 @@ impl ConnectedServer for ComServer {
         if ids_slice.is_empty() {
             return Ok(Vec::new());
         }
-        let (values, errors) = ItemPropertiesTrait::get_item_properties(self, item_id, ids_slice)?;
+        let (mut values, errors) =
+            ItemPropertiesTrait::get_item_properties(self, item_id, ids_slice)?;
         let descs = descriptions.as_slice();
         let dtypes = datatypes.as_slice();
         let vals = values.as_slice();
@@ -570,6 +572,7 @@ impl ConnectedServer for ComServer {
                 value,
             });
         }
+        clear_variant_array(&mut values);
         Ok(out)
     }
 
@@ -759,7 +762,7 @@ impl ConnectedGroup for ComGroup {
             return Ok(Vec::new());
         }
         let max_ages = vec![max_age_ms; n];
-        let (values, qualities, timestamps, errors) =
+        let (mut values, qualities, timestamps, errors) =
             SyncIo2Trait::read_max_age(self, server_handles, &max_ages)?;
         let vals = values.as_slice();
         let quals = qualities.as_slice();
@@ -792,6 +795,7 @@ impl ConnectedGroup for ComGroup {
                 timestamp,
             });
         }
+        clear_variant_array(&mut values);
         Ok(out)
     }
 

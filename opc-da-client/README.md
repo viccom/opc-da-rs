@@ -11,10 +11,12 @@ Backend-agnostic OPC DA client library for Rust — async, trait-based, with tra
 - **Async/Await API**: Built for modern asynchronous Rust using `tokio` and `async-trait`.
 - **Trait-Based Abstraction**: The `OpcProvider` trait allows for easy mocking and backend swapping.
 - **Transparent COM Management**: Handles COM initialization (`CoInitializeEx`) and apartment thread affinity automatically in the background.
-- **Read & Write Support**: Read tag values and write typed values (`Int`, `Float`, `Bool`, `String`) to OPC tags.
+- **Full OPC DA Coverage**: Browse, read, write, subscribe (IOPCDataCallback), shutdown notifications (IOPCShutdown), server status, item properties, MaxAge read, VQT write, batch operations, and DA 3.0 interfaces.
+- **Remote DCOM**: Connect to OPC DA servers on remote hosts via DCOM (`CoCreateInstanceEx`).
+- **Connection Resilience**: Connection pooling with stale-proxy eviction, exponential-backoff reconnect, explicit disconnect/reconnect API.
 - **Windows COM/DCOM Support**: Native OPC DA backend via `windows-rs` — no external OPC crates needed.
 - **Robust Error Handling**: Leverages `thiserror` for the `OpcError` domain type and `friendly_com_hint()` for human-readable HRESULT explanations.
-- **Test-Friendly**: Built-in `MockOpcProvider` via the `test-support` feature.
+- **Test-Friendly**: Built-in `MockOpcProvider` via the `test-support` feature; 19-test end-to-end suite against real Matrikon/Kepware servers (`e2e` feature).
 
 ## Installation
 
@@ -22,7 +24,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-opc-da-client = "0.2.0"
+opc-da-client = "0.3"
 ```
 
 ## Prerequisites

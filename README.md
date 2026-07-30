@@ -13,10 +13,12 @@ See **[architecture.md](./architecture.md)** for the full design, state machine,
 
 ## ✨ Features
 
-- **Server Discovery**: Enumerate OPC DA servers on the local host. *(Remote host enumeration is planned — see `ROADMAP.md`.)*
-- **Hierarchical Browsing**: Recursive exploration of complex server namespaces with partial-result harvesting on timeout.
-- **Real-time Monitoring**: Live tag value updates via 1-second auto-refresh polling. *(Event-driven subscription via `IOPCDataCallback` is planned — see `ROADMAP.md`.)*
-- **Tag Write Support**: Write typed values (int, float, bool, string) to individual tags.
+- **Server Discovery**: Enumerate OPC DA servers on local or remote hosts (DCOM).
+- **Hierarchical Browsing**: Recursive exploration of complex server namespaces with partial-result harvesting on timeout, data-type/access-rights filtering.
+- **Real-time Subscription**: Event-driven data-change notifications via `IOPCDataCallback` (true push, not polling). The TUI also supports 1-second auto-refresh polling as a fallback.
+- **Tag Read/Write**: Synchronous read, MaxAge read (`IOPCSyncIO2`), VQT write (value + quality + timestamp), and batch operations.
+- **Diagnostics**: Server status, item properties (EU/data type/access rights), localized error strings, server-shutdown notifications.
+- **Connection Resilience**: Connection pooling with stale-proxy eviction, exponential-backoff reconnect, explicit disconnect/reconnect API.
 - **Search & Filter**: Substring search with `Tab`/`Shift+Tab` cycling through matches.
 - **Rich Error Hints**: Human-readable explanations for cryptic Windows COM/DCOM HRESULT codes.
 - **Transparent COM Management**: COM initialization and apartment thread affinity handled automatically by a dedicated background worker thread.

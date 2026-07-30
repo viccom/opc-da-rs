@@ -21,10 +21,24 @@ All methods use `#[async_trait]`.
 
 | Method | Signature | Description |
 | :--- | :--- | :--- |
-| `list_servers` | `async fn list_servers(&self, host: &str) -> Result<Vec<String>>` | Enumerate OPC DA servers available on `host`. |
-| `browse_tags` | `async fn browse_tags(&self, server: &str, max_tags: usize, progress: Arc<AtomicUsize>, tags_sink: Arc<Mutex<Vec<String>>>) -> Result<Vec<String>>` | Recursively discover tags on `server`, pushing each to `tags_sink` as found. |
-| `read_tag_values` | `async fn read_tag_values(&self, server: &str, tag_ids: Vec<String>) -> Result<Vec<TagValue>>` | Read current value, quality, and timestamp for the given tag IDs. |
-| `write_tag_value` | `async fn write_tag_value(&self, server: &str, tag_id: &str, value: OpcValue) -> Result<WriteResult>` | Write a typed value to a single tag on `server`. |
+| `list_servers` | `async fn list_servers(&self, host: &str) -> OpcResult<Vec<String>>` | Enumerate OPC DA servers on `host` (local or remote DCOM). |
+| `browse_tags` | `async fn browse_tags(&self, server: &str, max_tags: usize, progress: Arc<AtomicUsize>, tags_sink: Arc<Mutex<Vec<String>>>, data_type: u16, access_rights: u32) -> OpcResult<Vec<String>>` | Recursively discover tags with optional data-type/access-rights filter. |
+| `read_tag_values` | `async fn read_tag_values(&self, server: &str, tag_ids: Vec<String>) -> OpcResult<Vec<TagValue>>` | Read current value, quality, and timestamp (`IOPCSyncIO::Read`). |
+| `write_tag_value` | `async fn write_tag_value(&self, server: &str, tag_id: &str, value: OpcValue) -> OpcResult<WriteResult>` | Write a typed value to a single tag (`IOPCSyncIO::Write`). |
+| `get_server_status` | `async fn get_server_status(&self, server: &str) -> OpcResult<ServerStatus>` | Query server status — vendor info, state, group count (`IOPCServer::GetStatus`). |
+| `write_tag_values` | `async fn write_tag_values(&self, server: &str, items: Vec<(String, OpcValue)>) -> OpcResult<Vec<WriteResult>>` | Batch write multiple tags in one operation. |
+| `get_item_properties` | `async fn get_item_properties(&self, server: &str, tag_id: &str) -> OpcResult<Vec<ItemProperty>>` | Query item properties — EU, data type, access rights (`IOPCItemProperties`). |
+| `read_tag_values_max_age` | `async fn read_tag_values_max_age(&self, server: &str, tag_ids: Vec<String>, max_age_ms: u32) -> OpcResult<Vec<TagValue>>` | Read with maximum-age constraint (`IOPCSyncIO2::ReadMaxAge`, DA 3.0). |
+| `write_tag_value_vqt` | `async fn write_tag_value_vqt(&self, server: &str, tag_id: &str, value: OpcValue, quality: Option<u16>, timestamp: Option<SystemTime>) -> OpcResult<WriteResult>` | Write value + quality + timestamp (`IOPCSyncIO2::WriteVQT`, DA 3.0). |
+| `get_error_string` | `async fn get_error_string(&self, server: &str, hresult: i32) -> OpcResult<String>` | Server-localized error description (`IOPCCommon::GetErrorString`). |
+| `subscribe` | `async fn subscribe(&self, server: &str, tag_ids: Vec<String>, update_rate: u32) -> OpcResult<SubscriptionHandle>` | Subscribe to data-change notifications (`IOPCDataCallback` + `Advise`). Returns a `SubscriptionHandle{cookie, rx}`. |
+| `unsubscribe` | `async fn unsubscribe(&self, cookie: u32) -> OpcResult<()>` | Tear down a subscription by cookie (`Unadvise`). |
+| `subscribe_shutdown` | `async fn subscribe_shutdown(&self, server: &str) -> OpcResult<ShutdownHandle>` | Subscribe to server-shutdown notifications (`IOPCShutdown`). |
+| `unsubscribe_shutdown` | `async fn unsubscribe_shutdown(&self, cookie: u32) -> OpcResult<()>` | Tear down a shutdown subscription. |
+| `set_subscription_rate` | `async fn set_subscription_rate(&self, cookie: u32, update_rate: u32) -> OpcResult<u32>` | Change update rate at runtime (`IOPCGroupStateMgt::SetState`). |
+| `set_keep_alive` | `async fn set_keep_alive(&self, cookie: u32, keep_alive_ms: u32) -> OpcResult<u32>` | Set keep-alive interval (`IOPCGroupStateMgt2::SetKeepAlive`, DA 3.0). |
+| `set_locale_id` | `async fn set_locale_id(&self, server: &str, locale_id: u32) -> OpcResult<()>` | Set server locale for string localization (`IOPCCommon::SetLocaleID`). |
+| `set_client_name` | `async fn set_client_name(&self, server: &str, name: &str) -> OpcResult<()>` | Set client application name (`IOPCCommon::SetClientName`). |
 
 **Error Conditions:**
 
@@ -299,6 +313,7 @@ Defined in § 1.1. See table above.
 | :--- | :--- | :--- |
 | `opc-da-backend` | ✅ Yes | Compiles the `backend::opc_da` module and exports `OpcDaClient`. |
 | `test-support` | ❌ No | Enables `mockall` and exports `MockOpcProvider`. |
+| `e2e` | ❌ No | Enables end-to-end integration tests against a real OPC DA server (`tests/e2e.rs`). |
 
 ---
 

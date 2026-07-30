@@ -3,6 +3,7 @@
 //! This module provides safe wrappers around COM memory allocations and arrays,
 //! as well as traits for converting between COM-native and Rust-native types.
 
+use windows::Win32::System::Variant::{VARIANT, VariantClear};
 use windows::{
     Win32::System::Com::{CoTaskMemAlloc, CoTaskMemFree},
     core::PWSTR,
@@ -300,6 +301,36 @@ impl<T: Sized> Drop for RemotePointer<T> {
             unsafe {
                 CoTaskMemFree(Some(self.inner as _));
             }
+        }
+    }
+}
+
+/// Release each VARIANT in a COM-allocated array, preventing BSTR/SafeArray leaks when the
+/// array's backing buffer is freed by [`RemotePointer::drop`].
+///
+/// Call this before the `RemoteArray<VARIANT>` goes out of scope.
+///
+/// # Safety contract (caller)
+///
+/// Every element must be a valid COM-allocated VARIANT (produced by the OPC server).
+pub fn clear_variant_array(arr: &mut RemoteArray<VARIANT>) {
+    for v in arr.as_mut_slice() {
+        // SAFETY: each element is a COM-allocated VARIANT; VariantClear releases its
+        // embedded resources (BSTR, SafeArray, IUnknown) via the COM allocator.
+        unsafe {
+            let _ = VariantClear(v);
+        }
+    }
+}
+
+/// Release the `vDataValue` VARIANT in each `tagOPCITEMSTATE` (read-path cleanup).
+///
+/// Call this before the `RemoteArray<tagOPCITEMSTATE>` goes out of scope.
+pub fn clear_item_states(arr: &mut RemoteArray<crate::bindings::da::tagOPCITEMSTATE>) {
+    for s in arr.as_mut_slice() {
+        // SAFETY: vDataValue is COM-allocated; VariantClear releases its resources.
+        unsafe {
+            let _ = VariantClear(&mut s.vDataValue);
         }
     }
 }

@@ -6,6 +6,7 @@ use crate::bindings::da::{
 use crate::helpers::{
     filetime_to_string, format_hresult, opc_value_to_variant, quality_to_string, variant_to_string,
 };
+use crate::opc_da::com_utils::clear_item_states;
 use crate::opc_da::errors::{OpcError, OpcResult};
 use crate::opc_da::typedefs::ServerStatus;
 use crate::opc_da::typedefs::{GroupHandle, ItemHandle};
@@ -15,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{mpsc, oneshot};
+use windows::Win32::System::Variant::VariantClear;
 use windows::core::Interface as _;
 
 /// Represents a asynchronous request dispatched to the COM worker thread.
@@ -753,7 +755,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             return Ok(tag_values);
         }
 
-        let (item_states, read_errors) = group.read(OPC_DS_DEVICE, &server_handles)?;
+        let (mut item_states, read_errors) = group.read(OPC_DS_DEVICE, &server_handles)?;
         let item_states_slice = item_states.as_slice();
         let read_errors_slice = read_errors.as_slice();
 
@@ -784,6 +786,10 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                 timestamp: filetime_to_string(state.ftTimeStamp),
             };
         }
+
+        // Release VARIANT resources in the COM-allocated item_states array before it drops
+        // (RemotePointer::drop only frees the array buffer, not individual VARIANTs).
+        clear_item_states(&mut item_states);
 
         tracing::info!(
             count = tag_values.len(),
@@ -962,7 +968,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             Some(t) => t.try_to_native()?,
             None => windows::Win32::Foundation::FILETIME::default(),
         };
-        let vqt = crate::bindings::da::tagOPCITEMVQT {
+        let mut vqt = crate::bindings::da::tagOPCITEMVQT {
             vDataValue: variant,
             bQualitySpecified: windows::core::BOOL::from(quality.is_some()),
             wQuality: quality.unwrap_or(0),
@@ -972,7 +978,12 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             ftTimeStamp: ft_time_stamp,
         };
 
-        let write_errors = group.write_vqt(&[item_handle], &[vqt])?;
+        let write_errors = group.write_vqt(&[item_handle], &[vqt.clone()])?;
+        // SAFETY: the server has consumed/copied the VARIANT; VariantClear releases the
+        // local BSTR (for OpcValue::String) to prevent a per-write leak.
+        unsafe {
+            let _ = VariantClear(&raw mut vqt.vDataValue);
+        }
         let write_err = write_errors
             .as_slice()
             .first()
@@ -1068,9 +1079,14 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         }
 
         let item_handle = ItemHandle(item_res.hServer);
-        let variant = opc_value_to_variant(value);
+        let mut variant_arr = [opc_value_to_variant(value)];
 
-        let write_errors = group.write(&[item_handle], &[variant])?;
+        let write_errors = group.write(&[item_handle], &variant_arr)?;
+        // SAFETY: the server has consumed/copied the VARIANT by now; VariantClear releases
+        // the local BSTR (for OpcValue::String) to prevent a per-write leak.
+        unsafe {
+            let _ = VariantClear(&raw mut variant_arr[0]);
+        }
         let write_err = write_errors
             .as_slice()
             .first()
@@ -1202,11 +1218,18 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             return Ok(write_results);
         }
 
-        let variants: Vec<_> = valid_indices
+        let mut variants: Vec<_> = valid_indices
             .iter()
             .map(|&i| opc_value_to_variant(&items[i].1))
             .collect();
         let write_errors = group.write(&handles, &variants)?;
+        // SAFETY: the server has consumed/copied each VARIANT; release local BSTR resources.
+        for v in &mut variants {
+            // SAFETY: the server has consumed/copied each VARIANT; VariantClear releases BSTR.
+            unsafe {
+                let _ = VariantClear(v);
+            }
+        }
         if write_errors.len() as usize != handles.len() {
             if let Err(e) = opc_server.remove_group(server_handle, true) {
                 tracing::warn!(error = ?e, operation = "write_tag_values", "Failed to remove OPC group during cleanup");

@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-07-30
+
+### Added — OPC DA Subscription & DA 3.0
+- **Data-change subscription** (`subscribe`/`unsubscribe`): `IOPCDataCallback` sink via `#[implement]`, `Advise`/`Unadvise`, returns `SubscriptionHandle{cookie, rx}` for async stream consumption.
+- **Server-shutdown notification** (`subscribe_shutdown`/`unsubscribe_shutdown`): `IOPCShutdown` sink.
+- **MaxAge read** (`read_tag_values_max_age`): `IOPCSyncIO2::ReadMaxAge` (DA 3.0).
+- **VQT write** (`write_tag_value_vqt`): value + quality + timestamp (`IOPCSyncIO2::WriteVQT`, DA 3.0).
+- **Batch write** (`write_tag_values`): write multiple tags in one COM group.
+- **Keep-alive** (`set_keep_alive`): `IOPCGroupStateMgt2::SetKeepAlive` (DA 3.0).
+- **Subscription rate** (`set_subscription_rate`): runtime `IOPCGroupStateMgt::SetState`.
+- **Item properties** (`get_item_properties`): EU, data type, access rights (`IOPCItemProperties`).
+- **Server status** (`get_server_status`): vendor info, state, group count (`IOPCServer::GetStatus`).
+- **Error string** (`get_error_string`): server-localized HRESULT text (`IOPCCommon::GetErrorString`).
+- **Locale / client name** (`set_locale_id` / `set_client_name`): `IOPCCommon`.
+- **Browse filter**: `browse_tags` now accepts `data_type` + `access_rights` filter parameters.
+- **DA 3.0 interface wiring**: `ComServer`/`ComGroup` connected to all DA 3.0 traits (Browse, ItemIO, GroupStateMgt2, SyncIO2, AsyncIO3, ItemDeadbandMgt, ItemSamplingMgt).
+- **Remote DCOM**: `ComConnector` carries a target `host`; `create_server2`/`CoCreateInstanceEx` for remote server instantiation; `IOPCServerList` remote enumeration.
+- **Connection lifecycle**: `disconnect`/`reconnect` inherent methods + `dispatch_with_retry` exponential backoff (max 3, 50/100/200 ms).
+- **End-to-end test suite** (`e2e` feature, `tests/e2e.rs`): 19 local + 4 remote tests against Matrikon.OPC.Simulation.1.
+- **Diagnostic CLI** (`examples/remote_list.rs`): minimal remote server enumeration tool.
+
+### Fixed
+- **VARIANT memory leak** (P0): `clear_variant_array` / `clear_item_states` release embedded BSTR/SafeArray in COM-allocated arrays before `RemotePointer::drop`. All read paths (`handle_read`, `read_max_age`, `get_item_properties`) and write paths (`handle_write`, `handle_write_vqt`, `handle_write_values`) now `VariantClear` local VARIANTs.
+- **AuthInfo Bridge dangling pointer**: `try_to_native()` returned a temporary `COAUTHINFO` whose address was taken for `COSERVERINFO.pAuthInfo` — caused `0x800703E6` on 32-bit. Fixed by using `COSERVERINFO{pAuthInfo: null}` (DCOM default auth = current user).
+- **`.cargo/config.toml`**: replaced machine-specific portable-msvc linker path with BuildTools path (x64 + i686 targets).
+- **`write_tag_value` error message**: copy-paste "Browse error" → "Write error" in `poll_write_result`.
+
+### Changed — Breaking
+- `OpcProvider` trait expanded from 4 to 18 methods. Downstream `impl OpcProvider` must implement all new methods (or use `MockOpcProvider` via `test-support`).
+- `browse_tags` signature: added `data_type: u16` and `access_rights: u32` parameters.
+- `ServerConnector::enumerate_servers` signature: added `host: &str` parameter.
+- `ComConnector` is no longer a unit struct; use `ComConnector::new(host)` or `ComConnector::default()` (localhost).
+
 ## [0.2.0] - 2026-02-23
 
 ### Added
