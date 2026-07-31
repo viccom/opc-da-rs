@@ -24,6 +24,8 @@ jobs:
 
       - name: Install Rust (stable, satisfies MSRV 1.93.1 / edition 2024)
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: i686-pc-windows-msvc
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -47,12 +49,19 @@ jobs:
       - name: Build opc-da-desktop (GUI)
         run: cargo build --release --locked -p opc-da-desktop
 
+      # 32-bit (i686) desktop build. The OPC DA servers (Matrikon/Kepware) often
+      # register their CATID only in the 32-bit registry view, so a 32-bit client
+      # can enumerate servers a 64-bit client cannot see.
+      - name: Build opc-da-desktop 32-bit (GUI)
+        run: cargo build --release --locked -p opc-da-desktop --target i686-pc-windows-msvc
+
       - name: Stage release assets
         shell: bash
         run: |
           mkdir -p assets
           cp target/release/opc-cli.exe assets/opc-cli-x64.exe
           cp target/release/opc-da-desktop.exe assets/opc-da-desktop-x64.exe
+          cp target/i686-pc-windows-msvc/release/opc-da-desktop.exe assets/opc-da-desktop-x86.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -60,6 +69,7 @@ jobs:
           files: |
             assets/opc-cli-x64.exe
             assets/opc-da-desktop-x64.exe
+            assets/opc-da-desktop-x86.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
