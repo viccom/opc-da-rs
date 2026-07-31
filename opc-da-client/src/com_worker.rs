@@ -25,6 +25,11 @@ use tokio::sync::{mpsc, oneshot};
 use windows::Win32::System::Variant::VariantClear;
 use windows::core::Interface as _;
 
+/// Monotonic counter for OPC group names. OPC servers reject a second group
+/// with the same name (`OPC_E_DUPLICATENAME` / `0xC004000C`), so each
+/// subscription group gets a unique name (multiple concurrent subscriptions).
+static GROUP_SEQ: AtomicUsize = AtomicUsize::new(0);
+
 /// Represents a asynchronous request dispatched to the COM worker thread.
 pub enum ComRequest {
     /// Request to enumerate available OPC DA servers on a host.
@@ -1971,8 +1976,12 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
     )> {
         let mut revised_update_rate = 0u32;
         let mut server_handle = GroupHandle::default();
+        let group_name = format!(
+            "opc-da-client-subscribe-{}",
+            GROUP_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
         let group = opc_server.add_group(
-            "opc-da-client-subscribe",
+            &group_name,
             true,
             update_rate,
             GroupHandle(0),

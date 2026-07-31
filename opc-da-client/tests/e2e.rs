@@ -404,6 +404,52 @@ async fn e2e_diag_browse_bucket() {
 }
 
 #[tokio::test]
+#[ignore = "诊断：多个订阅组并发（库层是否支持同时 >1 订阅）"]
+async fn e2e_diag_multi_subscribe() {
+    let c = client();
+    let server = server();
+
+    // 两个并发订阅（不同 tag）。
+    let sub1 = c
+        .subscribe(&server, vec!["Bucket Brigade.Int1".to_string()], 1000)
+        .await;
+    let sub2 = c
+        .subscribe(&server, vec!["Bucket Brigade.Int2".to_string()], 1000)
+        .await;
+    let sub1_str = match &sub1 {
+        Ok(s) => format!("cookie={}", s.cookie),
+        Err(e) => format!("ERR {e:?}"),
+    };
+    let sub2_str = match &sub2 {
+        Ok(s) => format!("cookie={}", s.cookie),
+        Err(e) => format!("ERR {e:?}"),
+    };
+    eprintln!("[multi] sub1: {sub1_str}");
+    eprintln!("[multi] sub2: {sub2_str}");
+
+    if let (Ok(s1), Ok(s2)) = (sub1, sub2) {
+        let mut rx1 = s1.rx;
+        let mut rx2 = s2.rx;
+        // 两组都应收到初始 OnDataChange。
+        let r1 = tokio::time::timeout(Duration::from_secs(3), rx1.recv()).await;
+        let r2 = tokio::time::timeout(Duration::from_secs(3), rx2.recv()).await;
+        eprintln!("[multi] sub1 initial: {r1:?}");
+        eprintln!("[multi] sub2 initial: {r2:?}");
+
+        // write Int1 → sub1 应收新值。
+        let w1 = c
+            .write_tag_value(&server, "Bucket Brigade.Int1", OpcValue::Int(111))
+            .await;
+        eprintln!("[multi] write Int1=111: {:?}", w1.map(|r| r.success));
+        let after1 = tokio::time::timeout(Duration::from_secs(3), rx1.recv()).await;
+        eprintln!("[multi] sub1 after write Int1: {after1:?}");
+
+        let _ = c.unsubscribe(s1.cookie).await;
+        let _ = c.unsubscribe(s2.cookie).await;
+    }
+}
+
+#[tokio::test]
 async fn e2e_set_subscription_rate() {
     let c = client();
     let tags = first_tags(1).await;
