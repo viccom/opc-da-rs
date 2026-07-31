@@ -81,7 +81,7 @@ pub use provider::{
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
 pub use opc_da::{
     errors::{OpcError, OpcResult},
-    typedefs::{GroupHandle, ItemHandle, ServerState, ServerStatus},
+    typedefs::{AuthCredentials, GroupHandle, ItemHandle, ServerState, ServerStatus},
 };
 
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]

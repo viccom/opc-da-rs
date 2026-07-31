@@ -350,7 +350,11 @@ pub fn is_remote_host(host: &str) -> bool {
 ///
 /// Returns `Err` if the `ProgID` cannot be resolved or the server
 /// cannot be instantiated.
-pub fn connect_server(server_name: &str, host: &str) -> OpcResult<crate::bindings::da::IOPCServer> {
+pub fn connect_server(
+    server_name: &str,
+    host: &str,
+    credentials: Option<&crate::opc_da::typedefs::AuthCredentials>,
+) -> OpcResult<crate::bindings::da::IOPCServer> {
     // SAFETY: `server_wide` is null-terminated and lives until the end of this scope.
     let clsid_raw = unsafe {
         let server_wide: Vec<u16> = server_name
@@ -369,9 +373,13 @@ pub fn connect_server(server_name: &str, host: &str) -> OpcResult<crate::binding
     let client = crate::opc_da::client::v2::Client;
     let is_remote = is_remote_host(host);
     let server_result = if is_remote {
+        let auth_info = match credentials {
+            Some(c) => c.to_auth_info(),
+            None => crate::opc_da::typedefs::AuthInfo::default_dcom(),
+        };
         let info = crate::opc_da::typedefs::ServerInfo {
             name: host.to_string(),
-            auth_info: crate::opc_da::typedefs::AuthInfo::default_dcom(),
+            auth_info,
         };
         tracing::debug!(server = %server_name, host = %host, "Connecting via remote DCOM (create_server2)");
         client.create_server2(

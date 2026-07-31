@@ -625,7 +625,9 @@ impl TryToNative<windows::Win32::System::Com::COSERVERINFO> for ServerInfoBridge
             dwReserved1: 0,
             dwReserved2: 0,
             pwszName: self.name.as_pwstr(),
-            pAuthInfo: &self.auth_info.try_to_native()? as *const _ as *mut _,
+            // 指向 self.auth_info.native（Box<COAUTHINFO> 堆地址）。self（ServerInfoBridge）在
+            // 调用方存活期间不 move，故该指针在返回的 COSERVERINFO 使用期内有效。
+            pAuthInfo: &*self.auth_info.native as *const _ as *mut _,
         })
     }
 }
@@ -668,6 +670,11 @@ impl AuthInfo {
 }
 
 /// FFI-safe bridge for `AuthInfo` (COAUTHINFO).
+///
+/// `native` 是 owned `COAUTHINFO`：`pwszServerPrincName` 指向本结构体的 `server_principal_name`，
+/// `pAuthIdentityData` 指向 `auth_identity_data.native`（`Box<COAUTHIDENTITY>` 堆地址）。
+/// 用 `Box` 固定 `native` 地址，使 `ServerInfoBridge::try_to_native` 取走的 `pAuthInfo` 指针
+/// 在 Bridge 存活期内有效（不再悬垂）。
 pub struct AuthInfoBridge {
     pub authn_svc: u32,
     pub authz_svc: u32,
@@ -676,33 +683,41 @@ pub struct AuthInfoBridge {
     pub impersonation_level: u32,
     pub auth_identity_data: AuthIdentityBridge,
     pub capabilities: u32,
+    pub native: Box<windows::Win32::System::Com::COAUTHINFO>,
 }
 
 impl IntoBridge<AuthInfoBridge> for AuthInfo {
     fn into_bridge(self) -> AuthInfoBridge {
+        let princ_empty = self.server_principal_name.is_empty();
+        let server_principal_name = LocalPointer::from(&self.server_principal_name);
+        let auth_identity_data = self.auth_identity_data.into_bridge();
+        // 指针有效性：`pAuthIdentityData` 指向 `auth_identity_data.native`（Box 堆地址，固定）；
+        // `pwszServerPrincName` 指向 `server_principal_name` 的 Vec 堆缓冲。两者随后 move 进 struct，
+        // 堆地址均不变，故指针在 Bridge 存活期内有效。
+        let native = Box::new(windows::Win32::System::Com::COAUTHINFO {
+            dwAuthnSvc: self.authn_svc,
+            dwAuthzSvc: self.authz_svc,
+            // MSDN: 用 RPC_C_AUTHN_WINNT 时 pwszServerPrincName 必须为 NULL；空串→null。
+            pwszServerPrincName: if princ_empty {
+                windows::core::PWSTR::null()
+            } else {
+                server_principal_name.as_pwstr()
+            },
+            dwAuthnLevel: self.authn_level,
+            dwImpersonationLevel: self.impersonation_level,
+            pAuthIdentityData: &*auth_identity_data.native as *const _ as *mut _,
+            dwCapabilities: self.capabilities,
+        });
         AuthInfoBridge {
             authn_svc: self.authn_svc,
             authz_svc: self.authz_svc,
-            server_principal_name: LocalPointer::from(&self.server_principal_name),
+            server_principal_name,
             authn_level: self.authn_level,
             impersonation_level: self.impersonation_level,
-            auth_identity_data: self.auth_identity_data.into_bridge(),
+            auth_identity_data,
             capabilities: self.capabilities,
+            native,
         }
-    }
-}
-
-impl TryToNative<windows::Win32::System::Com::COAUTHINFO> for AuthInfoBridge {
-    fn try_to_native(&self) -> windows::core::Result<windows::Win32::System::Com::COAUTHINFO> {
-        Ok(windows::Win32::System::Com::COAUTHINFO {
-            dwAuthnSvc: self.authn_svc,
-            dwAuthzSvc: self.authz_svc,
-            pwszServerPrincName: self.server_principal_name.as_pwstr(),
-            dwAuthnLevel: self.authn_level,
-            dwImpersonationLevel: self.impersonation_level,
-            pAuthIdentityData: &self.auth_identity_data.try_to_native()? as *const _ as *mut _,
-            dwCapabilities: self.capabilities,
-        })
     }
 }
 
@@ -715,51 +730,117 @@ pub struct AuthIdentity {
     pub flags: u32,
 }
 
+/// 用户态 DCOM 远程认证凭据，对应 `COAUTHIDENTITY`（见 [`AuthIdentity`]）。
+///
+/// 通过 [`crate::backend::connector::ComConnector::with_credentials`] 或
+/// `OpcDaClient::with_credentials` 注入，用于跨域或指定账户访问远程 OPC DA Server。
+/// `user` 为空时退化为当前登录用户（DCOM 默认认证）。
+///
+/// `Debug` 实现屏蔽 `password`，避免凭据进入日志或错误信息。
+pub struct AuthCredentials {
+    /// 登录用户名（空 → 用当前登录用户）。
+    pub user: String,
+    /// 密码明文（仅用于构造 `COAUTHIDENTITY`，不进入日志）。
+    pub password: String,
+    /// 域或机器名（可空；本地账户用机器名或留空）。
+    pub domain: String,
+}
+
+impl AuthCredentials {
+    /// 构造对应 [`AuthInfo`]：`RPC_C_AUTHN_WINNT` + `RPC_C_AUTHN_LEVEL_CONNECT` +
+    /// `RPC_C_IMP_LEVEL_IMPERSONATE`（允许 server 以本 client 身份访问本地资源，如读取标签）。
+    ///
+    /// 常量值：`authn_svc=10`(WINNT)、`authz_svc=0`、`authn_level=2`(CONNECT)、
+    /// `impersonation_level=3`(IMPERSONATE)。
+    #[must_use]
+    pub fn to_auth_info(&self) -> AuthInfo {
+        AuthInfo {
+            authn_svc: 10,
+            authz_svc: 0,
+            server_principal_name: String::new(),
+            authn_level: 2,
+            impersonation_level: 3,
+            auth_identity_data: AuthIdentity {
+                user: self.user.clone(),
+                domain: self.domain.clone(),
+                password: self.password.clone(),
+                // SEC_WINNT_AUTH_IDENTITY_UNICODE(2)：User/Domain/Password 是 UTF-16 wide string。
+                // （0 无效，会让 DCOM 按错误编码解析凭据 → 0x80070057 E_INVALIDARG。）
+                flags: 2,
+            },
+            capabilities: 0,
+        }
+    }
+}
+
+impl Clone for AuthCredentials {
+    fn clone(&self) -> Self {
+        Self {
+            user: self.user.clone(),
+            password: self.password.clone(),
+            domain: self.domain.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for AuthCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 屏蔽 password，避免凭据随 Debug 进入日志/错误。
+        f.debug_struct("AuthCredentials")
+            .field("user", &self.user)
+            .field("password", &"***")
+            .field("domain", &self.domain)
+            .finish()
+    }
+}
+
+/// 宽字符串的字符数（不含 null 终止符），用于 `COAUTHIDENTITY` 的 `*Length` 字段。
+///
+/// `LocalPointer::from` 生成的 wide string 带 null 终止符，故 `len() - 1` 得字符数。
+/// 用户名/域名/密码长度不可能接近 u32 上限，截断无实际风险。
+#[allow(clippy::cast_possible_truncation)]
+fn wide_char_len(s: &LocalPointer<Vec<u16>>) -> u32 {
+    (s.len().saturating_sub(1)) as u32
+}
+
 /// FFI-safe bridge for `AuthIdentity` (COAUTHIDENTITY).
+///
+/// `native` 是 owned 的 `COAUTHIDENTITY`，其 `User`/`Domain`/`Password` 指针指向本
+/// 结构体里 `user`/`domain`/`password` 的 wide string 堆缓冲。整条数据链
+/// （`Box<COAUTHIDENTITY>` 与三个 `LocalPointer<Vec<u16>>`）都由 Bridge owned 且都在堆上，
+/// Bridge 整体 move 后这些指针仍指向有效内存——不再有旧实现返回临时值导致的悬垂指针
+/// （曾致 32 位 `0x800703E6`）。
 pub struct AuthIdentityBridge {
     pub user: LocalPointer<Vec<u16>>,
     pub domain: LocalPointer<Vec<u16>>,
     pub password: LocalPointer<Vec<u16>>,
     pub flags: u32,
+    pub native: Box<windows::Win32::System::Com::COAUTHIDENTITY>,
 }
 
 impl IntoBridge<AuthIdentityBridge> for AuthIdentity {
     fn into_bridge(self) -> AuthIdentityBridge {
-        AuthIdentityBridge {
-            user: LocalPointer::from(&self.user),
-            domain: LocalPointer::from(&self.domain),
-            password: LocalPointer::from(&self.password),
-            flags: self.flags,
-        }
-    }
-}
-
-impl TryToNative<windows::Win32::System::Com::COAUTHIDENTITY> for AuthIdentityBridge {
-    fn try_to_native(&self) -> windows::core::Result<windows::Win32::System::Com::COAUTHIDENTITY> {
-        Ok(windows::Win32::System::Com::COAUTHIDENTITY {
-            User: self.user.as_pwstr().0,
-            UserLength: self.user.len().try_into().map_err(|_| {
-                windows::core::Error::new(
-                    windows::Win32::Foundation::E_INVALIDARG,
-                    "User name exceeds u32 maximum length",
-                )
-            })?,
-            Domain: self.domain.as_pwstr().0,
-            DomainLength: self.domain.len().try_into().map_err(|_| {
-                windows::core::Error::new(
-                    windows::Win32::Foundation::E_INVALIDARG,
-                    "Domain name exceeds u32 maximum length",
-                )
-            })?,
-            Password: self.password.as_pwstr().0,
-            PasswordLength: self.password.len().try_into().map_err(|_| {
-                windows::core::Error::new(
-                    windows::Win32::Foundation::E_INVALIDARG,
-                    "Password exceeds u32 maximum length",
-                )
-            })?,
+        let user = LocalPointer::from(&self.user);
+        let domain = LocalPointer::from(&self.domain);
+        let password = LocalPointer::from(&self.password);
+        // 指针有效性：`native` 的裸指针指向上面三个 `LocalPointer` 的 `Vec<u16>` 堆缓冲。
+        // 它们随后 move 进 struct，但 `Vec` 堆地址不变，故指针在 Bridge 存活期内始终有效。
+        let native = Box::new(windows::Win32::System::Com::COAUTHIDENTITY {
+            User: user.as_pwstr().0,
+            UserLength: wide_char_len(&user),
+            Domain: domain.as_pwstr().0,
+            DomainLength: wide_char_len(&domain),
+            Password: password.as_pwstr().0,
+            PasswordLength: wide_char_len(&password),
             Flags: self.flags,
-        })
+        });
+        AuthIdentityBridge {
+            user,
+            domain,
+            password,
+            flags: self.flags,
+            native,
+        }
     }
 }
 
@@ -832,5 +913,85 @@ impl ToNative<windows::Win32::System::Com::CLSCTX> for ClassContext {
             }
             ClassContext::PsDll => windows::Win32::System::Com::CLSCTX_PS_DLL,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opc_da::com_utils::{IntoBridge as _, TryToNative as _};
+
+    /// 读取 null 结尾 wide string 为 `String`（仅测试用）。
+    fn read_wide(ptr: *const u16) -> String {
+        if ptr.is_null() {
+            return String::new();
+        }
+        // SAFETY: `ptr` 来自 `LocalPointer` 内 null 结尾的 wide string，向后扫描到 0 安全。
+        unsafe {
+            let mut len = 0;
+            while *ptr.add(len) != 0 {
+                len += 1;
+            }
+            String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+        }
+    }
+
+    /// P1.1 回归：`AuthIdentityBridge.native` 的指针在 Bridge move 后仍有效
+    /// （旧实现 `try_to_native` 返回临时 → 悬垂；新实现 `native` 是 owned `Box`）。
+    #[test]
+    fn auth_identity_native_pointers_survive_move() {
+        let id = AuthIdentity {
+            user: "viccom".to_string(),
+            domain: "PLANT".to_string(),
+            password: "Pa88word".to_string(),
+            flags: 0,
+        };
+        let bridge = id.into_bridge();
+        let moved = bridge; // 模拟调用栈中的 move
+        let native = &*moved.native;
+        assert_eq!(native.UserLength, 6);
+        assert_eq!(native.DomainLength, 5);
+        assert_eq!(native.PasswordLength, 8);
+        assert_eq!(read_wide(native.User), "viccom");
+        assert_eq!(read_wide(native.Domain), "PLANT");
+        assert_eq!(read_wide(native.Password), "Pa88word");
+    }
+
+    /// P1.1 回归：三层 Bridge（ServerInfo→AuthInfo→AuthIdentity）move 后 `pAuthInfo` 链仍有效。
+    #[test]
+    fn server_info_bridge_auth_chain_survives_move() {
+        let info = ServerInfo {
+            name: "192.168.199.155".to_string(),
+            auth_info: AuthInfo {
+                authn_svc: 10,
+                authz_svc: 0,
+                server_principal_name: String::new(),
+                authn_level: 2,
+                impersonation_level: 2,
+                auth_identity_data: AuthIdentity {
+                    user: "viccom".to_string(),
+                    domain: String::new(),
+                    password: "Pa88word".to_string(),
+                    flags: 0,
+                },
+                capabilities: 0,
+            },
+        };
+        let bridge = info.into_bridge();
+        let moved = bridge;
+        let server = moved
+            .try_to_native()
+            .expect("ServerInfoBridge::try_to_native ok");
+        assert!(!server.pAuthInfo.is_null(), "pAuthInfo 必须非空");
+        // SAFETY: `pAuthInfo` 指向 `moved.auth_info.native`（`Box<COAUTHINFO>` 堆地址，moved 存活）。
+        let auth = unsafe { &*server.pAuthInfo };
+        assert!(
+            !auth.pAuthIdentityData.is_null(),
+            "pAuthIdentityData 必须非空"
+        );
+        // SAFETY: `pAuthIdentityData` 指向 `moved.auth_info.auth_identity_data.native`（`Box` 堆）。
+        let ident = unsafe { &*auth.pAuthIdentityData };
+        assert_eq!(read_wide(ident.User), "viccom");
+        assert_eq!(read_wide(ident.Password), "Pa88word");
     }
 }

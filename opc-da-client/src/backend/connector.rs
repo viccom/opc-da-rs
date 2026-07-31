@@ -320,13 +320,32 @@ pub trait ConnectedGroup {
 /// the target machine for [`Self::connect`]: remote hosts go through `create_server2` (DCOM).
 pub struct ComConnector {
     host: String,
+    credentials: Option<crate::opc_da::typedefs::AuthCredentials>,
 }
 
 impl ComConnector {
-    /// Create a connector targeting `host` (e.g. `"localhost"` or `"192.168.1.10"`).
+    /// Create a connector targeting `host` (e.g. `"localhost"` or `"192.168.1.10"`),
+    /// using the current logged-in user's credentials (DCOM default authentication).
     #[must_use]
     pub fn new(host: impl Into<String>) -> Self {
-        Self { host: host.into() }
+        Self {
+            host: host.into(),
+            credentials: None,
+        }
+    }
+
+    /// Create a connector targeting `host` authenticated with explicit DCOM credentials
+    /// (`user`/`password`/`domain`). Use this when the current logged-in user cannot
+    /// access the remote OPC DA Server (cross-domain, dedicated service account, etc.).
+    #[must_use]
+    pub fn with_credentials(
+        host: impl Into<String>,
+        credentials: crate::opc_da::typedefs::AuthCredentials,
+    ) -> Self {
+        Self {
+            host: host.into(),
+            credentials: Some(credentials),
+        }
     }
 
     /// Target host for subsequent `connect` calls.
@@ -347,7 +366,15 @@ impl ServerConnector for ComConnector {
 
     fn enumerate_servers(&self, host: &str) -> OpcResult<Vec<String>> {
         let client = crate::opc_da::client::v2::Client;
-        let guid_iter = client.get_servers(Some(host)).map_err(|e| {
+        let auth_info = self.credentials.as_ref().map_or_else(
+            crate::opc_da::typedefs::AuthInfo::default_dcom,
+            crate::opc_da::typedefs::AuthCredentials::to_auth_info,
+        );
+        let server_info = crate::opc_da::typedefs::ServerInfo {
+            name: host.to_string(),
+            auth_info,
+        };
+        let guid_iter = client.get_servers(Some(server_info)).map_err(|e| {
             tracing::warn!(error = ?e, host = %host, "IOPCServerList enumeration failed");
             e
         })?;
@@ -375,7 +402,8 @@ impl ServerConnector for ComConnector {
     }
 
     fn connect(&self, server_name: &str) -> OpcResult<Self::Server> {
-        let opc_server = crate::helpers::connect_server(server_name, &self.host)?;
+        let opc_server =
+            crate::helpers::connect_server(server_name, &self.host, self.credentials.as_ref())?;
         let unknown: windows::core::IUnknown = opc_server.cast()?;
 
         Ok(ComServer {

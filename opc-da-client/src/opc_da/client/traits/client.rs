@@ -17,34 +17,31 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
     /// # Returns
     ///
     /// A `Result` containing a `GuidIterator` over server GUIDs, or an error if the operation fails.
-    fn get_servers(&self, host: Option<&str>) -> OpcResult<GuidIterator> {
+    fn get_servers(&self, server_info: Option<ServerInfo>) -> OpcResult<GuidIterator> {
         tracing::debug!("Enumerating OPC DA Server classes via COM Component Categories Manager");
         let id = unsafe {
             windows::Win32::System::Com::CLSIDFromProgID(windows::core::w!("OPC.ServerList.1"))?
         };
 
-        let servers: crate::bindings::comn::IOPCServerList = match host {
-            // 非空 host（含 "localhost"）→ DCOM 路径；空 host → 本地 CoCreateInstance。
+        let servers: crate::bindings::comn::IOPCServerList = match server_info {
+            // 非空 name（含 "localhost"）→ DCOM 路径；空 name/None → 本地 CoCreateInstance。
             // localhost 走 DCOM 绕过本地 in-proc 尝试，与 helpers::is_remote_host 一致。
-            Some(h) if !h.is_empty() => {
-                // SAFETY: `host_wide` is null-terminated and outlives the CoCreateInstanceEx call.
-                let mut host_wide: Vec<u16> = h.encode_utf16().chain(core::iter::once(0)).collect();
-                let native = windows::Win32::System::Com::COSERVERINFO {
-                    dwReserved1: 0,
-                    pwszName: windows::core::PWSTR(host_wide.as_ptr().cast_mut()),
-                    // pAuthInfo = null => DCOM default authentication (current logged-in user),
-                    // matching legacy 32-bit OPC clients. Avoids the AuthInfo bridge's dangling
-                    // pointer to a temporary COAUTHINFO (caused 0x800703E6 on 32-bit).
-                    pAuthInfo: std::ptr::null_mut(),
-                    dwReserved2: 0,
-                };
+            Some(info) if !info.name.is_empty() => {
+                let has_credentials = !info.auth_info.auth_identity_data.user.is_empty();
+                let bridge = info.into_bridge();
+                let mut native = bridge.try_to_native()?;
+                if !has_credentials {
+                    // 空凭据 → DCOM 默认认证（当前登录用户），与历史行为一致。
+                    native.pAuthInfo = std::ptr::null_mut();
+                }
                 let mut results = [windows::Win32::System::Com::MULTI_QI {
                     pIID: &crate::bindings::comn::IOPCServerList::IID,
                     pItf: core::mem::ManuallyDrop::new(None),
                     hr: windows::core::HRESULT(0),
                 }];
-                // SAFETY: CoCreateInstanceEx with a remote COSERVERINFO instantiates
-                // IOPCServerList on `host` and returns it via MULTI_QI.
+                // SAFETY: `bridge` 持有 `native` 引用的全部内存，存活到本调用之后；
+                // CoCreateInstanceEx with a remote COSERVERINFO instantiates IOPCServerList
+                // on `info.name` and returns it via MULTI_QI.
                 unsafe {
                     windows::Win32::System::Com::CoCreateInstanceEx(
                         &id,
@@ -134,24 +131,19 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
             hr: windows::core::HRESULT(0),
         }];
 
-        // SAFETY: when remote, `host_wide` + `native` outlive the CoCreateInstanceEx call.
-        unsafe {
-            match &server_info {
-                Some(info) => {
-                    let mut host_wide: Vec<u16> = info
-                        .name
-                        .encode_utf16()
-                        .chain(core::iter::once(0))
-                        .collect();
-                    let native = windows::Win32::System::Com::COSERVERINFO {
-                        dwReserved1: 0,
-                        pwszName: windows::core::PWSTR(host_wide.as_ptr().cast_mut()),
-                        // pAuthInfo = null => DCOM default auth (current logged-in user),
-                        // matching legacy 32-bit clients; avoids the AuthInfo bridge's
-                        // dangling pointer to a temporary COAUTHINFO.
-                        pAuthInfo: std::ptr::null_mut(),
-                        dwReserved2: 0,
-                    };
+        match server_info {
+            Some(info) => {
+                // 空用户名 → pAuthInfo:null（当前登录用户），保持向后兼容；
+                // 非空 → 走 Bridge 用显式凭据（COAUTHINFO/COAUTHIDENTITY）。
+                let has_credentials = !info.auth_info.auth_identity_data.user.is_empty();
+                let bridge = info.into_bridge();
+                let mut native = bridge.try_to_native()?;
+                if !has_credentials {
+                    native.pAuthInfo = std::ptr::null_mut();
+                }
+                // SAFETY: `bridge` 持有 `native` 引用的全部内存（name/AuthInfo 的
+                // LocalPointer wide string + Box<COAUTH*>)，存活到本调用之后。
+                unsafe {
                     windows::Win32::System::Com::CoCreateInstanceEx(
                         &class_id,
                         None,
@@ -160,15 +152,17 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
                         &mut results,
                     )?
                 }
-                None => windows::Win32::System::Com::CoCreateInstanceEx(
+            }
+            None => unsafe {
+                windows::Win32::System::Com::CoCreateInstanceEx(
                     &class_id,
                     None,
                     class_context.to_native(),
                     None,
                     &mut results,
-                )?,
-            }
-        };
+                )?
+            },
+        }
 
         if results[0].hr.is_err() {
             return Err(OpcError::Com {

@@ -30,6 +30,23 @@ impl Default for OpcDaClient<ComConnector> {
     }
 }
 
+impl OpcDaClient<ComConnector> {
+    /// Create an `OpcDaClient` targeting `host` with explicit DCOM credentials
+    /// (`user`/`password`/`domain`), for remote OPC DA Servers the current logged-in
+    /// user cannot access (cross-domain, dedicated service account, etc.).
+    ///
+    /// `user` 为空时退化为当前登录用户。凭据经 `COAUTHIDENTITY` 注入远程激活。
+    ///
+    /// # Errors
+    /// Returns `Err` if the background COM worker thread cannot be started.
+    pub fn with_credentials(
+        host: impl Into<String>,
+        credentials: crate::opc_da::typedefs::AuthCredentials,
+    ) -> OpcResult<Self> {
+        Self::new(ComConnector::with_credentials(host, credentials))
+    }
+}
+
 impl<C: ServerConnector + 'static> OpcDaClient<C> {
     /// Creates a new `OpcDaClient` with the given connector.
     pub fn new(connector: C) -> OpcResult<Self> {
