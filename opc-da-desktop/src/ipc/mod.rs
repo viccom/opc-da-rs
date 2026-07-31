@@ -18,6 +18,8 @@ pub struct TagUpdate {
     pub tag_id: String,
     /// Display value (string form of the underlying OPC value).
     pub value: String,
+    /// OPC data type display name (e.g. `"Float"`, `"Boolean"`, `"Array of String"`).
+    pub data_type: String,
     /// Server timestamp (local-time string).
     pub timestamp: String,
     /// Quality string (e.g. `"Good"` / `"Bad"` / `"Uncertain"`).
@@ -29,6 +31,7 @@ impl From<TagValue> for TagUpdate {
         Self {
             tag_id: t.tag_id,
             value: t.value,
+            data_type: t.data_type,
             timestamp: t.timestamp,
             quality: t.quality,
         }

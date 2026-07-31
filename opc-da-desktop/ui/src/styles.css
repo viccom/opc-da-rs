@@ -329,6 +329,19 @@ button.danger {
   overflow: hidden;
 }
 
+.leaf-toolbar {
+  display: flex;
+  gap: 4px;
+  padding: 4px 8px;
+  border-bottom: 1px solid #3c3c3c;
+  align-items: center;
+}
+
+button.mini {
+  padding: 2px 8px;
+  font-size: 11px;
+}
+
 .leaf-list {
   flex: 1;
 }

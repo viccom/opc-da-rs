@@ -30,6 +30,8 @@ export interface TagRow {
 export interface TagUpdate {
   tag_id: string;
   value: string;
+  /** OPC data type display name (e.g. "Float", "Boolean", "Array of String"). */
+  data_type: string;
   timestamp: string;
   quality: string;
 }

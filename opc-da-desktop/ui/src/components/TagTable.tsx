@@ -17,7 +17,7 @@ import { useMemo, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useSubscriptionStore } from "../stores/subscription";
 
-type SortKey = "tag_id" | "value" | "timestamp" | "quality";
+type SortKey = "tag_id" | "data_type" | "value" | "timestamp" | "quality";
 type SortDir = "asc" | "desc";
 
 interface Column {
@@ -28,7 +28,7 @@ interface Column {
 
 const COLUMNS: Column[] = [
     { key: "tag_id", label: "Tag ID", sortable: true },
-    { key: "data_type", label: "Data Type", sortable: false },
+    { key: "data_type", label: "Data Type", sortable: true },
     { key: "value", label: "Value", sortable: true },
     { key: "timestamp", label: "Timestamp", sortable: true },
     { key: "quality", label: "Quality", sortable: true },
@@ -118,7 +118,9 @@ export function TagTable() {
                                 }}
                             >
                                 <div className="tag-cell">{row.tag_id}</div>
-                                <div className="tag-cell tag-muted">(unknown)</div>
+                                <div className="tag-cell tag-muted">
+                                    {row.data_type || "—"}
+                                </div>
                                 <div className="tag-cell">{row.value}</div>
                                 <div className="tag-cell">{row.timestamp}</div>
                                 <div className="tag-cell">{row.quality}</div>

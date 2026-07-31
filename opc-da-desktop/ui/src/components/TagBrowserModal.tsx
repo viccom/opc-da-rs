@@ -148,14 +148,38 @@ export function TagBrowserModal({ onAdd, onClose }: Props) {
                         {roots.map((b) => renderBranch(b, 1))}
                     </div>
                     <div className="leaf-pane">
-                        <div style={{ padding: "4px 8px", borderBottom: "1px solid #3c3c3c" }}>
+                        <div className="leaf-toolbar">
                             <input
                                 type="text"
                                 placeholder="filter leaves…"
                                 value={leafFilter}
                                 onChange={(e) => setLeafFilter(e.target.value)}
-                                style={{ width: "100%", padding: "2px 6px" }}
+                                style={{ flex: 1, padding: "2px 6px" }}
                             />
+                            <button
+                                className="mini"
+                                onClick={() =>
+                                    setSelectedLeaves(
+                                        (s) =>
+                                            new Set([
+                                                ...s,
+                                                ...visibleLeaves.map((l) => l.item_id),
+                                            ]),
+                                    )
+                                }
+                                disabled={visibleLeaves.length === 0}
+                                title="Select all visible leaves"
+                            >
+                                All
+                            </button>
+                            <button
+                                className="mini"
+                                onClick={() => setSelectedLeaves(new Set())}
+                                disabled={selectedLeaves.size === 0}
+                                title="Clear selection"
+                            >
+                                None
+                            </button>
                         </div>
                         <div className="leaf-list">
                             {isLoading ? (
