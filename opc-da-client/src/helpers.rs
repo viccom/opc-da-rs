@@ -714,10 +714,11 @@ mod tests {
             VT_I4, VT_R4,
         };
 
-        // 只设 vt 判别符；union payload 用 lVal=0（variant_type_name 只读 vt，不碰
-        // payload）。VariantClear 对这些标量类型 trivial；VT_BSTR 的 null 指针
-        // SysFreeString 是安全 no-op。
-        fn vt_variant(vt: VARENUM) -> VARIANT {
+        // 返回 ManuallyDrop<VARIANT>：测试只读 vt 判别符，绝不应触发 VARIANT::drop
+        // 的 VariantClear。对 VT_BSTR/VT_ARRAY，VariantClear 会释放 dummy null payload
+        // （bstrVal/parray = 0），在部分 Windows 堆实现（如 CI 的 Server runner）上触发
+        // STATUS_HEAP_CORRUPTION。ManuallyDrop 阻止 drop，避免清空 dummy payload。
+        fn vt_variant(vt: VARENUM) -> ManuallyDrop<VARIANT> {
             let inner = VARIANT_0_0_0 { lVal: 0 };
             let middle = VARIANT_0_0 {
                 vt,
@@ -726,11 +727,11 @@ mod tests {
                 wReserved3: 0,
                 Anonymous: inner,
             };
-            VARIANT {
+            ManuallyDrop::new(VARIANT {
                 Anonymous: VARIANT_0 {
                     Anonymous: ManuallyDrop::new(middle),
                 },
-            }
+            })
         }
 
         assert_eq!(variant_type_name(&vt_variant(VT_R4)), "Float");
