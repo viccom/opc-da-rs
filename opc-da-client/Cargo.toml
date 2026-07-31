@@ -9,7 +9,7 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 keywords = ["opc", "opc-da", "windows", "automation", "scada"]
-categories = ["api-bindings", "network-programming"]
+categories = ["api-bindings", "network-programming", "os::windows-apis"]
 exclude = [
     ".winmd/",
     "architecture.md",

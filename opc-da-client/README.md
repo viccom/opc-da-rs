@@ -145,13 +145,52 @@ The library is split into a core trait layer and concrete implementations:
 - **`OpcProvider`**: The primary async trait defining OPC operations (list, browse, read, write).
 - **`OpcDaClient`**: The default implementation using native `windows-rs` COM calls. Generic over `ServerConnector` for testability; defaults to `ComConnector`.
 
-See [architecture.md](https://github.com/wends155/opc-cli/blob/main/opc-da-client/architecture.md) for in-depth design details and [spec.md](https://github.com/wends155/opc-cli/blob/main/opc-da-client/spec.md) for behavioral contracts.
+See [`architecture.md`](./architecture.md) for in-depth design details and [`spec.md`](./spec.md) for behavioral contracts.
 
 ### COM Threading Model
 
 OPC DA relies on Windows COM, which requires per-thread initialization and strict thread affinity. `opc-da-client` handles this transparently:
 * **Dedicated Worker Thread**: All COM operations are executed on a dedicated background worker thread initialized in Multi-Threaded Apartment (MTA) mode.
 * **No Manual Init**: You do not need to call `CoInitialize` or manage COM lifecycles in your calling application.
+
+## Platform Support
+
+OPC DA is built on Windows COM/DCOM, so this crate is **Windows-only**.
+
+| Target | Support | Notes |
+|--------|---------|-------|
+| Windows 10 / Server 2016+ | ✅ Standard `cargo build` output | Primary target |
+| Windows 7 SP1 / Server 2008 R2 SP1 | ⚠️ Requires `compat/` polyfill + static CRT | Use `make package-win7`; the polyfill must be rebuilt from source (not currently vendored in this repo) |
+| Linux / macOS | ❌ Will not compile — yields a single friendly `compile_error!` | OPC DA depends on COM/DCOM |
+
+Every target needs the **OPC DA Core Components** registered locally (or on the remote host for DCOM).
+
+## Acknowledgements
+
+This library stands on prior work — grateful acknowledgement:
+
+- **[wends155/opc-cli](https://github.com/wends155/opc-cli)** — the original project this was forked from, which established the `OpcProvider` trait abstraction, the dedicated COM worker-thread model, and the initial TUI client.
+- **[Ronbb/rust_opc](https://github.com/Ronbb/rust_opc)** — the frozen OPC DA / OPC Common COM bindings in `src/bindings/` were generated from this project.
+- **[OPC Foundation](https://opcfoundation.org/)** — the OPC Data Access 2.05a / 3.0 IDL specifications (`opcda.idl`, `OPCComn.idl`) the bindings are derived from.
+
+## Improvements in this Fork
+
+Relative to upstream `wends155/opc-cli`, this fork hardens the library for production:
+
+- **Subscription crash root-cause fix** — stopped `VariantClear` from freeing borrowed `SafeArray` elements; eliminated the heap-corruption (`0xc0000374`) crash that appeared a few seconds into streaming.
+- **Subscription self-healing** — a health monitor detects a silently-dead `IOPCDataCallback` (e.g. after the OPC server process is killed) and rebuilds the subscription; a dead server triggers DCOM reconnect (e2e-verified: ~31s recovery after kill).
+- **Panic observability** — the COM worker's `catch_unwind` boundary now captures the panic payload/message instead of swallowing it, so production crashes leave a root cause.
+- **Lazy hierarchical browse** — `browse_children` does one-round-trip branch/leaf enumeration per tree-node click, instead of a flat recursive dump.
+- **Multiple concurrent subscription groups** — fixed `OPC_E_DUPLICATENAME` from a static group name.
+- **Per-tag data type** surfaced on `TagValue`; inline write from the desktop UI.
+
+## Third-Party Licenses
+
+The OPC DA / OPC Common COM bindings in `src/bindings/` are derived from
+[`Ronbb/rust_opc`](https://github.com/Ronbb/rust_opc), generated with
+`windows-bindgen`. Copyright © 2025 Wang Ruobiao, distributed under the MIT
+License. The full third-party notices (including dependency licenses) live in
+`THIRD_PARTY_LICENSES.md` at the workspace root.
 
 ## License
 

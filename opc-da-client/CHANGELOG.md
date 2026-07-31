@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Lazy hierarchical browse** (`browse_children`): one-round-trip branch/leaf enumeration per tree-node click, instead of a flat recursive dump. New `BranchNode` / `LeafNode` / `BrowseChildren` types.
+- **Per-tag data type** on `TagValue` (`data_type: String`), populated from the VARIANT type via `variant_type_name`.
+
+### Fixed
+- **Subscription crash (heap corruption `0xc0000374`)**: `VariantClear` was freeing borrowed `SafeArray` BSTR/`IUnknown` elements; the crash a few seconds into streaming is eliminated.
+- **Multi-subscription `OPC_E_DUPLICATENAME`**: subscription groups now get unique names (was a static name) — multiple concurrent subscription groups work.
+
+### Changed
+- `authors` / `repository` metadata now reflect the current fork maintainer (original author retained); README links updated.
+- README: added **Platform Support** matrix, **Acknowledgements**, **Improvements in this Fork**, and **Third-Party Licenses** sections (vendored bindings attribution).
+- `categories` now includes `os::windows-apis`.
+
 ## [0.3.0] - 2026-07-30
 
 ### Added — OPC DA Subscription & DA 3.0
