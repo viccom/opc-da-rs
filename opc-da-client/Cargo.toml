@@ -33,19 +33,23 @@ test-support = ["dep:mockall"]
 e2e = ["opc-da-backend"]
 
 [dependencies]
-# Core (always included)
+# Core (always included, cross-platform)
 anyhow = { workspace = true }
 async-trait = "0.1.86"
 chrono = "0.4.43"
 tokio = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-# OS: Windows (required)
-windows = { workspace = true }
-windows-core = { workspace = true }
 
 # Test support: mock provider (optional)
 mockall = { version = "0.13.1", optional = true }
+
+# OS: Windows-only COM/DCOM backend. Gated to the Windows target so a
+# non-Windows `cargo build` fails fast at cfg resolution (see the
+# `compile_error!` in lib.rs) instead of pulling windows-rs and cascading.
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }
+windows-core = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }

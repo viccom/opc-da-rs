@@ -183,6 +183,7 @@ Relative to upstream `wends155/opc-cli`, this fork hardens the library for produ
 - **Lazy hierarchical browse** — `browse_children` does one-round-trip branch/leaf enumeration per tree-node click, instead of a flat recursive dump.
 - **Multiple concurrent subscription groups** — fixed `OPC_E_DUPLICATENAME` from a static group name.
 - **Per-tag data type** surfaced on `TagValue`; inline write from the desktop UI.
+- **Production-readiness hardening** — cross-target `cfg` guard with a friendly `compile_error!`, removed a latent `Clone`-on-free-on-drop double-free, fixed an array-variant stack overflow, and added an `hr_code()` HRESULT accessor that decouples consumers from `windows-rs`.
 
 ## Third-Party Licenses
 

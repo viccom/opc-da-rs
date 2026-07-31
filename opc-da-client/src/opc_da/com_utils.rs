@@ -15,7 +15,11 @@ use windows::{
 ///
 /// This struct ensures proper cleanup of COM-allocated memory when dropped.
 /// It provides safe access to the underlying array through slices.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Clone` is deliberately **not** derived: the inner [`RemotePointer`]
+/// owns COM-allocated memory that `Drop` frees, so a derived `Clone` would
+/// be a shallow pointer copy → double-free on drop.
+#[derive(Debug, PartialEq)]
 pub struct RemoteArray<T: Sized> {
     pointer: RemotePointer<T>,
     len: u32,
@@ -137,13 +141,6 @@ impl<T: Sized> RemoteArray<T> {
     pub(crate) unsafe fn set_len(&mut self, len: u32) {
         self.len = len;
     }
-
-    pub fn into_vec(self) -> Vec<RemotePointer<T>> {
-        self.as_slice()
-            .iter()
-            .map(|v| RemotePointer::from_raw(v as *const T as *mut T))
-            .collect()
-    }
 }
 
 impl<T: Sized> Default for RemoteArray<T> {
@@ -159,7 +156,7 @@ impl<T: Sized> Default for RemoteArray<T> {
 /// This struct ensures proper cleanup of COM-allocated memory when dropped.
 /// It provides methods to access the underlying pointer.
 #[repr(transparent)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct RemotePointer<T: Sized> {
     inner: *mut T,
 }

@@ -182,6 +182,12 @@ pub trait OpcProvider: Send + Sync {
 
     /// Browse tags recursively, pushing discoveries to `tags_sink`.
     ///
+    /// `progress` is bumped (atomically) once per discovered tag and every tag
+    /// id is appended to `tags_sink` as soon as it is found, so a caller that
+    /// times out the `await` can still harvest partial results from either.
+    /// Pass fresh `Arc::default()` values if you don't need progress
+    /// observation or partial-result harvesting.
+    ///
     /// # Errors
     /// Returns `Err` if the server connection fails, the `ProgID` cannot be
     /// resolved, or the namespace walk encounters an unrecoverable error.

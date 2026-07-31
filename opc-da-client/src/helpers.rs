@@ -111,7 +111,11 @@ pub fn variant_to_string(variant: &VARIANT) -> String {
                                 std::ptr::addr_of_mut!((*temp_var.Anonymous.Anonymous).Anonymous)
                                     .cast::<u8>();
 
-                            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, elem_size.min(16));
+                            // 目标是 VARIANT 的 value union（8 字节：容纳 BSTR 指针 / I8 / R8 等）。
+                            // 限制为 8 以防服务器上报更大的 elem_size（如 VT_RECORD 结构体）
+                            // 写入超过 union 边界、覆盖相邻 VARIANT 字段（栈溢出）。
+                            let copy_len = elem_size.min(8);
+                            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, copy_len);
 
                             elements.push(variant_to_string(&temp_var));
                         }

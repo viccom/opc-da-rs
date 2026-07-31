@@ -10,10 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Lazy hierarchical browse** (`browse_children`): one-round-trip branch/leaf enumeration per tree-node click, instead of a flat recursive dump. New `BranchNode` / `LeafNode` / `BrowseChildren` types.
 - **Per-tag data type** on `TagValue` (`data_type: String`), populated from the VARIANT type via `variant_type_name`.
+- **`OpcError::hr_code()`**: access the raw HRESULT without coupling to `windows::core::Error`.
+- **Cross-target guard**: non-Windows targets now fail with a single friendly `compile_error!` instead of a wall of unresolved imports.
 
 ### Fixed
 - **Subscription crash (heap corruption `0xc0000374`)**: `VariantClear` was freeing borrowed `SafeArray` BSTR/`IUnknown` elements; the crash a few seconds into streaming is eliminated.
 - **Multi-subscription `OPC_E_DUPLICATENAME`**: subscription groups now get unique names (was a static name) — multiple concurrent subscription groups work.
+- **`variant_to_string` array-branch stack overflow**: clamped the copy length to the VARIANT union size (was `min(16)` into an 8-byte union).
+- **Latent `Clone` double-free**: removed `Clone` from `RemotePointer`/`RemoteArray` (free-on-drop types) and deleted the dead `into_vec`.
+- **`--no-default-features` build**: the `provider` module no longer unconditionally imports the cfg-gated `opc_da` backend.
 
 ### Changed
 - `authors` / `repository` metadata now reflect the current fork maintainer (original author retained); README links updated.

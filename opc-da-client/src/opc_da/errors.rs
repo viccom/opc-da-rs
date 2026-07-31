@@ -101,3 +101,20 @@ pub fn friendly_com_hint(error: &OpcError) -> Option<&'static str> {
         _ => None,
     }
 }
+
+impl OpcError {
+    /// Returns the raw `HRESULT` code carried by this error, if any.
+    ///
+    /// Enables programmatic matching on the numeric HRESULT (e.g.
+    /// `0x800706BA`, `0xC0040007`) without coupling the caller to the
+    /// `windows` crate. `Com` yields `source.code()`; `Server(_, hr)` yields
+    /// the reported code; all other variants return `None`.
+    #[must_use]
+    pub fn hr_code(&self) -> Option<i32> {
+        match self {
+            Self::Com { source } => Some(source.code().0),
+            Self::Server(_, hr) => Some(*hr as i32),
+            _ => None,
+        }
+    }
+}
