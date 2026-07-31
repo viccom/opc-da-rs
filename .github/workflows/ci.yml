@@ -55,7 +55,11 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
       - name: Unit tests
-        run: cargo test --workspace --locked
+        # COM tests (com_guard / com_worker) spin up real CoInitializeEx(MTA)
+        # apartments and worker threads. Run single-threaded so the per-test
+        # apartments don't interleave and corrupt the heap on process exit
+        # (observed on the Windows Server CI runner; clean locally on Win10/11).
+        run: cargo test --workspace --locked -- --test-threads=1
 
       - name: Build opc-cli (TUI)
         run: cargo build --release --locked --bin opc-cli
