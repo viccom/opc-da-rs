@@ -12,7 +12,7 @@
 //!
 //! ```sh
 //! cargo run -p opc-da-client --example verify_dcom_auth -- \
-//!     --host 192.168.199.155 --user viccom --pass Pa88word \
+//!     --host <host> --user <user> --pass <password> \
 //!     --server Matrikon.OPC.Simulation.1 --tag Random.Real4
 //! ```
 //!
@@ -30,7 +30,7 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let host = arg_or(&args, "--host", "192.168.199.155");
     let user = arg_or(&args, "--user", "viccom");
-    let pass = arg_or(&args, "--pass", "Pa88word");
+    let pass = arg_or(&args, "--pass", "");
     let server = arg_or(&args, "--server", "Matrikon.OPC.Simulation.1");
     let tag = arg_or(&args, "--tag", "Random.Real4");
     let domain = arg_or(&args, "--domain", "");
@@ -40,18 +40,29 @@ async fn main() {
 
     println!("\n==== 阶段A：DCOM 凭据验证（想法1）====");
 
-    // A1: null 凭据（当前登录用户）—— 预期失败（若该用户无权访问远程 host）
-    println!(
-        "\n[A1] null 凭据（当前登录用户 {me}）→ 预期 Access Denied（若 {me} 无权访问 {host}）"
-    );
+    // A1: null 凭据（当前登录用户）
+    println!("\n[A1] null 凭据（当前登录用户 {me}）");
     match OpcDaClient::new(ComConnector::new(&host)) {
-        Ok(null_client) => match null_client.list_servers(&host).await {
-            Ok(list) => println!(
-                "[A1] 成功（{me} 有权访问 {host}）：{} 个 server",
-                list.len()
-            ),
-            Err(e) => println!("[A1] 失败（预期）：{e}"),
-        },
+        Ok(null_client) => {
+            match null_client.list_servers(&host).await {
+                Ok(list) => println!("[A1] list_servers 成功（{} 个）", list.len()),
+                Err(e) => println!("[A1] list_servers 失败：{e}"),
+            }
+            match null_client
+                .read_tag_values(&server, vec![tag.clone()])
+                .await
+            {
+                Ok(vs) => {
+                    for tv in vs {
+                        println!(
+                            "[A1] read {server}/{tag} = {} ({}, {})",
+                            tv.value, tv.quality, tv.timestamp
+                        );
+                    }
+                }
+                Err(e) => println!("[A1] read 失败：{e}"),
+            }
+        }
         Err(e) => println!("[A1] client 初始化失败：{e}"),
     }
 

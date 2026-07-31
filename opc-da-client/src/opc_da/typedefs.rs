@@ -943,7 +943,7 @@ mod tests {
         let id = AuthIdentity {
             user: "viccom".to_string(),
             domain: "PLANT".to_string(),
-            password: "Pa88word".to_string(),
+            password: "test-password".to_string(),
             flags: 0,
         };
         let bridge = id.into_bridge();
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(native.PasswordLength, 8);
         assert_eq!(read_wide(native.User), "viccom");
         assert_eq!(read_wide(native.Domain), "PLANT");
-        assert_eq!(read_wide(native.Password), "Pa88word");
+        assert_eq!(read_wide(native.Password), "test-password");
     }
 
     /// P1.1 回归：三层 Bridge（ServerInfo→AuthInfo→AuthIdentity）move 后 `pAuthInfo` 链仍有效。
@@ -971,7 +971,7 @@ mod tests {
                 auth_identity_data: AuthIdentity {
                     user: "viccom".to_string(),
                     domain: String::new(),
-                    password: "Pa88word".to_string(),
+                    password: "test-password".to_string(),
                     flags: 0,
                 },
                 capabilities: 0,
@@ -992,6 +992,6 @@ mod tests {
         // SAFETY: `pAuthIdentityData` 指向 `moved.auth_info.auth_identity_data.native`（`Box` 堆）。
         let ident = unsafe { &*auth.pAuthIdentityData };
         assert_eq!(read_wide(ident.User), "viccom");
-        assert_eq!(read_wide(ident.Password), "Pa88word");
+        assert_eq!(read_wide(ident.Password), "test-password");
     }
 }

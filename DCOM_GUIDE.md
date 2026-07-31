@@ -292,6 +292,25 @@ let vals = client
 
 **已验证**（2026-07-31，192.168.199.155 / viccom）：带凭据 `list_servers` + `read` 成功，读到真实值；`0x80070057`（凭据编码）/`0x80070533`（帐户禁用）等现场问题由 `friendly_hresult_hint` 翻译。详见 spec 验证结果。
 
+#### 当前用户 token vs 显式凭据（跨工作组 SID）
+
+⚠️ **工作组（非域）跨机器：当前登录用户 token 不可移植，必须显式凭据。**
+
+`OpcDaClient::new(ComConnector::new(host))`（不传 `AuthCredentials`）走 `pAuthInfo: null`，DCOM 用 client 进程的**当前登录用户 token**。但本机帐户的 SID 与远程机同名帐户的 SID 不同（除非同域），远程 launch/access permission 按 SID 比对时对不上 → `0x80070005`。`OPCServerList` 认证宽松会掩盖（`list_servers` 成功），但 DA server 本体严格会暴露。
+
+显式 `AuthCredentials`（`COAUTHIDENTITY`）给出 `user`/`password`，server 用**自己本地**的该帐户认证，SID/密码/permission 全对得上 → 成功。
+
+**实战诊断矩阵**（192.168.199.155 / Matrikon，viccom 与 ncpepc 均启用且 viccom 有 launch 权限）：
+
+| # | 凭据方式 | read 结果 | 说明 |
+|:--|:--|:--|:--|
+| 1 | ncpepc 当前用户 token（null） | ❌ `0x80070005` | 本机 ncpepc token SID ≠ 远程 ncpepc，launch permission 不匹配 |
+| 2 | viccom 显式凭据（正确密码） | ✅ 读到值 | `COAUTHIDENTITY` → 远程本地 viccom 认证 |
+| 3 | viccom 显式凭据（错误密码） | ❌ `0x80070005` | 证明代码确实用 viccom 认证（拒错密码） |
+| 4 | ncpepc 显式凭据（正确密码） | ✅ 读到值 | 同一 ncpepc 帐户，显式凭据成功、当前 token 失败 → 定位为 token SID 问题 |
+
+**结论**：跨工作组远程 DA server，用 `OpcDaClient::with_credentials`（显式 user/password），不要依赖当前登录用户 token。
+
 `is_remote_host`（`helpers.rs`）：空 host = 本地 `CoCreateInstance`；任何非空 host（含 `localhost`）= DCOM。
 
 ### 5.5 订阅健康监控与自愈（生产可用性关键）

@@ -53,7 +53,7 @@
 - 输出：每条数据标注 `SUBSCRIBE` / `SYNC_FALLBACK` + 触发原因。
 
 **`examples/verify_dcom_auth.rs`**
-- 参数（带默认）：`--host 192.168.199.155 --user viccom --pass Pa88word --server Matrikon.OPC.Simulation.1 --tag Random.Real4`。
+- 参数（带默认）：`--host 192.168.199.155 --user viccom --pass <password> --server Matrikon.OPC.Simulation.1 --tag Random.Real4`。
 - 阶段 A（想法1，**含 null 对比**）：先 `OpcDaClient::new`（null 凭据，ncpepc）→ 预期 `0x80070005`/权限不足；再 `with_credentials(viccom)` → `list_servers` 含目标、`read Random.Real4` 成功。
 - 阶段 B（想法2）：`FusionReader` 跑 ~30s，打印每条数据来源与模式切换。
 
@@ -61,7 +61,7 @@
 
 1. `cargo build --workspace` 通过；`make verify`（fmt/clippy/test/compat）通过。
 2. example 阶段 A：null 凭据连远程 → Access Denied 或权限不足（证明凭据必要性）。
-3. example 阶段 A：`viccom/Pa88word` → `list_servers` 含 `Matrikon.OPC.Simulation.1`，`read Random.Real4` 返回值。
+3. example 阶段 A：`viccom/<password>` → `list_servers` 含 `Matrikon.OPC.Simulation.1`，`read Random.Real4` 返回值。
 4. example 阶段 B：订阅收到推送，或 fallback 同步轮询有数据；输出正确标注来源。
 5. 现有 e2e（19 本地 + 4 远程）不破坏。
 
@@ -84,7 +84,7 @@
 - **`get_servers` 签名改动**影响 `ClientTrait` —— 调用点少（`ComConnector::enumerate_servers`），可控。
 - **密码安全** —— `AuthCredentials::Debug` 屏蔽密码；`tracing` 不记密码。
 
-## 验证结果（2026-07-31，host 192.168.199.155，viccom/Pa88word）
+## 验证结果（2026-07-31，host 192.168.199.155，viccom/<password>）
 
 真机跑 `examples/verify_dcom_auth.rs` 全流程通过：
 
