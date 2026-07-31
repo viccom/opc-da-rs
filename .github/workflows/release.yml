@@ -1,0 +1,65 @@
+name: Release
+
+# Tag a version (e.g. v0.3.1) to build the Windows portable binaries and
+# publish them as a GitHub Release. CI on push/PR already gates quality.
+on:
+  push:
+    tags:
+      - 'v*'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Remove machine-specific linker config
+        shell: bash
+        run: rm -f .cargo/config.toml
+
+      - name: Install Rust (stable, satisfies MSRV 1.93.1 / edition 2024)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: opc-da-desktop/ui/package-lock.json
+
+      - name: Build desktop frontend
+        working-directory: opc-da-desktop/ui
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build opc-cli (TUI)
+        run: cargo build --release --locked --bin opc-cli
+
+      - name: Build opc-da-desktop (GUI)
+        run: cargo build --release --locked -p opc-da-desktop
+
+      - name: Stage release assets
+        shell: bash
+        run: |
+          mkdir -p assets
+          cp target/release/opc-cli.exe assets/opc-cli-x64.exe
+          cp target/release/opc-da-desktop.exe assets/opc-da-desktop-x64.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            assets/opc-cli-x64.exe
+            assets/opc-da-desktop-x64.exe
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
