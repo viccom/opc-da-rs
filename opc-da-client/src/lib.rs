@@ -88,5 +88,9 @@ pub use opc_da::{
 pub use backend::{connector::ComConnector, opc_da::OpcDaClient};
 
 // Test support re-export (requires the backend, which is Windows-only).
-#[cfg(all(target_os = "windows", feature = "opc-da-backend", feature = "test-support"))]
+#[cfg(all(
+    target_os = "windows",
+    feature = "opc-da-backend",
+    feature = "test-support"
+))]
 pub use provider::MockOpcProvider;
