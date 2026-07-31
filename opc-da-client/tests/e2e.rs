@@ -98,6 +98,55 @@ async fn e2e_browse_filtered() {
 }
 
 #[tokio::test]
+async fn e2e_browse_children() {
+    // 树形浏览端到端验证：root 单级 + 下钻一个 branch 单级。
+    // 验证 OPC_BROWSE_TO "" 回 root + OPC_BROWSE_DOWN 分段下钻 + branch/leaf
+    // 枚举在真实服务器工作（Matrikon hierarchical：root 有 branches，下钻有 leaves）。
+    let c = client();
+
+    let root = c
+        .browse_children(&server(), None, 0, 0)
+        .await
+        .expect("browse_children(root)");
+    eprintln!(
+        "[browse_children] root: {} branches, {} leaves",
+        root.branches.len(),
+        root.leaves.len()
+    );
+    // 容错：flat namespace 的 root 可能只有 leaves；hierarchical 的 root 只有 branches。
+    assert!(
+        !root.branches.is_empty() || !root.leaves.is_empty(),
+        "root should expose branches or leaves"
+    );
+
+    // 下钻第一个 branch：验证 DOWN 分段导航 + 该 branch 的 leaves 解析。
+    if let Some(branch) = root.branches.first() {
+        let kids = c
+            .browse_children(&server(), Some(branch.id.clone()), 0, 0)
+            .await
+            .expect("browse_children(branch)");
+        eprintln!(
+            "[browse_children] branch {:?}: {} sub-branches, {} leaves",
+            branch.id,
+            kids.branches.len(),
+            kids.leaves.len()
+        );
+        assert!(
+            !kids.branches.is_empty() || !kids.leaves.is_empty(),
+            "branch {:?} should have children (branches or leaves)",
+            branch.id
+        );
+        for leaf in &kids.leaves {
+            assert!(
+                !leaf.item_id.is_empty(),
+                "leaf item_id must be non-empty (name={:?})",
+                leaf.name
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn e2e_read_tag_values() {
     let c = client();
     let tags = first_tags(3).await;
