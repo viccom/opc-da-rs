@@ -16,7 +16,7 @@
 
 use crate::bindings::comn::{IOPCShutdown, IOPCShutdown_Impl};
 use crate::bindings::da::{IOPCDataCallback, IOPCDataCallback_Impl};
-use crate::helpers::{filetime_to_string, quality_to_string, variant_to_string};
+use crate::helpers::{filetime_to_string, quality_to_string, variant_to_string, variant_type_name};
 use crate::provider::TagValue;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -165,6 +165,7 @@ fn forward_data_change(
         let tv = TagValue {
             tag_id: tag_id.clone(),
             value: variant_to_string(value),
+            data_type: variant_type_name(value),
             quality: quality_to_string(quality),
             timestamp: filetime_to_string(timestamp),
         };

@@ -200,6 +200,49 @@ pub fn variant_to_string(variant: &VARIANT) -> String {
     }
 }
 
+/// Map a VARIANT's type discriminant to a human-readable type name
+/// (e.g. `VT_R4` → "Float", `VT_BSTR` → "String", `VT_ARRAY|VT_BSTR` →
+/// "Array of String"). Base names mirror what Prosys OPC Client reports.
+///
+/// Reads only the `vt` discriminant — never touches the union payload — so it
+/// is safe on borrowed VARIANTs (no `VariantClear` / double-free risk, unlike
+/// a naïve copy).
+pub fn variant_type_name(variant: &VARIANT) -> String {
+    // SAFETY: reading the `vt` discriminant is a non-mutating field access;
+    // the union payload is never read or moved, so there is no aliasing or
+    // ownership concern.
+    unsafe {
+        let vt = variant.Anonymous.Anonymous.vt;
+        let base = vt.0 & 0x0FFF;
+        let is_array = (vt.0 & 0x2000) != 0;
+        let base_name = match base {
+            0 => "Empty",
+            1 => "Null",
+            2 => "Short",
+            3 => "Integer",
+            4 => "Float",
+            5 => "Double",
+            6 => "Currency",
+            7 => "Date",
+            8 => "String",
+            10 => "Error",
+            11 => "Boolean",
+            16 => "SByte",
+            17 => "Byte",
+            18 => "UShort",
+            19 => "UInt",
+            20 => "Long",
+            21 => "ULong",
+            _ => return format!("VT({base})"),
+        };
+        if is_array {
+            format!("Array of {base_name}")
+        } else {
+            base_name.to_string()
+        }
+    }
+}
+
 /// Convert an OLE Automation date (f64) to a local datetime string.
 /// OLE date epoch is 1899-12-30; integer part = days, fraction = time-of-day.
 #[allow(
@@ -657,6 +700,43 @@ mod tests {
         };
         let v = VARIANT { Anonymous: outer };
         assert_eq!(variant_to_string(&v), "Null");
+    }
+
+    #[test]
+    fn test_variant_type_name() {
+        use std::mem::ManuallyDrop;
+        use windows::Win32::System::Variant::{
+            VARENUM, VARIANT, VARIANT_0, VARIANT_0_0, VARIANT_0_0_0, VT_ARRAY, VT_BOOL, VT_BSTR,
+            VT_I4, VT_R4,
+        };
+
+        // 只设 vt 判别符；union payload 用 lVal=0（variant_type_name 只读 vt，不碰
+        // payload）。VariantClear 对这些标量类型 trivial；VT_BSTR 的 null 指针
+        // SysFreeString 是安全 no-op。
+        fn vt_variant(vt: VARENUM) -> VARIANT {
+            let inner = VARIANT_0_0_0 { lVal: 0 };
+            let middle = VARIANT_0_0 {
+                vt,
+                wReserved1: 0,
+                wReserved2: 0,
+                wReserved3: 0,
+                Anonymous: inner,
+            };
+            VARIANT {
+                Anonymous: VARIANT_0 {
+                    Anonymous: ManuallyDrop::new(middle),
+                },
+            }
+        }
+
+        assert_eq!(variant_type_name(&vt_variant(VT_R4)), "Float");
+        assert_eq!(variant_type_name(&vt_variant(VT_I4)), "Integer");
+        assert_eq!(variant_type_name(&vt_variant(VT_BOOL)), "Boolean");
+        assert_eq!(variant_type_name(&vt_variant(VT_BSTR)), "String");
+        assert_eq!(
+            variant_type_name(&vt_variant(VARENUM(VT_BSTR.0 | VT_ARRAY.0))),
+            "Array of String"
+        );
     }
 
     #[test]

@@ -772,17 +772,20 @@ impl ConnectedGroup for ComGroup {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let tag_id = tag_ids.get(i).cloned().unwrap_or_default();
-            let (value, quality) = if errs.get(i).is_some_and(|e| e.is_ok()) {
+            let (value, quality, data_type) = if errs.get(i).is_some_and(|e| e.is_ok()) {
                 let v = vals
                     .get(i)
                     .map_or_else(|| "Error".to_string(), crate::helpers::variant_to_string);
+                let dt = vals
+                    .get(i)
+                    .map_or_else(String::new, crate::helpers::variant_type_name);
                 let q = quals.get(i).map_or_else(
                     || "Bad".to_string(),
                     |&q| crate::helpers::quality_to_string(q),
                 );
-                (v, q)
+                (v, q, dt)
             } else {
-                ("Error".to_string(), "Bad".to_string())
+                ("Error".to_string(), "Bad".to_string(), String::new())
             };
             let timestamp = times
                 .get(i)
@@ -791,6 +794,7 @@ impl ConnectedGroup for ComGroup {
             out.push(TagValue {
                 tag_id,
                 value,
+                data_type,
                 quality,
                 timestamp,
             });

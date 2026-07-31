@@ -1332,6 +1332,7 @@ mod tests {
         let values = vec![TagValue {
             tag_id: "Tag1".into(),
             value: "123".into(),
+            data_type: "Integer".into(),
             quality: "Good".into(),
             timestamp: "Today".into(),
         }];
@@ -1376,6 +1377,7 @@ mod tests {
         app.tag_values = vec![TagValue {
             tag_id: "Tag1".into(),
             value: "100".into(),
+            data_type: "Integer".into(),
             quality: "Good".into(),
             timestamp: String::new(),
         }];
@@ -1396,12 +1398,14 @@ mod tests {
             TagValue {
                 tag_id: "T1".into(),
                 value: "V1".into(),
+                data_type: "String".into(),
                 quality: "Q".into(),
                 timestamp: "T".into(),
             },
             TagValue {
                 tag_id: "T2".into(),
                 value: "V2".into(),
+                data_type: "String".into(),
                 quality: "Q".into(),
                 timestamp: "T".into(),
             },

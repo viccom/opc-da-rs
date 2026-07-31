@@ -5,6 +5,7 @@ use crate::bindings::da::{
 };
 use crate::helpers::{
     filetime_to_string, format_hresult, opc_value_to_variant, quality_to_string, variant_to_string,
+    variant_type_name,
 };
 use crate::opc_da::com_utils::clear_item_states;
 use crate::opc_da::errors::{OpcError, OpcResult};
@@ -1093,6 +1094,7 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             .map(|tag_id| TagValue {
                 tag_id: tag_id.clone(),
                 value: "Error".to_string(),
+                data_type: String::new(),
                 quality: "Bad — not added to group".to_string(),
                 timestamp: String::new(),
             })
@@ -1155,6 +1157,11 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             tag_values[*idx] = TagValue {
                 tag_id: tag_ids[*idx].clone(),
                 value: value_str,
+                data_type: if read_error.is_ok() {
+                    variant_type_name(&state.vDataValue)
+                } else {
+                    String::new()
+                },
                 quality: quality_str,
                 timestamp: filetime_to_string(state.ftTimeStamp),
             };

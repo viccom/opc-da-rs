@@ -19,6 +19,7 @@ use mockall::automock;
 /// let tv = TagValue {
 ///     tag_id: "Simulation.Random.1".to_string(),
 ///     value: "42.5".to_string(),
+///     data_type: "Float".to_string(),
 ///     quality: "Good".to_string(),
 ///     timestamp: "2026-01-01 00:00:00".to_string(),
 /// };
@@ -30,6 +31,9 @@ pub struct TagValue {
     pub tag_id: String,
     /// The current value as a display string.
     pub value: String,
+    /// The value's OPC data type as a display name (e.g. `"Float"`, `"Boolean"`,
+    /// `"Array of String"`), derived from the VARIANT's `vt` discriminant.
+    pub data_type: String,
     /// OPC quality indicator (e.g., `"Good"`, `"Bad"`, or `"Uncertain"`).
     pub quality: String,
     /// Timestamp of the last value change, formatted as a local time string.
