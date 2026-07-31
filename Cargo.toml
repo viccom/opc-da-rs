@@ -12,7 +12,7 @@ resolver = "2"
 [workspace.package]
 authors = ["Wendell Saligan <saliganw@gmail.com>", "viccom"]
 license = "MIT"
-repository = "https://git.metme.top/viccom/opc-da-lib"
+repository = "https://github.com/viccom/opc-da-rs"
 edition = "2024"
 rust-version = "1.93.1"
 

@@ -4,6 +4,8 @@
 [![Docs.rs](https://docs.rs/opc-da-client/badge.svg)](https://docs.rs/opc-da-client)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+> **Mirror**: also mirrored on [Gitea](https://git.metme.top/viccom/opc-da-lib). Primary development on [GitHub](https://github.com/viccom/opc-da-rs).
+
 Backend-agnostic OPC DA client library for Rust — async, trait-based, with transparent COM management.
 
 ## Features
