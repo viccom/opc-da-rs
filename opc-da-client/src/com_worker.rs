@@ -2052,7 +2052,13 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             })
             .collect();
 
-        let (results, errors) = group.add_items(&item_defs)?;
+        let (results, errors) = match group.add_items(&item_defs) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = opc_server.remove_group(server_handle, true);
+                return Err(e);
+            }
+        };
         if results.len() as usize != tag_ids.len() || errors.len() as usize != tag_ids.len() {
             let _ = opc_server.remove_group(server_handle, true);
             return Err(OpcError::Internal(
@@ -3888,6 +3894,42 @@ mod tests {
             state.remove_group_count.load(Ordering::Relaxed),
             1,
             "read must remove the group when add_items fails (no leak)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_subscribe_cleans_up_group_when_add_items_fails() {
+        // Same leak class as the read/write handlers, on the subscribe path:
+        // `create_group_and_advise` must `remove_group` the freshly-added group
+        // when `add_items` itself fails (the doc on that fn promises "any failure
+        // after add_group cleans up"). Observed via the mock's remove_group counter.
+        let state = Arc::new(MockState::default());
+        state.should_fail_add_items.store(true, Ordering::Relaxed);
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::Subscribe {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                update_rate: 100,
+                reply,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "subscribe must fail when add_items fails: {result:?}"
+        );
+        assert_eq!(
+            state.remove_group_count.load(Ordering::Relaxed),
+            1,
+            "subscribe must remove the group when add_items fails (no leak)"
         );
     }
 
