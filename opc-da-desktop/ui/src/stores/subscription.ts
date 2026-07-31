@@ -60,6 +60,11 @@ function nextGroupId(): string {
     return `g${groupSeq}`;
 }
 
+// Tauri `Channel` 对象必须在前端保持 JS 引用——一旦被 GC，channel 就关闭，
+// 后端 `run_subscription` 的 `channel.send` 送不到任何 listener，订阅表格会
+// 一直空。每个订阅组的 channel 在此常驻，直到 stop/remove。
+const groupChannels = new Map<string, ReturnType<typeof subscribeTagsChannel>>();
+
 export const useSubscriptionStore = create<SubscriptionState>((set, get) => {
     // Patch one group immutably (new Map → new group object).
     const patchGroup = (id: string, patch: Partial<GroupState>) => {
@@ -104,6 +109,7 @@ export const useSubscriptionStore = create<SubscriptionState>((set, get) => {
             if (g && g.cookie !== null) {
                 await unsubscribeApi(g.cookie).catch(() => undefined);
             }
+            groupChannels.delete(id);
             set((state) => {
                 const next = new Map(state.groups);
                 next.delete(id);
@@ -132,7 +138,9 @@ export const useSubscriptionStore = create<SubscriptionState>((set, get) => {
                     patchGroup(id, { cookie: null, rows: new Map() });
                 }
                 // Each group gets its own Channel; onmessage routes by id.
+                // 必须存进 groupChannels 常驻，否则函数返回后 GC 关闭 channel。
                 const channel = subscribeTagsChannel();
+                groupChannels.set(id, channel);
                 channel.onmessage = (update: TagUpdate) => {
                     const cur = get().groups.get(id);
                     if (!cur) return;
@@ -153,6 +161,7 @@ export const useSubscriptionStore = create<SubscriptionState>((set, get) => {
             patchGroup(id, { busy: true });
             try {
                 await unsubscribeApi(g.cookie).catch(() => undefined);
+                groupChannels.delete(id);
                 patchGroup(id, { cookie: null, rows: new Map(), busy: false });
             } catch (e) {
                 patchGroup(id, { busy: false, error: String(e) });

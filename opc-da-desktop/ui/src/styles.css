@@ -230,10 +230,40 @@ button.danger {
    The header row and every virtualized data row share the same
    grid-template-columns, so column alignment is structural and does not
    depend on per-row content. */
-.tag-scroll {
+.tag-scroll-wrap {
+  display: flex;
+  flex-direction: column;
   height: 100%;
+  min-height: 0;
+}
+
+.tag-scroll {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   position: relative;
+}
+
+.write-error {
+  padding: 4px 8px;
+  background: #a1260d;
+  color: white;
+  font-size: 11px;
+  border-bottom: 1px solid #3c3c3c;
+}
+
+.tag-value {
+  cursor: text;
+}
+
+.cell-input {
+  width: 100%;
+  background: #1e1e1e;
+  border: 1px solid #007acc;
+  color: #d4d4d4;
+  padding: 1px 4px;
+  font-size: 12px;
+  border-radius: 2px;
 }
 
 .tag-grid {
