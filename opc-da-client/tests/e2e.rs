@@ -304,6 +304,106 @@ async fn e2e_subscribe_data_change() {
 }
 
 #[tokio::test]
+#[ignore = "诊断 Bucket Brigade.Int1：subscribe/read/write 端到端"]
+async fn e2e_diag_bucket_brigade_int1() {
+    // 用户报告订阅 Bucket Brigade.Int1 看不到数据。Bucket Brigade 是读写寄存器
+    // （static，不自动变化），OPC OnDataChange 只在数据变化时推送。本诊断逐项打印。
+    let c = client();
+    let server = server();
+    let tag = "Bucket Brigade.Int1";
+
+    eprintln!("[diag] --- read {tag} ---");
+    match c.read_tag_values(&server, vec![tag.into()]).await {
+        Ok(v) => eprintln!("[diag] read OK: {v:?}"),
+        Err(e) => eprintln!("[diag] read ERR: {e:?}"),
+    }
+
+    eprintln!("[diag] --- subscribe {tag} (1000ms) ---");
+    let sub = match c.subscribe(&server, vec![tag.into()], 1000).await {
+        Ok(s) => {
+            eprintln!("[diag] subscribe OK cookie={}", s.cookie);
+            s
+        }
+        Err(e) => {
+            eprintln!("[diag] subscribe ERR: {e:?}");
+            return;
+        }
+    };
+
+    let mut rx = sub.rx;
+    let mut errors = sub.errors;
+
+    // 初始 OnDataChange（Matrikon 通常在 group active 后推一次初始值）。
+    let initial = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+    eprintln!("[diag] initial OnDataChange within 3s: {initial:?}");
+
+    // write 后看是否触发 OnDataChange。
+    eprintln!("[diag] --- write {tag} = 42 ---");
+    match c.write_tag_value(&server, tag, OpcValue::Int(42)).await {
+        Ok(r) => eprintln!("[diag] write result: {r:?}"),
+        Err(e) => eprintln!("[diag] write ERR: {e:?}"),
+    }
+    let after_write = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+    eprintln!("[diag] post-write OnDataChange within 3s: {after_write:?}");
+
+    // read 验证写入值。
+    eprintln!("[diag] --- read {tag} after write ---");
+    match c.read_tag_values(&server, vec![tag.into()]).await {
+        Ok(v) => eprintln!("[diag] read after write: {v:?}"),
+        Err(e) => eprintln!("[diag] read after write ERR: {e:?}"),
+    }
+
+    // 订阅错误通道。
+    let err_msg = tokio::time::timeout(Duration::from_millis(200), errors.recv()).await;
+    eprintln!("[diag] subscription error channel: {err_msg:?}");
+
+    let _ = c.unsubscribe(sub.cookie).await;
+}
+
+#[tokio::test]
+#[ignore = "诊断：browse_children 逐层找 Bucket Brigade.Int1 的树形路径"]
+async fn e2e_diag_browse_bucket() {
+    let c = client();
+    let server = server();
+
+    let root = c.browse_children(&server, None, 0, 0).await.expect("root");
+    eprintln!(
+        "[browse] root branches: {:?}",
+        root.branches.iter().map(|b| &b.id).collect::<Vec<_>>()
+    );
+    eprintln!(
+        "[browse] root leaves: {:?}",
+        root.leaves.iter().map(|l| &l.item_id).collect::<Vec<_>>()
+    );
+
+    // 下钻每个 root branch 一层，找 Bucket Brigade。
+    for b in &root.branches {
+        let kids = c
+            .browse_children(&server, Some(b.id.clone()), 0, 0)
+            .await
+            .expect("branch");
+        eprintln!(
+            "[browse] {:?} -> sub-branches: {:?}",
+            b.id,
+            kids.branches.iter().map(|x| &x.id).collect::<Vec<_>>()
+        );
+        for sb in &kids.branches {
+            if sb.name.to_lowercase().contains("bucket") {
+                let gk = c
+                    .browse_children(&server, Some(sb.id.clone()), 0, 0)
+                    .await
+                    .expect("sub-branch");
+                eprintln!(
+                    "[browse] {:?} -> leaves: {:?}",
+                    sb.id,
+                    gk.leaves.iter().map(|x| &x.item_id).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn e2e_set_subscription_rate() {
     let c = client();
     let tags = first_tags(1).await;
