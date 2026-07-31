@@ -35,13 +35,9 @@ jobs:
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (deny warnings)
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-      - name: Unit tests
-        run: cargo test --workspace --locked
-
-      # ── Build portable Windows binaries (TUI + desktop GUI) ──
+      # The desktop frontend (ui/dist) is gitignored, but tauri::generate_context!()
+      # embeds it at compile time. It must exist before clippy/test/build compile
+      # opc-da-desktop, or the proc macro panics. Build the frontend first.
       - name: Setup Node 20
         uses: actions/setup-node@v4
         with:
@@ -54,6 +50,12 @@ jobs:
         run: |
           npm ci
           npm run build
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+      - name: Unit tests
+        run: cargo test --workspace --locked
 
       - name: Build opc-cli (TUI)
         run: cargo build --release --locked --bin opc-cli
