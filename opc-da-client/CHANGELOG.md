@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`variant_to_string` array-branch stack overflow**: clamped the copy length to the VARIANT union size (was `min(16)` into an 8-byte union).
 - **Latent `Clone` double-free**: removed `Clone` from `RemotePointer`/`RemoteArray` (free-on-drop types) and deleted the dead `into_vec`.
 - **`--no-default-features` build**: the `provider` module no longer unconditionally imports the cfg-gated `opc_da` backend.
+- **Server-side OPC group leak on `add_items` failure**: the read/write handlers (`read_tag_values`, `read_tag_values_max_age`, `write_tag_value`, `write_tag_value_vqt`, `write_tag_values`) now `remove_group` before returning when `add_items` itself fails, instead of leaking an orphan group on the server.
 
 ### Changed
 - `authors` / `repository` metadata now reflect the current fork maintainer (original author retained); README links updated.

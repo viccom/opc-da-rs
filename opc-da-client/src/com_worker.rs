@@ -1082,7 +1082,15 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             })
             .collect();
 
-        let (results, errors) = group.add_items(&item_defs)?;
+        let (results, errors) = match group.add_items(&item_defs) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(rg) = opc_server.remove_group(server_handle, true) {
+                    tracing::warn!(error = ?rg, operation = "read_tag_values", "Failed to remove OPC group during cleanup");
+                }
+                return Err(e);
+            }
+        };
 
         // RemoteArray::len() returns u32; tag_ids.len() returns usize.
         if results.len() as usize != tag_ids.len() || errors.len() as usize != tag_ids.len() {
@@ -1237,7 +1245,15 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             })
             .collect();
 
-        let (results, errors) = group.add_items(&item_defs)?;
+        let (results, errors) = match group.add_items(&item_defs) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(rg) = opc_server.remove_group(server_handle, true) {
+                    tracing::warn!(error = ?rg, operation = "read_max_age", "Failed to remove OPC group during cleanup");
+                }
+                return Err(e);
+            }
+        };
         if results.len() as usize != tag_ids.len() || errors.len() as usize != tag_ids.len() {
             if let Err(e) = opc_server.remove_group(server_handle, true) {
                 tracing::warn!(error = ?e, operation = "read_max_age", "Failed to remove OPC group during cleanup");
@@ -1325,7 +1341,15 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             wReserved: 0,
         };
 
-        let (results, errors) = group.add_items(&[item_def])?;
+        let (results, errors) = match group.add_items(&[item_def]) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(rg) = opc_server.remove_group(server_handle, true) {
+                    tracing::warn!(error = ?rg, operation = "write_vqt", "Failed to remove OPC group during cleanup");
+                }
+                return Err(e);
+            }
+        };
         let item_res = results
             .as_slice()
             .first()
@@ -1441,7 +1465,15 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             wReserved: 0,
         };
 
-        let (results, errors) = group.add_items(&[item_def])?;
+        let (results, errors) = match group.add_items(&[item_def]) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(rg) = opc_server.remove_group(server_handle, true) {
+                    tracing::warn!(error = ?rg, operation = "write_tag_value", "Failed to remove OPC group during cleanup");
+                }
+                return Err(e);
+            }
+        };
         let item_res = results
             .as_slice()
             .first()
@@ -1559,7 +1591,15 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
             })
             .collect();
 
-        let (results, errors) = group.add_items(&item_defs)?;
+        let (results, errors) = match group.add_items(&item_defs) {
+            Ok(v) => v,
+            Err(e) => {
+                if let Err(rg) = opc_server.remove_group(server_handle, true) {
+                    tracing::warn!(error = ?rg, operation = "write_tag_values", "Failed to remove OPC group during cleanup");
+                }
+                return Err(e);
+            }
+        };
         if results.len() as usize != items.len() || errors.len() as usize != items.len() {
             if let Err(e) = opc_server.remove_group(server_handle, true) {
                 tracing::warn!(error = ?e, operation = "write_tag_values", "Failed to remove OPC group during cleanup");
@@ -2466,6 +2506,10 @@ mod tests {
         /// P0-1 step E: when set, advise_data_callback returns NotImplemented — simulates a
         /// rebuild whose re-advise fails (e.g. remote DCOM sink unreachable / 0x800706BA).
         should_fail_advise: AtomicBool,
+        /// When set, `add_items` returns an `E_OUTOFMEMORY`-style error — simulates a total
+        /// `IOPCItemMgt::AddItems` failure so a test can assert the read/write handlers
+        /// remove the freshly-added group instead of leaking it on the server.
+        should_fail_add_items: AtomicBool,
         /// Counts `remove_group` calls so a test can assert a subscribe failure cleans up its
         /// freshly-added group instead of leaking it (P0-1 review fix ①).
         remove_group_count: AtomicUsize,
@@ -2569,6 +2613,14 @@ mod tests {
             let n = items.len();
             if n == 0 {
                 return Ok((RemoteArray::empty(), RemoteArray::empty()));
+            }
+
+            if self.state.should_fail_add_items.load(Ordering::Relaxed) {
+                return Err(OpcError::Com {
+                    source: windows::core::Error::from_hresult(
+                        windows::Win32::Foundation::E_OUTOFMEMORY,
+                    ),
+                });
             }
 
             let res_ptr = unsafe {
@@ -3802,6 +3854,40 @@ mod tests {
             state.remove_group_count.load(Ordering::Relaxed),
             1,
             "subscribe must remove the group on sink-creation failure (no leak)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_read_cleans_up_group_when_add_items_fails() {
+        // When `add_items` itself fails (e.g. E_OUTOFMEMORY / server fault), the read/write
+        // handlers must `remove_group` the freshly-added group instead of leaking it on the
+        // server. Observed via the mock's remove_group counter.
+        let state = Arc::new(MockState::default());
+        state.should_fail_add_items.store(true, Ordering::Relaxed);
+        let connector = Arc::new(ConfigurableMockConnector {
+            state: state.clone(),
+        });
+        let worker = tokio::task::spawn_blocking(move || {
+            ComWorker::start_with_health(connector, HealthMonitorConfig::production()).unwrap()
+        })
+        .await
+        .unwrap();
+
+        let result = worker
+            .send_request(|reply| ComRequest::ReadTagValues {
+                server: "Mock.Server.1".to_string(),
+                tag_ids: vec!["T1".to_string()],
+                reply,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "read must fail when add_items fails: {result:?}"
+        );
+        assert_eq!(
+            state.remove_group_count.load(Ordering::Relaxed),
+            1,
+            "read must remove the group when add_items fails (no leak)"
         );
     }
 
