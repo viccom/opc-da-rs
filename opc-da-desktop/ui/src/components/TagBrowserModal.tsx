@@ -1,10 +1,10 @@
 /**
  * TagBrowserModal — left branch tree + right leaf list, multi-select.
  *
- * Backed by the lazy `browse_children` IPC: opening the modal loads the
- * root's children; clicking a branch's ▸ expands it (one round-trip per
- * node). Selecting a branch (anywhere on its row) shows its leaves on the
- * right, where individual tags can be checked.
+ * Backed by the lazy `browse_children` IPC:
+ * - Clicking a branch *row* selects it AND loads its leaves (right pane).
+ * - Clicking ▸ toggles subtree expansion (loads child branches).
+ * Opening the modal loads root's children first.
  *
  * Matrikon Simulation is hierarchical (Random / Bucket Brigade / … branches,
  * each holding leaf tags), which is exactly what this tree renders.
@@ -33,48 +33,64 @@ export function TagBrowserModal({ onAdd, onClose }: Props) {
     const [selectedLeaves, setSelectedLeaves] = useState<Set<string>>(new Set());
     const [leafFilter, setLeafFilter] = useState("");
     const [error, setError] = useState<string | null>(null);
+    const [loadingKey, setLoadingKey] = useState<string | null>(null);
 
     // Load root children on open.
     useEffect(() => {
         setError(null);
+        setLoadingKey(ROOT_KEY);
         browseChildren(null)
             .then((c) => {
                 setRoots(c.branches);
                 setLeavesByBranch((m) => new Map(m).set(ROOT_KEY, c.leaves));
             })
-            .catch((e) => setError(String(e)));
+            .catch((e) => setError(String(e)))
+            .finally(() => setLoadingKey(null));
     }, [progId]);
 
-    const expand = useCallback(
-        async (branch: BranchNode) => {
-            if (childBranches.has(branch.id)) {
-                setExpanded((s) => {
-                    const next = new Set(s);
-                    if (next.has(branch.id)) next.delete(branch.id);
-                    else next.add(branch.id);
-                    return next;
-                });
-                return;
-            }
+    // Ensure a branch's children + leaves are loaded (idempotent on the cache).
+    const ensureLoaded = useCallback(
+        async (branchId: string) => {
+            if (leavesByBranch.has(branchId)) return;
+            setLoadingKey(branchId);
             try {
-                const c = await browseChildren(branch.id);
-                setChildBranches((m) => new Map(m).set(branch.id, c.branches));
-                setLeavesByBranch((m) => new Map(m).set(branch.id, c.leaves));
-                setExpanded((s) => new Set(s).add(branch.id));
+                const c = await browseChildren(branchId);
+                setChildBranches((m) => new Map(m).set(branchId, c.branches));
+                setLeavesByBranch((m) => new Map(m).set(branchId, c.leaves));
             } catch (e) {
                 setError(String(e));
+            } finally {
+                setLoadingKey(null);
             }
         },
-        [childBranches],
+        [leavesByBranch],
     );
 
-    const currentLeaves = leavesByBranch.get(branchKey(selectedBranch)) ?? [];
+    // Click a branch row: select it + load its leaves into the right pane.
+    const pickBranch = (id: string | null) => {
+        setSelectedBranch(id);
+        if (id !== null) void ensureLoaded(id);
+    };
+
+    // Click ▸: toggle subtree expansion (ensures child branches loaded).
+    const toggleExpand = (branch: BranchNode) => {
+        void ensureLoaded(branch.id);
+        setExpanded((s) => {
+            const next = new Set(s);
+            if (next.has(branch.id)) next.delete(branch.id);
+            else next.add(branch.id);
+            return next;
+        });
+    };
+
+    const currentKey = branchKey(selectedBranch);
+    const currentLeaves = leavesByBranch.get(currentKey) ?? [];
+    const isLoading = loadingKey === currentKey;
     const visibleLeaves = useMemo(() => {
         const f = leafFilter.trim().toLowerCase();
         if (!f) return currentLeaves;
         return currentLeaves.filter(
-            (l) =>
-                l.name.toLowerCase().includes(f) || l.item_id.toLowerCase().includes(f),
+            (l) => l.name.toLowerCase().includes(f) || l.item_id.toLowerCase().includes(f),
         );
     }, [currentLeaves, leafFilter]);
 
@@ -96,13 +112,13 @@ export function TagBrowserModal({ onAdd, onClose }: Props) {
                 <div
                     className={`tree-node ${isSelected ? "selected" : ""}`}
                     style={{ paddingLeft: 8 + depth * 14 }}
-                    onClick={() => setSelectedBranch(branch.id)}
+                    onClick={() => pickBranch(branch.id)}
                 >
                     <span
                         className="tree-twisty"
                         onClick={(e) => {
                             e.stopPropagation();
-                            void expand(branch);
+                            toggleExpand(branch);
                         }}
                     >
                         {isExpanded ? "▾" : "▸"}
@@ -124,7 +140,7 @@ export function TagBrowserModal({ onAdd, onClose }: Props) {
                         <div
                             className={`tree-node ${selectedBranch === null ? "selected" : ""}`}
                             style={{ paddingLeft: 8 }}
-                            onClick={() => setSelectedBranch(null)}
+                            onClick={() => pickBranch(null)}
                         >
                             <span className="tree-twisty"> </span>
                             🌐 {progId ?? "(root)"}
@@ -142,21 +158,26 @@ export function TagBrowserModal({ onAdd, onClose }: Props) {
                             />
                         </div>
                         <div className="leaf-list">
-                            {visibleLeaves.length === 0 && (
+                            {isLoading ? (
+                                <div style={{ padding: 8, color: "#858585", fontSize: 11 }}>
+                                    Loading…
+                                </div>
+                            ) : visibleLeaves.length === 0 ? (
                                 <div style={{ padding: 8, color: "#858585", fontSize: 11 }}>
                                     No tags under this node.
                                 </div>
+                            ) : (
+                                visibleLeaves.map((l) => (
+                                    <div
+                                        key={l.item_id}
+                                        className={`leaf ${selectedLeaves.has(l.item_id) ? "selected" : ""}`}
+                                        onClick={() => toggleLeaf(l.item_id)}
+                                        title={l.item_id}
+                                    >
+                                        {selectedLeaves.has(l.item_id) ? "☑" : "☐"} {l.name}
+                                    </div>
+                                ))
                             )}
-                            {visibleLeaves.map((l) => (
-                                <div
-                                    key={l.item_id}
-                                    className={`leaf ${selectedLeaves.has(l.item_id) ? "selected" : ""}`}
-                                    onClick={() => toggleLeaf(l.item_id)}
-                                    title={l.item_id}
-                                >
-                                    {selectedLeaves.has(l.item_id) ? "☑" : "☐"} {l.name}
-                                </div>
-                            ))}
                         </div>
                     </div>
                 </div>

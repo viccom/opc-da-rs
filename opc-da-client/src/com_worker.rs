@@ -1840,11 +1840,13 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
     /// Browse one namespace level: the direct child branches + leaves under
     /// `branch_path` (`None`/empty = root). Used by the desktop tree browser.
     ///
-    /// Jumps to the target branch with `OPC_BROWSE_TO` (absolute, self-contained —
-    /// the connection cursor is shared, but every call resets to root afterwards,
-    /// so no call depends on a prior call's position). Child branch ids are built
-    /// as `parent + "." + name`; child leaves are resolved to full item IDs via
-    /// `GetItemID`.
+    /// Navigation: `OPC_BROWSE_TO ""` back to root, then `OPC_BROWSE_DOWN` through
+    /// each `.`-separated segment of `branch_path`. DOWN is relative/standard
+    /// (same as `browse_recursive`); `OPC_BROWSE_TO <full path>` is avoided because
+    /// some servers reject multi-segment absolute paths. Every call ends by
+    /// resetting to root, so no call depends on a prior call's cursor position.
+    /// Child branch ids are built as `parent + "." + name`; child leaves are
+    /// resolved to full item IDs via `GetItemID`.
     fn handle_browse_children(
         server_name: &str,
         branch_path: Option<&str>,
@@ -1860,8 +1862,15 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
         let _enter = span.enter();
 
         let parent = branch_path.unwrap_or("");
-        // Absolute jump to the target branch (root if empty).
-        opc_server.change_browse_position(OPC_BROWSE_TO.0 as u32, parent)?;
+        // 回 root（OPC_BROWSE_TO ""），再用 OPC_BROWSE_DOWN 逐段下钻到 target。
+        // DOWN 是相对导航，标准可靠（browse_recursive 同款）。避免 OPC_BROWSE_TO
+        // <full path>：部分服务器不接受多段绝对路径，只接受单段相对跳转。
+        opc_server.change_browse_position(OPC_BROWSE_TO.0 as u32, "")?;
+        for segment in parent.split('.') {
+            if !segment.is_empty() {
+                opc_server.change_browse_position(OPC_BROWSE_DOWN.0 as u32, segment)?;
+            }
+        }
 
         // Child branches: enumerator yields relative names; build full ids.
         let mut branches = Vec::new();
