@@ -32,6 +32,7 @@ export function ServerPanel() {
           value={host}
           onChange={(e) => setHost(e.target.value)}
           placeholder="localhost or IP"
+          disabled={loading}
         />
         <button onClick={refresh} disabled={loading}>
           {loading ? "…" : "Refresh"}
@@ -48,6 +49,7 @@ export function ServerPanel() {
           size={6}
           style={{ flex: 1, minHeight: 80 }}
           value={progId ?? ""}
+          disabled={loading}
           onChange={(e) => {
             const v = e.target.value;
             if (v) void bind(v);
@@ -67,7 +69,7 @@ export function ServerPanel() {
         <div className="field">
           <label>Connected</label>
           <span style={{ color: "#4ec9b0", flex: 1 }}>{progId}</span>
-          <button className="danger" onClick={unbind}>
+          <button className="danger" onClick={unbind} disabled={loading}>
             Disconnect
           </button>
         </div>

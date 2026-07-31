@@ -7,8 +7,10 @@
  */
 
 import { useSubscriptionStore } from "../stores/subscription";
+import { useConnectionStore } from "../stores/connection";
 
 export function GroupSidebar() {
+    const connLoading = useConnectionStore((s) => s.loading);
     const groups = useSubscriptionStore((s) => s.groups);
     const activeGroupId = useSubscriptionStore((s) => s.activeGroupId);
     const addGroup = useSubscriptionStore((s) => s.addGroup);
@@ -25,6 +27,7 @@ export function GroupSidebar() {
                     className="sidebar-add"
                     onClick={() => addGroup()}
                     title="New group"
+                    disabled={connLoading}
                 >
                     +
                 </button>
@@ -37,7 +40,9 @@ export function GroupSidebar() {
                     <div
                         key={g.id}
                         className={`sidebar-item ${g.id === activeGroupId ? "active" : ""}`}
-                        onClick={() => setActive(g.id)}
+                        onClick={() => {
+                            if (!connLoading) setActive(g.id);
+                        }}
                     >
                         <span className="sidebar-item-name">
                             {g.cookie !== null && <span className="sidebar-dot" title="streaming">●</span>}
@@ -47,6 +52,7 @@ export function GroupSidebar() {
                         <button
                             className="sidebar-del"
                             title="Delete group"
+                            disabled={connLoading}
                             onClick={(e) => {
                                 e.stopPropagation();
                                 void removeGroup(g.id);

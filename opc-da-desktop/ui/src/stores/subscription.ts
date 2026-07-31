@@ -52,6 +52,8 @@ interface SubscriptionState {
     startGroup: (id: string) => Promise<void>;
     /** Tear down the group's subscription. */
     stopGroup: (id: string) => Promise<void>;
+    /** Tear down ALL groups (a host switch invalidates every subscription). */
+    clearAll: () => Promise<void>;
 }
 
 let groupSeq = 0;
@@ -166,6 +168,20 @@ export const useSubscriptionStore = create<SubscriptionState>((set, get) => {
             } catch (e) {
                 patchGroup(id, { busy: false, error: String(e) });
             }
+        },
+
+        clearAll: async () => {
+            // Unsubscribe every active group first (idempotent — the backend
+            // rebuild may have already torn them down, in which case the call
+            // errors and we swallow it), then drop channels + reset state.
+            const groups = get().groups;
+            for (const g of groups.values()) {
+                if (g.cookie !== null) {
+                    await unsubscribeApi(g.cookie).catch(() => undefined);
+                }
+            }
+            groupChannels.clear();
+            set({ groups: new Map(), activeGroupId: null });
         },
     };
 });

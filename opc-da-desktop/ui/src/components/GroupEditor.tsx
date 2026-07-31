@@ -8,9 +8,11 @@
 
 import { useState } from "react";
 import { useSubscriptionStore } from "../stores/subscription";
+import { useConnectionStore } from "../stores/connection";
 import { TagBrowserModal } from "./TagBrowserModal";
 
 export function GroupEditor() {
+    const connLoading = useConnectionStore((s) => s.loading);
     const group = useSubscriptionStore((s) =>
         s.activeGroupId ? s.groups.get(s.activeGroupId) : undefined,
     );
@@ -40,6 +42,7 @@ export function GroupEditor() {
                 <input
                     value={group.name}
                     onChange={(e) => setGroupName(group.id, e.target.value)}
+                    disabled={connLoading}
                 />
             </div>
             <div className="field">
@@ -48,6 +51,7 @@ export function GroupEditor() {
                     type="number"
                     value={group.rate}
                     onChange={(e) => setGroupRate(group.id, Number(e.target.value))}
+                    disabled={connLoading}
                 />
             </div>
             {group.error && (
@@ -56,15 +60,26 @@ export function GroupEditor() {
                 </div>
             )}
             <div className="field">
-                <button onClick={() => setShowModal(true)}>Add Tags…</button>
+                <button onClick={() => setShowModal(true)} disabled={connLoading}>
+                    Add Tags…
+                </button>
                 <button
                     onClick={onSubscribe}
-                    disabled={group.busy || group.tagIds.length === 0 || group.cookie !== null}
+                    disabled={
+                        connLoading ||
+                        group.busy ||
+                        group.tagIds.length === 0 ||
+                        group.cookie !== null
+                    }
                 >
                     Start ({group.tagIds.length})
                 </button>
                 {group.cookie !== null && (
-                    <button className="danger" onClick={onUnsubscribe} disabled={group.busy}>
+                    <button
+                        className="danger"
+                        onClick={onUnsubscribe}
+                        disabled={connLoading || group.busy}
+                    >
                         Stop
                     </button>
                 )}

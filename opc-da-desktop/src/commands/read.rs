@@ -20,7 +20,7 @@ pub async fn read_tag_values(
     state: State<'_, AppState>,
     tag_ids: Vec<String>,
 ) -> DesktopResult<Vec<TagRow>> {
-    let client = state.client();
+    let client = state.client().await;
     let prog_id = state.prog_id().await?;
     let values = client
         .read_tag_values(&prog_id, tag_ids)

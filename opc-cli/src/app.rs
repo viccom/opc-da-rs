@@ -8,7 +8,10 @@
 //! ([`CurrentScreen`]) driving the TUI layout, handling user inputs, managing the list selection
 //! states, and communicating asynchronously with the background OPC DA client provider.
 
-use opc_da_client::{OpcError, OpcProvider, OpcValue, TagValue, WriteResult, friendly_com_hint};
+use opc_da_client::{
+    ComConnector, OpcDaClient, OpcError, OpcProvider, OpcValue, TagValue, WriteResult,
+    friendly_com_hint,
+};
 use ratatui::widgets::{ListState, TableState}; // Added TableState
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -37,6 +40,9 @@ pub enum CurrentScreen {
 /// and terminal interaction through `ratatui`.
 pub struct App {
     pub host_input: String,
+    /// The host the current `opc_provider` is bound to. Used to skip rebuilding
+    /// the client (and preserve an injected mock) when the host hasn't changed.
+    pub current_host: String,
     pub servers: Vec<String>,
     pub tags: Vec<String>,
     pub selected_index: Option<usize>,
@@ -81,6 +87,7 @@ impl App {
     pub fn new(opc_provider: Arc<dyn OpcProvider>) -> Self {
         Self {
             host_input: "localhost".into(),
+            current_host: "localhost".into(),
             servers: Vec::new(),
             tags: Vec::new(),
             selected_index: None,
@@ -118,7 +125,33 @@ impl App {
     }
 
     // Actions
+
+    /// Rebuild the OPC provider bound to `host_input` when the host changes.
+    ///
+    /// `ComConnector` bakes the host in at construction and moves it into a
+    /// dedicated worker thread, so switching hosts requires a brand-new
+    /// `OpcDaClient` (new connector + worker). When the host is unchanged this
+    /// is a no-op, which preserves an injected mock provider under tests.
+    ///
+    /// # Errors
+    /// Returns [`OpcError`] if the new worker thread / COM init fails.
+    fn rebuild_provider(&mut self) -> Result<(), OpcError> {
+        if self.current_host == self.host_input {
+            return Ok(());
+        }
+        self.opc_provider = Arc::new(OpcDaClient::new(ComConnector::new(&self.host_input))?);
+        self.current_host = self.host_input.clone();
+        Ok(())
+    }
+
     pub fn start_fetch_servers(&mut self) {
+        if let Err(e) = self.rebuild_provider() {
+            self.add_message(format!(
+                "Failed to init OPC client for {}: {e}",
+                self.host_input
+            ));
+            return;
+        }
         let host = self.host_input.clone();
         self.current_screen = CurrentScreen::Loading;
         self.add_message(format!("Connecting to {host}..."));

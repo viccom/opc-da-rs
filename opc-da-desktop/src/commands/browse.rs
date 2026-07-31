@@ -50,7 +50,7 @@ pub async fn browse_tags(
     max_tags: Option<usize>,
     channel: Channel<TagDescriptor>,
 ) -> DesktopResult<()> {
-    let client = state.client();
+    let client = state.client().await;
     let prog_id = state.prog_id().await?;
     let max = max_tags.unwrap_or(1000);
 
@@ -196,7 +196,7 @@ pub async fn browse_children(
     state: State<'_, AppState>,
     branch_path: Option<String>,
 ) -> DesktopResult<BrowseChildrenDto> {
-    let client = state.client();
+    let client = state.client().await;
     let prog_id = state.prog_id().await?;
     let children = client
         .browse_children(&prog_id, branch_path, 0, 0)

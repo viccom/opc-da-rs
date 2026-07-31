@@ -35,7 +35,7 @@ pub async fn list_servers(
     state: State<'_, AppState>,
     host: String,
 ) -> DesktopResult<Vec<ServerInfo>> {
-    let client = state.client();
+    let client = state.client().await;
     let prog_ids = client.list_servers(&host).await?;
     Ok(prog_ids
         .into_iter()
@@ -55,5 +55,17 @@ pub async fn connect(state: State<'_, AppState>, prog_id: String) -> DesktopResu
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> DesktopResult<()> {
     state.clear_prog_id().await;
+    Ok(())
+}
+
+/// Switch the target host, rebuilding the OPC client from scratch.
+///
+/// Unlike `list_servers` (which takes `host` per call), the data-plane
+/// commands operate on the client bound at construction, so a host change
+/// must rebuild the whole client. See [`AppState::rebuild_client`]. No-op
+/// (via dedup inside `rebuild_client`) when the host is unchanged.
+#[tauri::command]
+pub async fn set_host(state: State<'_, AppState>, host: String) -> DesktopResult<()> {
+    state.rebuild_client(&host).await?;
     Ok(())
 }

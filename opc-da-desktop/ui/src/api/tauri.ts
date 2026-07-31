@@ -62,6 +62,14 @@ export async function disconnect(): Promise<void> {
 }
 
 /**
+ * Switch the target host. The backend rebuilds the OPC client (new
+ * connector + worker thread); no-op when the host is unchanged.
+ */
+export async function setHost(host: string): Promise<void> {
+  return invoke<void>("set_host", { host });
+}
+
+/**
  * Stream tags from the server namespace. `maxTags` caps the total
  * number of tags the backend will push through `channel`.
  */

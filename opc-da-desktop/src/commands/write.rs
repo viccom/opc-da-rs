@@ -60,7 +60,7 @@ pub async fn write_tag_value(
     state: State<'_, AppState>,
     request: WriteRequest,
 ) -> DesktopResult<WriteResultDto> {
-    let client = state.client();
+    let client = state.client().await;
     let prog_id = state.prog_id().await?;
     let value = request.to_opc_value().ok_or_else(|| {
         crate::error::DesktopError::Other(
