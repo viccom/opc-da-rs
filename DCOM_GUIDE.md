@@ -338,6 +338,35 @@ cargo run -p opc-da-client --target i686-pc-windows-msvc --example remote_list -
 
 ---
 
+### 5.8 FusionReader（融合读取库 API）
+
+`opc_da_client::FusionReader` —— 默认订阅（`OnDataChange` 推送）+ 自动同步兜底，专为
+NAT/防火墙/client 端 DCOM 回调难配场景：订阅不通时不报错中断，自动切同步轮询保数据。
+
+```rust
+use std::time::Duration;
+use opc_da_client::{FusionEvent, FusionReader, FusionReaderOptions};
+
+// creds=None 用当前登录用户；Some(AuthCredentials) 用显式凭据（跨工作组推荐）
+let (reader, mut rx) = FusionReader::start(
+    "192.168.1.10", None, "Matrikon.OPC.Simulation.1",
+    vec!["Random.Real4".into()],
+    &FusionReaderOptions { update_rate: 1000, fallback_timeout: Duration::from_secs(10), buffer: 256 },
+)?;
+while let Some(ev) = rx.recv().await {
+    match ev {
+        FusionEvent::Data(tv)    => { /* 一条值（订阅推送或同步轮询）*/ }
+        FusionEvent::Subscribed  => { /* 订阅建立，进入推送模式 */ }
+        FusionEvent::Fallback(e) => { /* 切同步兜底，原因 e */ }
+    }
+}
+// Drop reader → 取消后台 task、释放订阅
+```
+
+内部用独立 `sub_client` + `read_client`（各自 COM worker），避免订阅失败/超时阻塞兜底
+读取。事件流 `FusionEvent` 单 channel；`Data` 在 channel 满时丢最旧值，`Subscribed`/`Fallback`
+阻塞必达。详见 [`docs/superpowers/specs/2026-08-01-fusion-reader-design.md`](./docs/superpowers/specs/2026-08-01-fusion-reader-design.md)。
+
 ## 6. 现场调试实操
 
 ### 6.1 本机（localhost）：基本零配置

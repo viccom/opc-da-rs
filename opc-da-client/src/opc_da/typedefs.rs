@@ -951,7 +951,7 @@ mod tests {
         let native = &*moved.native;
         assert_eq!(native.UserLength, 6);
         assert_eq!(native.DomainLength, 5);
-        assert_eq!(native.PasswordLength, 8);
+        assert_eq!(native.PasswordLength, 13);
         assert_eq!(read_wide(native.User), "viccom");
         assert_eq!(read_wide(native.Domain), "PLANT");
         assert_eq!(read_wide(native.Password), "test-password");

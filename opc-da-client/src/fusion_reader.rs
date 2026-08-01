@@ -1,0 +1,260 @@
+//! 融合读取：默认订阅（`OnDataChange` 推送），订阅失败 / 超时 / 回调静默时自动 fallback
+//! 同步轮询。
+//!
+//! 专为 NAT / 防火墙 / client 端 DCOM 回调难配等场景：远程订阅反向回调不通时，不报错
+//! 中断，而是自动切同步轮询兜底，保证数据持续可得。
+//!
+//! 订阅与兜底读取用各自独立的 [`OpcDaClient`]（独立 COM worker），避免订阅失败 / 超时
+//! 阻塞兜底读取（经真机验证：同 worker 会被 server 端 Advise 的长 RPC 超时卡死）。
+//!
+//! # Example
+//!
+//! ```no_run
+//! # use std::time::Duration;
+//! # use opc_da_client::{FusionReader, FusionReaderOptions, AuthCredentials};
+//! # #[tokio::main]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let (reader, mut rx) = FusionReader::start(
+//!     "192.168.1.10",
+//!     None,                       // None=当前登录用户；Some(AuthCredentials)=显式凭据
+//!     "Matrikon.OPC.Simulation.1",
+//!     vec!["Random.Real4".into()],
+//!     FusionReaderOptions::default(),
+//! )?;
+//! while let Some(ev) = rx.recv().await {
+//!     match ev {
+//!         opc_da_client::FusionEvent::Data(tv) => println!("{} = {}", tv.tag_id, tv.value),
+//!         opc_da_client::FusionEvent::Subscribed => println!("[推送模式]"),
+//!         opc_da_client::FusionEvent::Fallback(e) => println!("[同步兜底] {e}"),
+//!     }
+//! }
+//! # Ok(()) }
+//! ```
+
+use std::time::{Duration, Instant};
+
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
+
+use crate::opc_da::errors::{OpcError, OpcResult};
+use crate::{
+    AuthCredentials, ComConnector, OpcDaClient, OpcProvider, SubscriptionHandle, TagValue,
+};
+
+/// 远程订阅反向回调不通时，server 端 Advise 会长时间 RPC 超时，必须截断。经验值：
+/// 太短会误判正常订阅，太长会阻塞首次兜底（8s 覆盖绝大多数正常 Advise 往返）。
+const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 融合读取事件。
+#[derive(Debug)]
+pub enum FusionEvent {
+    /// 一条标签值（订阅推送或同步轮询产生）。
+    Data(TagValue),
+    /// 订阅建立成功，进入推送模式。
+    Subscribed,
+    /// 切换到同步兜底（订阅失败 / 超时 / 回调静默 / 推送流关闭），携带原因。
+    Fallback(OpcError),
+}
+
+/// 融合读取选项。
+#[derive(Clone)]
+pub struct FusionReaderOptions {
+    /// 订阅 `update_rate`，兼作同步兜底的轮询周期（毫秒）。
+    pub update_rate: u32,
+    /// 订阅建立成功后，多久收不到回调即判静默、切同步兜底。
+    pub fallback_timeout: Duration,
+    /// 事件 channel 容量。`Data` 在满时丢弃（保 `Subscribed`/`Fallback` 必达）。
+    pub buffer: usize,
+}
+
+impl Default for FusionReaderOptions {
+    fn default() -> Self {
+        Self {
+            update_rate: 1000,
+            fallback_timeout: Duration::from_secs(10),
+            buffer: 256,
+        }
+    }
+}
+
+/// 融合读取器：默认订阅 + 同步兜底。
+///
+/// 用 [`FusionReader::start`] 启动（**必须在 tokio runtime 内**），返回事件接收端。
+/// Drop 时取消后台 task 并释放订阅。
+pub struct FusionReader {
+    task: Option<JoinHandle<()>>,
+}
+
+impl FusionReader {
+    /// 启动融合读取。
+    ///
+    /// - `creds = None`：用当前登录用户（DCOM 默认认证）。
+    /// - `creds = Some`：用显式 user/password（跨工作组远程推荐，绕开当前用户 token 的
+    ///   SID 跨机不匹配问题，详见 `DCOM_GUIDE.md`）。
+    ///
+    /// # Errors
+    /// 仅当 client（COM worker）初始化失败时返回 `Err`。运行期订阅/读取失败通过
+    /// `FusionEvent::Fallback` 事件报告，不中断流。
+    pub fn start(
+        host: &str,
+        creds: Option<AuthCredentials>,
+        server: &str,
+        tags: Vec<String>,
+        opts: &FusionReaderOptions,
+    ) -> OpcResult<(Self, mpsc::Receiver<FusionEvent>)> {
+        let sub_client = build_client(host, creds.clone())?;
+        let read_client = build_client(host, creds)?;
+        let update_rate = opts.update_rate;
+        let fallback_timeout = opts.fallback_timeout;
+        let (tx, rx) = mpsc::channel(opts.buffer);
+        let server_owned = server.to_string();
+        let task = tokio::spawn(async move {
+            run_fusion(
+                sub_client,
+                read_client,
+                server_owned,
+                tags,
+                update_rate,
+                fallback_timeout,
+                tx,
+            )
+            .await;
+        });
+        Ok((Self { task: Some(task) }, rx))
+    }
+}
+
+impl Drop for FusionReader {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+fn build_client(
+    host: &str,
+    creds: Option<AuthCredentials>,
+) -> OpcResult<OpcDaClient<ComConnector>> {
+    match creds {
+        Some(c) => OpcDaClient::with_credentials(host, c),
+        None => OpcDaClient::new(ComConnector::new(host)),
+    }
+}
+
+/// 后台 task：维护订阅/同步模式，向 `tx` 发事件。`rx` 关闭（上层 drop 接收端）时退出。
+#[allow(clippy::too_many_lines)]
+async fn run_fusion(
+    sub_client: OpcDaClient<ComConnector>,
+    read_client: OpcDaClient<ComConnector>,
+    server: String,
+    tags: Vec<String>,
+    update_rate: u32,
+    fallback_timeout: Duration,
+    tx: mpsc::Sender<FusionEvent>,
+) {
+    let mut mode_subscribe;
+    let (mut rx_sub, mut errors, cookie) = match tokio::time::timeout(
+        SUBSCRIBE_TIMEOUT,
+        sub_client.subscribe(&server, tags.clone(), update_rate),
+    )
+    .await
+    {
+        Ok(Ok(SubscriptionHandle { cookie, rx, errors })) => {
+            // Subscribed 必达；若接收端已关则直接退出。
+            if tx.send(FusionEvent::Subscribed).await.is_err() {
+                let _ = sub_client.unsubscribe(cookie).await;
+                return;
+            }
+            mode_subscribe = true;
+            (Some(rx), Some(errors), Some(cookie))
+        }
+        Ok(Err(e)) => {
+            let _ = tx.send(FusionEvent::Fallback(e)).await;
+            mode_subscribe = false;
+            (None, None, None)
+        }
+        Err(_) => {
+            let _ = tx
+                .send(FusionEvent::Fallback(OpcError::Connection(
+                    "订阅 8s 未完成（反向回调可能不通）".to_string(),
+                )))
+                .await;
+            mode_subscribe = false;
+            (None, None, None)
+        }
+    };
+
+    let mut last_data = Instant::now();
+    loop {
+        if tx.is_closed() {
+            break;
+        }
+        if mode_subscribe {
+            // 非阻塞 drain 订阅级错误（重建失败等）→ fallback
+            if let Some(err_rx) = errors.as_mut()
+                && let Ok(err) = err_rx.try_recv()
+            {
+                let _ = tx.send(FusionEvent::Fallback(err)).await;
+                mode_subscribe = false;
+                continue;
+            }
+            let Some(rx_recv) = rx_sub.as_mut() else {
+                mode_subscribe = false;
+                continue;
+            };
+            let since = last_data.elapsed();
+            if since >= fallback_timeout {
+                let _ = tx
+                    .send(FusionEvent::Fallback(OpcError::Connection(format!(
+                        "回调静默 {}s",
+                        fallback_timeout.as_secs()
+                    ))))
+                    .await;
+                mode_subscribe = false;
+                continue;
+            }
+            let left = fallback_timeout.saturating_sub(since);
+            match tokio::time::timeout(left, rx_recv.recv()).await {
+                Ok(Some(tv)) => {
+                    last_data = Instant::now();
+                    // Data 用 try_send：满则丢，避免 task 阻塞。
+                    let _ = tx.try_send(FusionEvent::Data(tv));
+                }
+                Ok(None) => {
+                    let _ = tx
+                        .send(FusionEvent::Fallback(OpcError::Connection(
+                            "推送流关闭".to_string(),
+                        )))
+                        .await;
+                    mode_subscribe = false;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(FusionEvent::Fallback(OpcError::Connection(format!(
+                            "回调静默 {}s",
+                            fallback_timeout.as_secs()
+                        ))))
+                        .await;
+                    mode_subscribe = false;
+                }
+            }
+        } else {
+            match read_client.read_tag_values(&server, tags.clone()).await {
+                Ok(vs) => {
+                    for tv in vs {
+                        let _ = tx.try_send(FusionEvent::Data(tv));
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(FusionEvent::Fallback(e)).await;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(u64::from(update_rate))).await;
+        }
+    }
+
+    if let Some(c) = cookie {
+        let _ = sub_client.unsubscribe(c).await;
+    }
+}

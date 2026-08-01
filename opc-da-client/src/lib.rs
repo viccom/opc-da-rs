@@ -66,6 +66,8 @@ mod opc_da;
 mod backend;
 
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
+mod fusion_reader;
+#[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
 mod subscription;
 
 // Stable public API (Windows + backend only)
@@ -86,6 +88,9 @@ pub use opc_da::{
 
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
 pub use backend::{connector::ComConnector, opc_da::OpcDaClient};
+
+#[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
+pub use fusion_reader::{FusionEvent, FusionReader, FusionReaderOptions};
 
 // Test support re-export (requires the backend, which is Windows-only).
 #[cfg(all(
