@@ -131,12 +131,15 @@ async fn main() {
             _ = tokio::time::sleep(left) => break,
         }
     }
+    let drop_start = Instant::now();
     drop(reader);
+    eprintln!("[B] reader 拆除耗时 {:?}", drop_start.elapsed());
     println!("[B] 完成（20s）");
 }
 
 fn arg_or(args: &[String], key: &str, default: &str) -> String {
-    let mut iter = args.iter();
+    // 跳过 args[0]（程序名），否则 flag/value 配对会整体错位一位。
+    let mut iter = args.iter().skip(1);
     while let Some(a) = iter.next()
         && let Some(v) = iter.next()
     {

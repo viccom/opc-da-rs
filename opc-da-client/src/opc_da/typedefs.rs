@@ -722,12 +722,25 @@ impl IntoBridge<AuthInfoBridge> for AuthInfo {
 }
 
 /// DCOM authentication credentials.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct AuthIdentity {
     pub user: String,
     pub domain: String,
     pub password: String,
     pub flags: u32,
+}
+
+impl std::fmt::Debug for AuthIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // 屏蔽 password（与 AuthCredentials 一致）。AuthInfo/ServerInfo 的 derive(Debug)
+        // 经此实现访问 auth_identity_data，故整条 Debug 链都不会泄露 password。
+        f.debug_struct("AuthIdentity")
+            .field("user", &self.user)
+            .field("domain", &self.domain)
+            .field("password", &"***")
+            .field("flags", &self.flags)
+            .finish()
+    }
 }
 
 /// 用户态 DCOM 远程认证凭据，对应 `COAUTHIDENTITY`（见 [`AuthIdentity`]）。

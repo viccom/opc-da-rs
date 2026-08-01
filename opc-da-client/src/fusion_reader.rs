@@ -19,7 +19,7 @@
 //!     None,                       // None=当前登录用户；Some(AuthCredentials)=显式凭据
 //!     "Matrikon.OPC.Simulation.1",
 //!     vec!["Random.Real4".into()],
-//!     FusionReaderOptions::default(),
+//!     &FusionReaderOptions::default(),
 //! )?;
 //! while let Some(ev) = rx.recv().await {
 //!     match ev {
@@ -31,6 +31,7 @@
 //! # Ok(()) }
 //! ```
 
+use std::mem::ManuallyDrop;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -132,21 +133,55 @@ impl Drop for FusionReader {
     }
 }
 
-fn build_client(
-    host: &str,
-    creds: Option<AuthCredentials>,
-) -> OpcResult<OpcDaClient<ComConnector>> {
-    match creds {
+/// 包装 `OpcDaClient`，使其 `Drop`（含 `ComWorker::join`）在独立 OS 线程上执行。
+///
+/// 远程订阅反向回调不通时，worker 线程可能卡在 `Advise` 同步 RPC 直到 DCOM 超时
+/// （数分钟）。若 client 在 tokio runtime 线程上 drop，`ComWorker::drop::join()` 会
+/// 阻塞该 runtime 线程：单线程 runtime（current_thread）整体冻结，多线程 runtime
+/// 损失一个 worker。这里把真正的释放移到专用清理线程，堵清理线程而非 runtime。
+struct DetachingClient {
+    inner: ManuallyDrop<OpcDaClient<ComConnector>>,
+}
+
+impl DetachingClient {
+    fn new(client: OpcDaClient<ComConnector>) -> Self {
+        Self {
+            inner: ManuallyDrop::new(client),
+        }
+    }
+
+    /// 被包装 client 的引用（`OpcProvider` 方法均为 `&self`，无需可变访问）。
+    fn client(&self) -> &OpcDaClient<ComConnector> {
+        &self.inner
+    }
+}
+
+impl Drop for DetachingClient {
+    fn drop(&mut self) {
+        // SAFETY: `inner` 由 ManuallyDrop 持有，仅在此 take 一次；take 后结构体即被
+        // 丢弃，不会再访问 `inner`，故无 double-drop。
+        let client = unsafe { ManuallyDrop::take(&mut self.inner) };
+        // spawn 失败（资源耗尽，极罕见）时 `client` 随闭包在此原地 drop，退回原同步
+        // join 行为，不比修复前更差。
+        let _ = std::thread::Builder::new()
+            .name("opc-da-fusion-cleanup".into())
+            .spawn(move || drop(client));
+    }
+}
+
+fn build_client(host: &str, creds: Option<AuthCredentials>) -> OpcResult<DetachingClient> {
+    let client = match creds {
         Some(c) => OpcDaClient::with_credentials(host, c),
         None => OpcDaClient::new(ComConnector::new(host)),
-    }
+    }?;
+    Ok(DetachingClient::new(client))
 }
 
 /// 后台 task：维护订阅/同步模式，向 `tx` 发事件。`rx` 关闭（上层 drop 接收端）时退出。
 #[allow(clippy::too_many_lines)]
 async fn run_fusion(
-    sub_client: OpcDaClient<ComConnector>,
-    read_client: OpcDaClient<ComConnector>,
+    sub_client: DetachingClient,
+    read_client: DetachingClient,
     server: String,
     tags: Vec<String>,
     update_rate: u32,
@@ -156,14 +191,16 @@ async fn run_fusion(
     let mut mode_subscribe;
     let (mut rx_sub, mut errors, cookie) = match tokio::time::timeout(
         SUBSCRIBE_TIMEOUT,
-        sub_client.subscribe(&server, tags.clone(), update_rate),
+        sub_client
+            .client()
+            .subscribe(&server, tags.clone(), update_rate),
     )
     .await
     {
         Ok(Ok(SubscriptionHandle { cookie, rx, errors })) => {
             // Subscribed 必达；若接收端已关则直接退出。
             if tx.send(FusionEvent::Subscribed).await.is_err() {
-                let _ = sub_client.unsubscribe(cookie).await;
+                let _ = sub_client.client().unsubscribe(cookie).await;
                 return;
             }
             mode_subscribe = true;
@@ -240,7 +277,11 @@ async fn run_fusion(
                 }
             }
         } else {
-            match read_client.read_tag_values(&server, tags.clone()).await {
+            match read_client
+                .client()
+                .read_tag_values(&server, tags.clone())
+                .await
+            {
                 Ok(vs) => {
                     for tv in vs {
                         let _ = tx.try_send(FusionEvent::Data(tv));
@@ -255,6 +296,6 @@ async fn run_fusion(
     }
 
     if let Some(c) = cookie {
-        let _ = sub_client.unsubscribe(c).await;
+        let _ = sub_client.client().unsubscribe(c).await;
     }
 }
