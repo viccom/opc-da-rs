@@ -87,6 +87,8 @@ export const useConnectionStore = create<ConnectionState>((set, get) => ({
   unbind: async () => {
     try {
       await disconnectApi();
+      // 后端 disconnect 已停所有订阅；前端清订阅状态（保留 groups 配置）。
+      useSubscriptionStore.getState().onDisconnected();
       set({ progId: null });
     } catch (e) {
       set({ error: String(e) });

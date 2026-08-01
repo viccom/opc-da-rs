@@ -279,6 +279,21 @@ impl AppState {
         *self.connected_prog_id.lock().await = Some(prog_id);
     }
 
+    /// Stop ALL data streams: unsubscribe every active cookie + drop every
+    /// FusionReader. The client itself stays in place (lazy OPC connection
+    /// stays cached for the next connect) — this only halts subscriptions.
+    /// Called by `disconnect` so the data plane actually stops.
+    pub async fn stop_all_subscriptions(&self) {
+        // Snapshot + clear cookies/fusion readers under short locks, then
+        // unsubscribe outside any lock (COM calls are uncancellable).
+        let cookies: Vec<u32> = self.active_cookies.lock().await.drain().collect();
+        self.fusion_readers.lock().await.clear();
+        let client = self.client.lock().await.clone();
+        for cookie in cookies {
+            let _ = client.unsubscribe(cookie).await;
+        }
+    }
+
     /// Drop the current ProgID binding.
     pub async fn clear_prog_id(&self) {
         *self.connected_prog_id.lock().await = None;

@@ -65,6 +65,8 @@ interface SubscriptionState {
     stopGroup: (id: string) => Promise<void>;
     /** Tear down ALL groups (a host switch invalidates every subscription). */
     clearAll: () => Promise<void>;
+    /** 后端已停所有订阅（disconnect）；清 cookie/rows/channel，保留 groups 配置。 */
+    onDisconnected: () => void;
 }
 
 let groupSeq = 0;
@@ -238,6 +240,26 @@ export const useSubscriptionStore = create<SubscriptionState>((set, get) => {
             }
             groupChannels.clear();
             set({ groups: new Map(), activeGroupId: null });
+        },
+
+        onDisconnected: () => {
+            // 后端 disconnect 已停所有订阅；前端只清本地状态（cookie/rows/channel），
+            // 保留 groups 配置（tag 列表等）以便重连复用。
+            groupChannels.clear();
+            set((state) => {
+                const next = new Map<string, GroupState>();
+                for (const g of state.groups.values()) {
+                    next.set(g.id, {
+                        ...g,
+                        cookie: null,
+                        rows: new Map(),
+                        fusionStatus: null,
+                        busy: false,
+                        error: null,
+                    });
+                }
+                return { groups: next };
+            });
         },
     };
 });

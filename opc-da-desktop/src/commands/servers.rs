@@ -54,6 +54,9 @@ pub async fn connect(state: State<'_, AppState>, prog_id: String) -> DesktopResu
 /// Drop the current ProgID binding.
 #[tauri::command]
 pub async fn disconnect(state: State<'_, AppState>) -> DesktopResult<()> {
+    // 先停所有订阅（纯订阅 unsubscribe + fusion readers drop），再清 ProgID。
+    // 否则旧实现只清 ProgID，订阅继续刷新（既有 bug）。
+    state.stop_all_subscriptions().await;
     state.clear_prog_id().await;
     Ok(())
 }
