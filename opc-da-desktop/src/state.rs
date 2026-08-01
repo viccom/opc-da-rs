@@ -17,12 +17,15 @@
 //! - a set of active subscription cookies (the actual `rx` lives inside
 //!   each runner task — see [`crate::ipc::subscription_runner`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::Mutex;
 
-use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, SubscriptionHandle};
+use opc_da_client::{
+    AuthCredentials, ComConnector, FusionReader, OpcDaClient, OpcProvider, SubscriptionHandle,
+};
 
 use crate::error::{DesktopError, DesktopResult};
 
@@ -53,6 +56,20 @@ pub struct AppState {
     /// Cookies of active subscriptions (the actual `rx` lives inside each
     /// runner task). Used by `unsubscribe_tags` for validation.
     active_cookies: Mutex<HashSet<u32>>,
+
+    /// DCOM credentials for the current client (`None` = current logged-in
+    /// user). Snapshotted so `subscribe_fusion_tags` (which builds its own
+    /// client via `FusionReader::start`) reuses the same credentials.
+    credentials: Mutex<Option<AuthCredentials>>,
+
+    /// Active FusionReader handles (id → reader). Drop = graceful unsubscribe
+    /// via the reader's shutdown path. Cleared on host rebuild, like
+    /// `active_cookies`.
+    fusion_readers: Mutex<HashMap<u32, FusionReader>>,
+
+    /// Next fusion subscription id (FusionReader has no server cookie; we
+    /// synthesize a handle id to report to the frontend).
+    next_fusion_id: AtomicU32,
 }
 
 impl AppState {
@@ -66,6 +83,9 @@ impl AppState {
             current_host: Mutex::new("localhost".to_string()),
             connected_prog_id: Mutex::new(None),
             active_cookies: Mutex::new(HashSet::new()),
+            credentials: Mutex::new(None),
+            fusion_readers: Mutex::new(HashMap::new()),
+            next_fusion_id: AtomicU32::new(1),
         })
     }
 
@@ -103,22 +123,42 @@ impl AppState {
     // lock). It is dropped before the potentially-long teardown loop. clippy's
     // `significant_drop_tightening` can't see that intent, so allow it here.
     #[allow(clippy::significant_drop_tightening)]
-    pub async fn rebuild_client(&self, host: &str) -> DesktopResult<()> {
+    pub async fn rebuild_client(
+        &self,
+        host: &str,
+        creds: Option<AuthCredentials>,
+    ) -> DesktopResult<()> {
         let mut client_guard = self.client.lock().await;
 
-        // Dedup. client_guard serializes rebuilds, so current_host is stable
-        // across the read below and the write further down.
+        // Dedup on host AND credentials. `ComConnector` bakes both host and
+        // credentials into the worker thread, so a credential change needs a
+        // rebuild just like a host change. Compare credentials field-by-field
+        // (`AuthCredentials` has no `PartialEq` — we don't want to expand its
+        // public derive surface just for this dedup).
         {
             let current = self.current_host.lock().await;
-            if current.as_str() == host {
+            let current_creds = self.credentials.lock().await;
+            let same_creds = match (&*current_creds, &creds) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.user == b.user && a.password == b.password && a.domain == b.domain
+                }
+                _ => false,
+            };
+            if current.as_str() == host && same_creds {
                 return Ok(());
             }
         }
 
         // Build the new client first. If this fails we return early: the old
         // client stays in place and nothing is torn down.
-        let new_client =
-            Arc::new(OpcDaClient::new(ComConnector::new(host)).map_err(DesktopError::from)?);
+        let new_client = Arc::new(
+            match &creds {
+                Some(c) => OpcDaClient::with_credentials(host, c.clone()),
+                None => OpcDaClient::new(ComConnector::new(host)),
+            }
+            .map_err(DesktopError::from)?,
+        );
 
         // Snapshot the old client + cookies, swap in the new client, and clear
         // host-bound state — all under the lock, but only these quick steps
@@ -128,6 +168,10 @@ impl AppState {
         let cookies: Vec<u32> = self.active_cookies.lock().await.iter().copied().collect();
         *client_guard = new_client;
         self.active_cookies.lock().await.clear();
+        // FusionReaders bake host+creds into their own clients — drop them all
+        // (each Drop gracefully unsubscribes its server-side group).
+        self.fusion_readers.lock().await.clear();
+        *self.credentials.lock().await = creds;
         *self.connected_prog_id.lock().await = None;
         *self.current_host.lock().await = host.to_string();
         drop(client_guard);
@@ -194,6 +238,30 @@ impl AppState {
             tracing::warn!(cookie, error = %e, "client.unsubscribe failed during UI stop");
         }
         Ok(())
+    }
+
+    /// Snapshot the bound host (for `subscribe_fusion_tags`, which builds its
+    /// own client via `FusionReader::start` and bypasses `AppState::client`).
+    pub async fn host_snapshot(&self) -> String {
+        self.current_host.lock().await.clone()
+    }
+
+    /// Snapshot the bound credentials (`None` = current logged-in user).
+    pub async fn credentials_snapshot(&self) -> Option<AuthCredentials> {
+        self.credentials.lock().await.clone()
+    }
+
+    /// Register a FusionReader handle, returning its synthetic id (reported
+    /// to the frontend as the subscription "cookie").
+    pub async fn register_fusion_reader(&self, reader: FusionReader) -> u32 {
+        let id = self.next_fusion_id.fetch_add(1, Ordering::Relaxed);
+        self.fusion_readers.lock().await.insert(id, reader);
+        id
+    }
+
+    /// Drop a FusionReader (its `Drop` gracefully unsubscribes the server group).
+    pub async fn remove_fusion_reader(&self, id: u32) {
+        self.fusion_readers.lock().await.remove(&id);
     }
 
     /// Currently-bound ProgID, or [`DesktopError::NotConnected`] if the

@@ -23,13 +23,18 @@
 //! `subscription_runner.rs` only runs as a defensive cleanup on the
 //! natural-exit path (channel closed, stream ended).
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use tauri::State;
 use tauri::ipc::Channel;
 
+use opc_da_client::{FusionReader, FusionReaderOptions};
+
 use crate::error::DesktopResult;
-use crate::ipc::TagUpdate;
+use crate::ipc::fusion_runner::run_fusion_subscription;
 use crate::ipc::subscription_runner::run_subscription;
+use crate::ipc::{FusionEventDto, TagUpdate};
 use crate::state::AppState;
 
 /// Result returned by `subscribe_tags`: the cookie used to identify
@@ -90,5 +95,42 @@ pub async fn unsubscribe_tags(state: State<'_, AppState>, cookie: u32) -> Deskto
     // server-side subscription closes the worker's `tx` → the runner's `rx`
     // reaches `None` → the runner exits on its own.
     state.unsubscribe_atomic(cookie).await?;
+    Ok(())
+}
+
+/// Subscribe via `FusionReader`（订阅优先，订阅不通自动同步兜底）。
+///
+/// 与 [`subscribe_tags`] 不同：用独立 client（`FusionReader::start` 自建，绕过
+/// `AppState::client`），事件流为 [`FusionEventDto`]（`Data` / `Subscribed` /
+/// `Fallback`）。返回的 `cookie` 实为 fusion 句柄 id，供 [`unsubscribe_fusion_tags`]
+/// drop reader（其 `Drop` 优雅退订 server 端订阅）。
+#[tauri::command]
+pub async fn subscribe_fusion_tags(
+    state: State<'_, AppState>,
+    tag_ids: Vec<String>,
+    update_rate_ms: u32,
+    channel: Channel<FusionEventDto>,
+) -> DesktopResult<SubscriptionCreated> {
+    let prog_id = state.prog_id().await?;
+    let host = state.host_snapshot().await;
+    let creds = state.credentials_snapshot().await;
+    let opts = FusionReaderOptions {
+        update_rate: update_rate_ms,
+        fallback_timeout: Duration::from_secs(10),
+        buffer: 256,
+    };
+    let (reader, rx) = FusionReader::start(&host, creds, &prog_id, tag_ids.clone(), &opts)?;
+    let sub_id = state.register_fusion_reader(reader).await;
+    tokio::spawn(run_fusion_subscription(rx, channel));
+    Ok(SubscriptionCreated {
+        cookie: sub_id,
+        tag_count: tag_ids.len(),
+    })
+}
+
+/// Drop a FusionReader（其 `Drop` 优雅退订 server 端订阅）。
+#[tauri::command]
+pub async fn unsubscribe_fusion_tags(state: State<'_, AppState>, sub_id: u32) -> DesktopResult<()> {
+    state.remove_fusion_reader(sub_id).await;
     Ok(())
 }

@@ -12,11 +12,17 @@ import { useConnectionStore } from "../stores/connection";
 export function ServerPanel() {
   const {
     host,
+    user,
+    password,
+    domain,
     servers,
     progId,
     loading,
     error,
     setHost,
+    setUser,
+    setPassword,
+    setDomain,
     refresh,
     bind,
     unbind,
@@ -37,6 +43,36 @@ export function ServerPanel() {
         <button onClick={refresh} disabled={loading}>
           {loading ? "…" : "Refresh"}
         </button>
+      </div>
+      <div className="field">
+        <label>User</label>
+        <input
+          type="text"
+          value={user}
+          onChange={(e) => setUser(e.target.value)}
+          placeholder="空=当前登录用户"
+          disabled={loading}
+        />
+      </div>
+      <div className="field">
+        <label>Password</label>
+        <input
+          type="password"
+          value={password}
+          onChange={(e) => setPassword(e.target.value)}
+          placeholder="空=当前登录用户"
+          disabled={loading}
+        />
+      </div>
+      <div className="field">
+        <label>Domain</label>
+        <input
+          type="text"
+          value={domain}
+          onChange={(e) => setDomain(e.target.value)}
+          placeholder="可选（域/机器名）"
+          disabled={loading}
+        />
       </div>
       {error && (
         <div className="field" style={{ color: "#f48771" }}>

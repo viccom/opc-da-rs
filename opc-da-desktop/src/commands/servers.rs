@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use opc_da_client::OpcProvider;
+use opc_da_client::{AuthCredentials, OpcProvider};
 
 use crate::error::DesktopResult;
 use crate::state::AppState;
@@ -65,7 +65,19 @@ pub async fn disconnect(state: State<'_, AppState>) -> DesktopResult<()> {
 /// must rebuild the whole client. See [`AppState::rebuild_client`]. No-op
 /// (via dedup inside `rebuild_client`) when the host is unchanged.
 #[tauri::command]
-pub async fn set_host(state: State<'_, AppState>, host: String) -> DesktopResult<()> {
-    state.rebuild_client(&host).await?;
+pub async fn set_host(
+    state: State<'_, AppState>,
+    host: String,
+    user: Option<String>,
+    password: Option<String>,
+    domain: Option<String>,
+) -> DesktopResult<()> {
+    // 空 user → None（用当前登录用户）；否则组装显式 DCOM 凭据。
+    let creds = user.filter(|u| !u.is_empty()).map(|u| AuthCredentials {
+        user: u,
+        password: password.unwrap_or_default(),
+        domain: domain.unwrap_or_default(),
+    });
+    state.rebuild_client(&host, creds).await?;
     Ok(())
 }

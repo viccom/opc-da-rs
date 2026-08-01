@@ -19,6 +19,7 @@ export function GroupEditor() {
     const setGroupName = useSubscriptionStore((s) => s.setGroupName);
     const setGroupRate = useSubscriptionStore((s) => s.setGroupRate);
     const setGroupTags = useSubscriptionStore((s) => s.setGroupTags);
+    const setGroupMode = useSubscriptionStore((s) => s.setGroupMode);
     const startGroup = useSubscriptionStore((s) => s.startGroup);
     const stopGroup = useSubscriptionStore((s) => s.stopGroup);
 
@@ -54,6 +55,27 @@ export function GroupEditor() {
                     disabled={connLoading}
                 />
             </div>
+            <div className="field">
+                <label>Mode</label>
+                <select
+                    value={group.mode}
+                    onChange={(e) =>
+                        setGroupMode(
+                            group.id,
+                            e.target.value as "subscription" | "fusion",
+                        )
+                    }
+                    disabled={connLoading || group.busy}
+                >
+                    <option value="subscription">订阅（OnDataChange）</option>
+                    <option value="fusion">融合（订阅+同步兜底）</option>
+                </select>
+            </div>
+            {group.fusionStatus && (
+                <div className="field" style={{ color: "#dcdcaa" }}>
+                    {group.fusionStatus}
+                </div>
+            )}
             {group.error && (
                 <div className="field" style={{ color: "#f48771" }}>
                     {group.error}

@@ -33,6 +33,8 @@ pub fn run() {
             crate::commands::write::write_tag_value,
             crate::commands::subscription::subscribe_tags,
             crate::commands::subscription::unsubscribe_tags,
+            crate::commands::subscription::subscribe_fusion_tags,
+            crate::commands::subscription::unsubscribe_fusion_tags,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

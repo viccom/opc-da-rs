@@ -62,11 +62,17 @@ export async function disconnect(): Promise<void> {
 }
 
 /**
- * Switch the target host. The backend rebuilds the OPC client (new
- * connector + worker thread); no-op when the host is unchanged.
+ * Switch the target host + credentials. The backend rebuilds the OPC client
+ * (new connector + worker thread); no-op when host AND credentials are
+ * unchanged. Empty `user` = current logged-in user (DCOM default auth).
  */
-export async function setHost(host: string): Promise<void> {
-  return invoke<void>("set_host", { host });
+export async function setHost(
+  host: string,
+  user: string,
+  password: string,
+  domain: string,
+): Promise<void> {
+  return invoke<void>("set_host", { host, user, password, domain });
 }
 
 /**
@@ -115,6 +121,38 @@ export async function subscribeTags(
 
 export async function unsubscribeTags(cookie: number): Promise<void> {
   return invoke<void>("unsubscribe_tags", { cookie });
+}
+
+// ── fusion subscription (订阅优先 + 订阅不通自动同步兜底) ──
+
+/**
+ * Fusion 订阅事件。后端 `#[serde(tag = "kind")]`：前端按 `ev.kind` 判别。
+ * `Data` 复用 `TagUpdate` 字段（渲染逻辑与普通订阅一致）。
+ */
+export type FusionEventDto =
+  | ({ kind: "Data" } & TagUpdate)
+  | { kind: "Subscribed" }
+  | { kind: "Fallback"; message: string };
+
+/** Open a fusion subscription channel. */
+export function subscribeFusionChannel(): Channel<FusionEventDto> {
+  return new Channel<FusionEventDto>();
+}
+
+export async function subscribeFusionTags(
+  tagIds: string[],
+  updateRateMs: number,
+  channel: Channel<FusionEventDto>,
+): Promise<SubscriptionCreated> {
+  return invoke<SubscriptionCreated>("subscribe_fusion_tags", {
+    tagIds,
+    updateRateMs,
+    channel,
+  });
+}
+
+export async function unsubscribeFusionTags(subId: number): Promise<void> {
+  return invoke<void>("unsubscribe_fusion_tags", { subId });
 }
 
 // ── browse_children: lazy single-level namespace browse (tree browser) ──
