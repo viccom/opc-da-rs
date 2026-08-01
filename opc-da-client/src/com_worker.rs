@@ -2463,7 +2463,7 @@ impl<C: ServerConnector + 'static> Drop for ComWorker<C> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(
         clippy::single_char_pattern,
         clippy::cast_possible_wrap,
@@ -2490,7 +2490,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
     #[derive(Default)]
-    struct MockState {
+    pub struct MockState {
         connect_count: AtomicUsize,
         should_fail_connect: AtomicBool,
         should_fail_write: AtomicBool,
@@ -2518,7 +2518,7 @@ mod tests {
         should_fail_add_items: AtomicBool,
         /// Counts `remove_group` calls so a test can assert a subscribe failure cleans up its
         /// freshly-added group instead of leaking it (P0-1 review fix ①).
-        remove_group_count: AtomicUsize,
+        pub remove_group_count: AtomicUsize,
         /// P0-1 增强：前 N 次 `advise_data_callback` 返回 `0x800706BA`（RPC server unavailable），
         /// 模拟死代理（server 进程死），驱动 rebuild 的重连路径测试。每次失败 dec；到 0 走正常 advise。
         advise_fail_remaining: AtomicUsize,
@@ -2530,11 +2530,18 @@ mod tests {
         last_browse_position: std::sync::Mutex<String>,
     }
 
-    struct ConfigurableMockConnector {
+    pub struct ConfigurableMockConnector {
         state: Arc<MockState>,
     }
 
-    struct ConfigurableMockServer {
+    impl ConfigurableMockConnector {
+        /// 测试构造：供 fusion_reader 等同 crate 测试复用本 mock。
+        pub fn new(state: Arc<MockState>) -> Self {
+            Self { state }
+        }
+    }
+
+    pub struct ConfigurableMockServer {
         state: Arc<MockState>,
     }
 
@@ -2602,7 +2609,7 @@ mod tests {
         }
     }
 
-    struct ConfigurableMockGroup {
+    pub struct ConfigurableMockGroup {
         state: Arc<MockState>,
     }
 

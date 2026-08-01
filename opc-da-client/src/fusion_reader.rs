@@ -39,6 +39,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::backend::connector::ServerConnector;
 use crate::opc_da::errors::{OpcError, OpcResult};
 use crate::{
     AuthCredentials, ComConnector, OpcDaClient, OpcProvider, SubscriptionHandle, TagValue,
@@ -162,24 +163,24 @@ impl Drop for FusionReader {
 /// （数分钟）。若 client 在 tokio runtime 线程上 drop，`ComWorker::drop::join()` 会
 /// 阻塞该 runtime 线程：单线程 runtime（current_thread）整体冻结，多线程 runtime
 /// 损失一个 worker。这里把真正的释放移到专用清理线程，堵清理线程而非 runtime。
-struct DetachingClient {
-    inner: ManuallyDrop<OpcDaClient<ComConnector>>,
+struct DetachingClient<C: ServerConnector + 'static> {
+    inner: ManuallyDrop<OpcDaClient<C>>,
 }
 
-impl DetachingClient {
-    fn new(client: OpcDaClient<ComConnector>) -> Self {
+impl<C: ServerConnector> DetachingClient<C> {
+    fn new(client: OpcDaClient<C>) -> Self {
         Self {
             inner: ManuallyDrop::new(client),
         }
     }
 
     /// 被包装 client 的引用（`OpcProvider` 方法均为 `&self`，无需可变访问）。
-    fn client(&self) -> &OpcDaClient<ComConnector> {
+    fn client(&self) -> &OpcDaClient<C> {
         &self.inner
     }
 }
 
-impl Drop for DetachingClient {
+impl<C: ServerConnector + 'static> Drop for DetachingClient<C> {
     fn drop(&mut self) {
         // SAFETY: `inner` 由 ManuallyDrop 持有，仅在此 take 一次；take 后结构体即被
         // 丢弃，不会再访问 `inner`，故无 double-drop。
@@ -192,7 +193,10 @@ impl Drop for DetachingClient {
     }
 }
 
-fn build_client(host: &str, creds: Option<AuthCredentials>) -> OpcResult<DetachingClient> {
+fn build_client(
+    host: &str,
+    creds: Option<AuthCredentials>,
+) -> OpcResult<DetachingClient<ComConnector>> {
     let client = match creds {
         Some(c) => OpcDaClient::with_credentials(host, c),
         None => OpcDaClient::new(ComConnector::new(host)),
@@ -202,9 +206,9 @@ fn build_client(host: &str, creds: Option<AuthCredentials>) -> OpcResult<Detachi
 
 /// 后台 task：维护订阅/同步模式，向 `tx` 发事件。`rx` 关闭（上层 drop 接收端）时退出。
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn run_fusion(
-    sub_client: DetachingClient,
-    read_client: DetachingClient,
+async fn run_fusion<C: ServerConnector + 'static>(
+    sub_client: DetachingClient<C>,
+    read_client: DetachingClient<C>,
     server: String,
     tags: Vec<String>,
     update_rate: u32,
@@ -331,5 +335,60 @@ async fn run_fusion(
     if let Some(c) = cookie {
         // 显式退订；超时放弃（server 端 lease 兜底回收），避免卡住清理线程。
         let _ = tokio::time::timeout(UNSUB_TIMEOUT, sub_client.client().unsubscribe(c)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::com_worker::tests::{ConfigurableMockConnector, MockState};
+
+    /// 意图：FusionReader 拆除（shutdown）必须显式退订 server 端订阅 group，不能靠 lease
+    /// 延迟回收。`ConfigurableMockServer` 的 `remove_group_count` 记录 group 移除次数——
+    /// 若改回 abort（跳过退订），此断言会失败。
+    #[tokio::test]
+    async fn shutdown_unsubscribes_server_group() {
+        let state = Arc::new(MockState::default());
+        let make_client = || {
+            DetachingClient::new(
+                OpcDaClient::new(ConfigurableMockConnector::new(state.clone())).unwrap(),
+            )
+        };
+        let (tx, mut rx) = mpsc::channel(256);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let handle = tokio::spawn(run_fusion(
+            make_client(),
+            make_client(),
+            "Mock.Server.1".to_string(),
+            vec!["Random.Real4".to_string()],
+            100,
+            Duration::from_millis(100),
+            tx,
+            shutdown.clone(),
+        ));
+
+        // 等 subscribe 完成（mock 走 in-process channel，秒级）。
+        let mut subscribed = false;
+        let _ = tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some(ev) = rx.recv().await {
+                if matches!(ev, FusionEvent::Subscribed) {
+                    subscribed = true;
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(subscribed, "subscribe 应在 mock 上成功并发出 Subscribed");
+
+        // 触发优雅退出。
+        shutdown.store(true, Ordering::Relaxed);
+
+        // 等 task 退出（unsubscribe 经 worker channel）。
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+
+        assert!(
+            state.remove_group_count.load(Ordering::Relaxed) > 0,
+            "shutdown 后应显式退订 server 端 group（remove_group_count > 0）"
+        );
     }
 }

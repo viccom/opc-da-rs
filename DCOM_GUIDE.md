@@ -360,12 +360,16 @@ while let Some(ev) = rx.recv().await {
         FusionEvent::Fallback(e) => { /* 切同步兜底，原因 e */ }
     }
 }
-// Drop reader → 取消后台 task、释放订阅
+// Drop reader → 优雅退出后台 task、显式退订订阅（不阻塞 runtime）
 ```
 
 内部用独立 `sub_client` + `read_client`（各自 COM worker），避免订阅失败/超时阻塞兜底
 读取。事件流 `FusionEvent` 单 channel；`Data` 在 channel 满时丢最旧值，`Subscribed`/`Fallback`
-阻塞必达。详见 [`docs/superpowers/specs/2026-08-01-fusion-reader-design.md`](./docs/superpowers/specs/2026-08-01-fusion-reader-design.md)。
+阻塞必达。
+
+**Drop 行为**：发 shutdown 信号让后台 task 优雅退出，显式退订 server 端订阅（不靠 lease
+延迟回收）；client 在独立 OS 线程释放，`ComWorker::join` 不阻塞 tokio runtime 线程。详见
+[`docs/superpowers/specs/2026-08-01-fusion-reader-design.md`](./docs/superpowers/specs/2026-08-01-fusion-reader-design.md)。
 
 ## 6. 现场调试实操
 
