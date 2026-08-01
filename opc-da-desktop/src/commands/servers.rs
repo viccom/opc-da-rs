@@ -24,6 +24,10 @@ use crate::state::AppState;
 pub struct ServerInfo {
     /// ProgID / programmatic identifier (the canonical key).
     pub prog_id: String,
+    /// CLSID（GUID 字符串）。
+    pub clsid: String,
+    /// 用户类型 / 描述（厂商 + 产品名）；server 未提供则为 `None`。
+    pub user_type: Option<String>,
 }
 
 /// Enumerate OPC DA servers reachable on the given host.
@@ -36,10 +40,14 @@ pub async fn list_servers(
     host: String,
 ) -> DesktopResult<Vec<ServerInfo>> {
     let client = state.client().await;
-    let prog_ids = client.list_servers(&host).await?;
-    Ok(prog_ids
+    let servers = client.list_servers_with_details(&host).await?;
+    Ok(servers
         .into_iter()
-        .map(|p| ServerInfo { prog_id: p })
+        .map(|s| ServerInfo {
+            prog_id: s.prog_id,
+            clsid: s.clsid,
+            user_type: s.user_type,
+        })
         .collect())
 }
 

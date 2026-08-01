@@ -41,6 +41,25 @@ pub trait ServerConnector: Send + Sync {
     /// `ComConnector` currently enumerates locally regardless of `host`).
     fn enumerate_servers(&self, host: &str) -> OpcResult<Vec<String>>;
 
+    /// Enumerate OPC DA servers with details (CLSID + user_type description).
+    ///
+    /// 默认实现退化为 prog_id only（clsid 空、user_type None）。`ComConnector` override
+    /// 调 `IOPCServerList::GetClassDetails` 填充富信息。
+    ///
+    /// # Errors
+    /// 同 [`enumerate_servers`](Self::enumerate_servers)。
+    fn enumerate_servers_with_details(&self, host: &str) -> OpcResult<Vec<crate::ServerDesc>> {
+        Ok(self
+            .enumerate_servers(host)?
+            .into_iter()
+            .map(|prog_id| crate::ServerDesc {
+                prog_id,
+                clsid: String::new(),
+                user_type: None,
+            })
+            .collect())
+    }
+
     /// Connect to the named OPC DA server and return a server facade.
     ///
     /// # Errors
@@ -398,6 +417,114 @@ impl ServerConnector for ComConnector {
         }
         servers.sort();
         servers.dedup();
+        Ok(servers)
+    }
+
+    /// 富信息枚举：持 `IOPCServerList`，每个 CLSID 调 `GetClassDetails` 取 ProgID +
+    /// UserType 描述。GetClassDetails 失败时退化为 `guid_to_progid`（prog_id only）。
+    fn enumerate_servers_with_details(&self, host: &str) -> OpcResult<Vec<crate::ServerDesc>> {
+        let client = crate::opc_da::client::v2::Client;
+        let auth_info = self.credentials.as_ref().map_or_else(
+            crate::opc_da::typedefs::AuthInfo::default_dcom,
+            crate::opc_da::typedefs::AuthCredentials::to_auth_info,
+        );
+        let server_info = crate::opc_da::typedefs::ServerInfo {
+            name: host.to_string(),
+            auth_info,
+        };
+        let server_list = client.create_server_list(Some(server_info)).map_err(|e| {
+            tracing::warn!(error = ?e, host = %host, "IOPCServerList creation failed");
+            e
+        })?;
+
+        let versions = [crate::opc_da::client::v2::Client::CATALOG_ID];
+        // SAFETY: EnumClassesOfCategories 按 OPC DA CATID 枚举 server CLSID。
+        let iter = unsafe {
+            server_list
+                .EnumClassesOfCategories(&versions, &versions)
+                .map_err(|e| {
+                    windows::core::Error::new(e.code(), "Failed to enumerate server classes")
+                })?
+        };
+        let guid_iter = crate::opc_da::client::GuidIterator::new(iter);
+
+        let mut servers: Vec<crate::ServerDesc> = Vec::new();
+        for guid in guid_iter.flatten() {
+            // SAFETY: `crate::opc_da::GUID` 与 `windows::core::GUID` 布局一致
+            //（const_assert_eq! in client/iterator.rs）。
+            let win_guid: windows::core::GUID = unsafe { std::mem::transmute_copy(&guid) };
+            if win_guid == windows::core::GUID::zeroed() {
+                continue;
+            }
+            // windows 0.61 的 GUID 未 impl Display，手动格式化标准 CLSID 字符串。
+            let clsid = format!(
+                "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                win_guid.data1,
+                win_guid.data2,
+                win_guid.data3,
+                win_guid.data4[0],
+                win_guid.data4[1],
+                win_guid.data4[2],
+                win_guid.data4[3],
+                win_guid.data4[4],
+                win_guid.data4[5],
+                win_guid.data4[6],
+                win_guid.data4[7],
+            );
+
+            // GetClassDetails → ProgID + UserType（2 个 PWSTR，COM allocator 分配，用完释放）。
+            let mut progid_ptr = windows::core::PWSTR::null();
+            let mut usertype_ptr = windows::core::PWSTR::null();
+            // SAFETY: `win_guid` 是有效 CLSID（枚举所得）；`progid_ptr`/`usertype_ptr`
+            // 是本地 PWSTR（null 初始化），GetClassDetails 用 COM allocator 写入。
+            let details_ok = unsafe {
+                server_list
+                    .GetClassDetails(
+                        &raw const win_guid,
+                        &raw mut progid_ptr,
+                        &raw mut usertype_ptr,
+                    )
+                    .is_ok()
+            };
+            let (prog_id, user_type) = if details_ok {
+                // SAFETY: 两 PWSTR 由 GetClassDetails 用 COM allocator 分配；`to_string`
+                // 读取（unsafe，读 null-terminated wide string）后 CoTaskMemFree 释放。
+                unsafe {
+                    let prog = progid_ptr.to_string().unwrap_or_default();
+                    let user = usertype_ptr.to_string().unwrap_or_default();
+                    if !progid_ptr.is_null() {
+                        windows::Win32::System::Com::CoTaskMemFree(Some(
+                            progid_ptr.as_ptr().cast(),
+                        ));
+                    }
+                    if !usertype_ptr.is_null() {
+                        windows::Win32::System::Com::CoTaskMemFree(Some(
+                            usertype_ptr.as_ptr().cast(),
+                        ));
+                    }
+                    (prog, user)
+                }
+            } else {
+                // GetClassDetails 失败 → 退化为 guid_to_progid（prog_id only）。
+                let prog = crate::helpers::guid_to_progid(&win_guid).unwrap_or_default();
+                (prog, String::new())
+            };
+
+            if prog_id.is_empty() {
+                continue;
+            }
+            servers.push(crate::ServerDesc {
+                prog_id,
+                clsid,
+                user_type: if user_type.is_empty() {
+                    None
+                } else {
+                    Some(user_type)
+                },
+            });
+        }
+        servers.sort_by(|a, b| a.prog_id.cmp(&b.prog_id));
+        servers.dedup_by(|a, b| a.prog_id == b.prog_id);
         Ok(servers)
     }
 

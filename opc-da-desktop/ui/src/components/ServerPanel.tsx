@@ -95,8 +95,9 @@ export function ServerPanel() {
             {servers.length === 0 ? "(no servers)" : "— pick one —"}
           </option>
           {servers.map((s) => (
-            <option key={s.prog_id} value={s.prog_id}>
+            <option key={s.prog_id} value={s.prog_id} title={s.clsid}>
               {s.prog_id}
+              {s.user_type ? ` — ${s.user_type}` : ""}
             </option>
           ))}
         </select>

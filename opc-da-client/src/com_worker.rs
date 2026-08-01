@@ -12,8 +12,8 @@ use crate::opc_da::errors::{OpcError, OpcResult};
 use crate::opc_da::typedefs::ServerStatus;
 use crate::opc_da::typedefs::{GroupHandle, ItemHandle};
 use crate::provider::{
-    BranchNode, BrowseChildren, LeafNode, OpcValue, ShutdownHandle, SubscriptionHandle, TagValue,
-    WriteResult,
+    BranchNode, BrowseChildren, LeafNode, OpcValue, ServerDesc, ShutdownHandle, SubscriptionHandle,
+    TagValue, WriteResult,
 };
 use crate::subscription::{DataCallbackSink, ShutdownSink};
 use std::collections::HashMap;
@@ -38,6 +38,13 @@ pub enum ComRequest {
         host: String,
         /// One-shot channel to send back the server enumeration result.
         reply: oneshot::Sender<OpcResult<Vec<String>>>,
+    },
+    /// Request to enumerate servers with details (CLSID + user_type description).
+    ListServersWithDetails {
+        /// Hostname or IP address to target.
+        host: String,
+        /// One-shot channel to send back the detailed server enumeration result.
+        reply: oneshot::Sender<OpcResult<Vec<ServerDesc>>>,
     },
     /// Request to read current values, quality, and timestamps for tag IDs.
     ReadTagValues {
@@ -586,6 +593,29 @@ impl<C: ServerConnector + 'static> ComWorker<C> {
                                     error = ?e,
                                     elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                                     "list_servers failed"
+                                );
+                            }
+                            let _ = reply.send(servers);
+                        }
+                        ComRequest::ListServersWithDetails { host, reply } => {
+                            let span =
+                                tracing::info_span!("opc.list_servers_with_details", host = %host);
+                            let _enter = span.enter();
+                            let start = std::time::Instant::now();
+                            let servers = connector.enumerate_servers_with_details(&host);
+                            if let Ok(s) = &servers {
+                                tracing::info!(
+                                    count = s.len(),
+                                    elapsed_ms = u64::try_from(start.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    "list_servers_with_details completed"
+                                );
+                            } else if let Err(e) = &servers {
+                                tracing::error!(
+                                    error = ?e,
+                                    elapsed_ms = u64::try_from(start.elapsed().as_millis())
+                                        .unwrap_or(u64::MAX),
+                                    "list_servers_with_details failed"
                                 );
                             }
                             let _ = reply.send(servers);

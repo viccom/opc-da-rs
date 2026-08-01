@@ -3,8 +3,8 @@ use crate::com_worker::{ComRequest, ComWorker};
 use crate::opc_da::errors::OpcResult;
 use crate::opc_da::typedefs::ServerStatus;
 use crate::provider::{
-    BrowseChildren, ItemProperty, OpcProvider, OpcValue, ShutdownHandle, SubscriptionHandle,
-    TagValue, WriteResult,
+    BrowseChildren, ItemProperty, OpcProvider, OpcValue, ServerDesc, ShutdownHandle,
+    SubscriptionHandle, TagValue, WriteResult,
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -95,6 +95,16 @@ impl<C: ServerConnector + 'static> OpcProvider for OpcDaClient<C> {
         let host_owned = host.to_string();
         self.worker
             .send_request(|reply| ComRequest::ListServers {
+                host: host_owned,
+                reply,
+            })
+            .await
+    }
+
+    async fn list_servers_with_details(&self, host: &str) -> OpcResult<Vec<ServerDesc>> {
+        let host_owned = host.to_string();
+        self.worker
+            .send_request(|reply| ComRequest::ListServersWithDetails {
                 host: host_owned,
                 reply,
             })

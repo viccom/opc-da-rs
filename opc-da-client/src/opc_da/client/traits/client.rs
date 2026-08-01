@@ -17,13 +17,18 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
     /// # Returns
     ///
     /// A `Result` containing a `GuidIterator` over server GUIDs, or an error if the operation fails.
-    fn get_servers(&self, server_info: Option<ServerInfo>) -> OpcResult<GuidIterator> {
+    /// Create the `IOPCServerList` enumerator (local or remote DCOM). 提取自
+    /// `get_servers` 供富信息枚举复用——`get_servers` 拿到 `GuidIterator` 后
+    /// `IOPCServerList` 即 drop，而 `GetClassDetails` 需要持有 `IOPCServerList`。
+    fn create_server_list(
+        &self,
+        server_info: Option<ServerInfo>,
+    ) -> OpcResult<crate::bindings::comn::IOPCServerList> {
         tracing::debug!("Enumerating OPC DA Server classes via COM Component Categories Manager");
         let id = unsafe {
             windows::Win32::System::Com::CLSIDFromProgID(windows::core::w!("OPC.ServerList.1"))?
         };
-
-        let servers: crate::bindings::comn::IOPCServerList = match server_info {
+        let servers = match server_info {
             // 非空 name（含 "localhost"）→ DCOM 路径；空 name/None → 本地 CoCreateInstance。
             // localhost 走 DCOM 绕过本地 in-proc 尝试，与 helpers::is_remote_host 一致。
             Some(info) if !info.name.is_empty() => {
@@ -72,9 +77,17 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
                 )?
             },
         };
+        Ok(servers)
+    }
 
+    /// Retrieves an iterator over available server GUIDs.
+    ///
+    /// # Returns
+    ///
+    /// A `Result` containing a `GuidIterator` over server GUIDs, or an error if the operation fails.
+    fn get_servers(&self, server_info: Option<ServerInfo>) -> OpcResult<GuidIterator> {
+        let servers = self.create_server_list(server_info)?;
         let versions = [Self::CATALOG_ID];
-
         let iter = unsafe {
             servers
                 .EnumClassesOfCategories(&versions, &versions)
@@ -82,7 +95,6 @@ pub trait ClientTrait<Server: TryFrom<windows::core::IUnknown, Error = windows::
                     windows::core::Error::new(e.code(), "Failed to enumerate server classes")
                 })?
         };
-
         Ok(GuidIterator::new(iter))
     }
 

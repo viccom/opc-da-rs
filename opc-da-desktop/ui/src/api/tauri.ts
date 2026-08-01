@@ -11,6 +11,10 @@ import { invoke, Channel } from "@tauri-apps/api/core";
 /** A server returned by `list_servers`. */
 export interface ServerInfo {
   prog_id: string;
+  /** CLSID（GUID 字符串）。 */
+  clsid: string;
+  /** 用户类型 / 描述；server 未提供则为 null。 */
+  user_type: string | null;
 }
 
 /** One leaf tag from `browse_tags`. */

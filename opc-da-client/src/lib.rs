@@ -75,8 +75,8 @@ mod subscription;
 pub use helpers::{format_hresult, friendly_com_hint};
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
 pub use provider::{
-    BranchNode, BrowseChildren, ItemProperty, LeafNode, OpcProvider, OpcValue, ShutdownHandle,
-    SubscriptionHandle, TagValue, WriteResult,
+    BranchNode, BrowseChildren, ItemProperty, LeafNode, OpcProvider, OpcValue, ServerDesc,
+    ShutdownHandle, SubscriptionHandle, TagValue, WriteResult,
 };
 
 // Backend re-exports (conditional)

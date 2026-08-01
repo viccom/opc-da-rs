@@ -166,6 +166,19 @@ pub struct ShutdownHandle {
     pub rx: tokio::sync::mpsc::Receiver<String>,
 }
 
+/// 一个 OPC DA server 的富信息（[`OpcProvider::list_servers_with_details`] 返回）。
+///
+/// 比 [`OpcProvider::list_servers`]（只 ProgID）多 CLSID + 用户类型描述。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerDesc {
+    /// 版本相关 ProgID（连接 server 用这个，等价于 `list_servers` 返回的 String）。
+    pub prog_id: String,
+    /// CLSID（GUID 字符串，如 `00000000-0000-0000-0000-000000000000`）。
+    pub clsid: String,
+    /// 用户类型 / 描述（厂商 + 产品名）；server 未提供则为 `None`。
+    pub user_type: Option<String>,
+}
+
 /// Async trait for OPC DA operations.
 ///
 /// This is the stable public API. Backend implementations provide
@@ -179,6 +192,27 @@ pub trait OpcProvider: Send + Sync {
     /// Returns `Err` if COM initialization fails or the server registry
     /// cannot be enumerated.
     async fn list_servers(&self, host: &str) -> OpcResult<Vec<String>>;
+
+    /// List servers with details (CLSID + user_type description).
+    ///
+    /// 默认实现退化为 prog_id only（clsid 空、user_type None）——只 impl
+    /// [`list_servers`](Self::list_servers) 的简单后端自动兼容。`OpcDaClient` override
+    /// 调 `IOPCServerList::GetClassDetails` 填充富信息。
+    ///
+    /// # Errors
+    /// 同 [`list_servers`](Self::list_servers)。
+    async fn list_servers_with_details(&self, host: &str) -> OpcResult<Vec<ServerDesc>> {
+        Ok(self
+            .list_servers(host)
+            .await?
+            .into_iter()
+            .map(|prog_id| ServerDesc {
+                prog_id,
+                clsid: String::new(),
+                user_type: None,
+            })
+            .collect())
+    }
 
     /// Browse tags recursively, pushing discoveries to `tags_sink`.
     ///
