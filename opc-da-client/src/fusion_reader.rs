@@ -32,6 +32,8 @@
 //! ```
 
 use std::mem::ManuallyDrop;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -45,6 +47,14 @@ use crate::{
 /// 远程订阅反向回调不通时，server 端 Advise 会长时间 RPC 超时，必须截断。经验值：
 /// 太短会误判正常订阅，太长会阻塞首次兜底（8s 覆盖绝大多数正常 Advise 往返）。
 const SUBSCRIBE_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// 同步兜底读取的单次超时。read 正常 <1s；超时说明 worker 卡在 RPC，放弃本次（下一轮
+/// check shutdown 后退出），避免 task 永远卡在 read 上无法响应拆除。
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 退出时显式退订 cookie 的超时。unadvise 正常 <1s；超时放弃，退而靠 server lease 回收，
+/// 不让退订卡住清理线程。
+const UNSUB_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 融合读取事件。
 #[derive(Debug)]
@@ -84,6 +94,7 @@ impl Default for FusionReaderOptions {
 /// Drop 时取消后台 task 并释放订阅。
 pub struct FusionReader {
     task: Option<JoinHandle<()>>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl FusionReader {
@@ -109,6 +120,8 @@ impl FusionReader {
         let fallback_timeout = opts.fallback_timeout;
         let (tx, rx) = mpsc::channel(opts.buffer);
         let server_owned = server.to_string();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
         let task = tokio::spawn(async move {
             run_fusion(
                 sub_client,
@@ -118,18 +131,28 @@ impl FusionReader {
                 update_rate,
                 fallback_timeout,
                 tx,
+                shutdown_clone,
             )
             .await;
         });
-        Ok((Self { task: Some(task) }, rx))
+        Ok((
+            Self {
+                task: Some(task),
+                shutdown,
+            },
+            rx,
+        ))
     }
 }
 
 impl Drop for FusionReader {
     fn drop(&mut self) {
-        if let Some(task) = self.task.take() {
-            task.abort();
-        }
+        // 通知 task 优雅退出（走完末尾 unsubscribe），不 abort——避免 abort 跳过 server 端
+        // 显式退订（group 只能靠 lease 延迟回收）。task 各 await 均有 timeout 兜底，几秒内退出。
+        self.shutdown.store(true, Ordering::Relaxed);
+        // detach：不 join 也不 abort。task 在后台自行退出，client 由 DetachingClient 移到
+        // 清理线程释放。JoinHandle drop 不会 cancel task。
+        self.task.take();
     }
 }
 
@@ -178,7 +201,7 @@ fn build_client(host: &str, creds: Option<AuthCredentials>) -> OpcResult<Detachi
 }
 
 /// 后台 task：维护订阅/同步模式，向 `tx` 发事件。`rx` 关闭（上层 drop 接收端）时退出。
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_fusion(
     sub_client: DetachingClient,
     read_client: DetachingClient,
@@ -187,6 +210,7 @@ async fn run_fusion(
     update_rate: u32,
     fallback_timeout: Duration,
     tx: mpsc::Sender<FusionEvent>,
+    shutdown: Arc<AtomicBool>,
 ) {
     let mut mode_subscribe;
     let (mut rx_sub, mut errors, cookie) = match tokio::time::timeout(
@@ -224,7 +248,7 @@ async fn run_fusion(
 
     let mut last_data = Instant::now();
     loop {
-        if tx.is_closed() {
+        if shutdown.load(Ordering::Relaxed) || tx.is_closed() {
             break;
         }
         if mode_subscribe {
@@ -277,18 +301,27 @@ async fn run_fusion(
                 }
             }
         } else {
-            match read_client
-                .client()
-                .read_tag_values(&server, tags.clone())
-                .await
+            match tokio::time::timeout(
+                READ_TIMEOUT,
+                read_client.client().read_tag_values(&server, tags.clone()),
+            )
+            .await
             {
-                Ok(vs) => {
+                Ok(Ok(vs)) => {
                     for tv in vs {
                         let _ = tx.try_send(FusionEvent::Data(tv));
                     }
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     let _ = tx.send(FusionEvent::Fallback(e)).await;
+                }
+                Err(_) => {
+                    let _ = tx
+                        .send(FusionEvent::Fallback(OpcError::Connection(format!(
+                            "read 超时 {}s",
+                            READ_TIMEOUT.as_secs()
+                        ))))
+                        .await;
                 }
             }
             tokio::time::sleep(Duration::from_millis(u64::from(update_rate))).await;
@@ -296,6 +329,7 @@ async fn run_fusion(
     }
 
     if let Some(c) = cookie {
-        let _ = sub_client.client().unsubscribe(c).await;
+        // 显式退订；超时放弃（server 端 lease 兜底回收），避免卡住清理线程。
+        let _ = tokio::time::timeout(UNSUB_TIMEOUT, sub_client.client().unsubscribe(c)).await;
     }
 }
