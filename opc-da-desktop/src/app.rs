@@ -27,6 +27,7 @@ pub fn run() {
             crate::commands::servers::connect,
             crate::commands::servers::disconnect,
             crate::commands::servers::set_host,
+            crate::commands::servers::get_server_status,
             crate::commands::browse::browse_tags,
             crate::commands::browse::browse_children,
             crate::commands::read::read_tag_values,

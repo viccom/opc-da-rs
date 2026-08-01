@@ -57,6 +57,22 @@ export async function listServers(host: string): Promise<ServerInfo[]> {
   return invoke<ServerInfo[]>("list_servers", { host });
 }
 
+/** Server runtime status from `IOPCServer::GetStatus`（连接后可查）。 */
+export interface ServerStatus {
+  server_state: string;
+  start_time: string;
+  current_time: string;
+  last_update_time: string;
+  group_count: number;
+  band_width: number;
+  version: string;
+  vendor_info: string;
+}
+
+export async function getServerStatus(): Promise<ServerStatus> {
+  return invoke<ServerStatus>("get_server_status");
+}
+
 export async function connect(progId: string): Promise<void> {
   return invoke<void>("connect", { progId });
 }

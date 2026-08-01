@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
-use opc_da_client::{AuthCredentials, OpcProvider};
+use opc_da_client::{AuthCredentials, OpcProvider, ServerStatus};
 
 use crate::error::DesktopResult;
 use crate::state::AppState;
@@ -91,4 +91,58 @@ pub async fn set_host(
     });
     state.rebuild_client(&host, creds).await?;
     Ok(())
+}
+
+/// `IOPCServer::GetStatus` 返回的运行时状态（连接后可查）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerStatusDto {
+    /// Server 运行状态（Running / Failed / Suspended / ...）。
+    pub server_state: String,
+    /// Server 启动时间（本地）。
+    pub start_time: String,
+    /// Server 当前时间（本地）。
+    pub current_time: String,
+    /// 最后数据更新时间（本地）。
+    pub last_update_time: String,
+    /// 当前 group 数。
+    pub group_count: u32,
+    /// 带宽利用率（-1 表示无限制/不支持）。
+    pub band_width: i32,
+    /// 版本字符串（major.minor Build build）。
+    pub version: String,
+    /// 厂商信息。
+    pub vendor_info: String,
+}
+
+impl From<ServerStatus> for ServerStatusDto {
+    #[allow(clippy::cast_possible_wrap)] // OPC band_width: u32 的 -1（无限）按约定 wrap 成 i32
+    fn from(s: ServerStatus) -> Self {
+        let fmt = |t: std::time::SystemTime| {
+            chrono::DateTime::<chrono::Local>::from(t)
+                .format("%Y/%m/%d %H:%M:%S")
+                .to_string()
+        };
+        Self {
+            server_state: format!("{:?}", s.server_state),
+            start_time: fmt(s.start_time),
+            current_time: fmt(s.current_time),
+            last_update_time: fmt(s.last_update_time),
+            group_count: s.group_count,
+            band_width: s.band_width as i32,
+            version: format!(
+                "{}.{} Build {}",
+                s.major_version, s.minor_version, s.build_number
+            ),
+            vendor_info: s.vendor_info,
+        }
+    }
+}
+
+/// Query the connected server's runtime status (state / times / version / vendor).
+#[tauri::command]
+pub async fn get_server_status(state: State<'_, AppState>) -> DesktopResult<ServerStatusDto> {
+    let client = state.client().await;
+    let prog_id = state.prog_id().await?;
+    let status = client.get_server_status(&prog_id).await?;
+    Ok(ServerStatusDto::from(status))
 }
