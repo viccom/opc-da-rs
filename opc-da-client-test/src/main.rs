@@ -11,13 +11,17 @@
 //! 2. server EXE 在 `target/{debug,release}/opc-da-server.exe`（SCM 按注册的
 //!    `LocalServer32` 路径拉起）。
 //!
-//! # 当前覆盖（M1）
+//! # 当前覆盖（M3）
 //!
 //! - `get_server_status`（`IOPCServer::GetStatus`）。
+//! - `read_tag_values`（AddGroup + AddItems + `IOPCSyncIO::Read`）——读 `Random.Int4`，
+//!   断言 quality=Good + 值在 read-time 产生器范围 0..=100。
+//! - `write_tag_value`（`IOPCSyncIO::Write`）——写 `Bucket Brigade.Int4=42`。
+//! - read round-trip——读回 `Bucket Brigade.Int4` 应为 42（Write+Read 闭环）。
 //!
-//! 后续 milestone 逐步追加 list / browse / add_group / read / write / subscribe。
+//! 后续 milestone 追加 browse / subscribe / item_properties / list_servers。
 
-use opc_da_client::{ComConnector, OpcDaClient, OpcProvider};
+use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, OpcValue};
 
 /// 自建 server 的 ProgID（`opc-da-server/src/bin/opc-da-server.rs` /RegServer 注册）。
 const PROG_ID: &str = "opc-da-rs.Server.1";
@@ -29,9 +33,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ComConnector::default() = localhost；OpcDaClient 内部 worker 线程做 CoInitializeEx(MTA)。
     let client = OpcDaClient::new(ComConnector::default())?;
-    let (mut passed, mut failed, mut pending) = (0u32, 0u32, 0u32);
+    let (mut passed, mut failed) = (0u32, 0u32);
 
-    // IOPCServer::GetStatus（server 阶段 0 已实装）。
+    // 1. IOPCServer::GetStatus（server 阶段 0 已实装）。
     match client.get_server_status(PROG_ID).await {
         Ok(status) => {
             println!("✓ get_server_status: {status:?}");
@@ -43,32 +47,88 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // read_tag_values（触发 AddGroup[M2] + AddItems[M1] + IOPCSyncIO::Read[M3]）。
-    // M2 预期：AddGroup + AddItems 端到端通，Read 仍 E_NOTIMPL——错误若为 Read 阶段
-    // 即证明 AddGroup 链路打通（M3 实装 Read 后整条 read 通）。
+    // 2. read Random.Int4（AddGroup[M2] + AddItems[M1] + IOPCSyncIO::Read[M3]）。
+    //    read-time 产生器返回 0..=100 的 VT_I4 + GOOD quality。
     match client
         .read_tag_values(PROG_ID, vec!["Random.Int4".to_string()])
         .await
     {
-        Ok(vals) => {
-            println!("✓ read_tag_values (Random.Int4): {vals:?}");
-            passed += 1;
-        }
-        Err(e) => {
-            // E_NOTIMPL (0x80004001) = server 接口尚未实装（当前 Read 待 M3），算 pending
-            // 而非 fail——证明前置的 AddGroup + AddItems 链路已通（否则错误会更早）。
-            let msg = format!("{e}");
-            if msg.contains("0x80004001") {
-                println!("⊘ read_tag_values (Random.Int4): pending (Read 待 M3) — {e}");
-                pending += 1;
-            } else {
-                println!("✗ read_tag_values (Random.Int4): {e}");
+        Ok(vals) => match vals.first() {
+            Some(tv) => {
+                let v: i32 = tv.value.parse().unwrap_or(-1);
+                if tv.quality == "Good" && (0..=100).contains(&v) {
+                    println!(
+                        "✓ read Random.Int4: value={v} quality={} [M3 Read 通]",
+                        tv.quality
+                    );
+                    passed += 1;
+                } else {
+                    println!(
+                        "✗ read Random.Int4: value={} quality={} (期望 Good + 0..=100)",
+                        tv.value, tv.quality
+                    );
+                    failed += 1;
+                }
+            }
+            None => {
+                println!("✗ read Random.Int4: 返回空结果");
                 failed += 1;
             }
+        },
+        Err(e) => {
+            println!("✗ read Random.Int4: {e}");
+            failed += 1;
         }
     }
 
-    println!("\n=== 汇总: {passed} passed, {pending} pending, {failed} failed ===");
+    // 3. write Bucket Brigade.Int4 = 42（AddGroup + AddItems + IOPCSyncIO::Write[M3]）。
+    match client
+        .write_tag_value(PROG_ID, "Bucket Brigade.Int4", OpcValue::Int(42))
+        .await
+    {
+        Ok(_) => {
+            println!("✓ write Bucket Brigade.Int4=42: Ok [M3 Write 通]");
+            passed += 1;
+        }
+        Err(e) => {
+            println!("✗ write Bucket Brigade.Int4=42: {e}");
+            failed += 1;
+        }
+    }
+
+    // 4. read round-trip：读回 Bucket Brigade.Int4 应为 42（Write+Read 闭环验证）。
+    match client
+        .read_tag_values(PROG_ID, vec!["Bucket Brigade.Int4".to_string()])
+        .await
+    {
+        Ok(vals) => match vals.first() {
+            Some(tv) => {
+                if tv.value == "42" {
+                    println!(
+                        "✓ read round-trip Bucket Brigade.Int4=42: value={} [Write+Read 闭环]",
+                        tv.value
+                    );
+                    passed += 1;
+                } else {
+                    println!(
+                        "✗ read round-trip Bucket Brigade.Int4: value={} (期望 42)",
+                        tv.value
+                    );
+                    failed += 1;
+                }
+            }
+            None => {
+                println!("✗ read round-trip Bucket Brigade.Int4: 返回空结果");
+                failed += 1;
+            }
+        },
+        Err(e) => {
+            println!("✗ read round-trip Bucket Brigade.Int4: {e}");
+            failed += 1;
+        }
+    }
+
+    println!("\n=== 汇总: {passed} passed, {failed} failed ===");
     if failed > 0 {
         anyhow::bail!("{failed} 个接口失败");
     }

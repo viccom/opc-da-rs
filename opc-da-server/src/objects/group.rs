@@ -69,7 +69,7 @@ fn pwstr_to_string(p: PWSTR) -> String {
 }
 
 /// 已注册 item 的服务端记录。
-#[allow(dead_code)] // item_id/data_type 待 IOPCSyncIO::Read 实装读取
+#[allow(dead_code)] // data_type 待 publisher/IOPCItemProperties 用（Read 经 DataSource 按 item_id 取值）
 struct ItemEntry {
     item_id: String,
     h_client: u32,
@@ -407,6 +407,38 @@ fn prealloc_errors(
     Ok(n)
 }
 
+/// `IOPCSyncIO::Read` 前置：校验指针 + 分配 `OPCITEMSTATE[]` 与 `HRESULT[]`
+///（`CoTaskMemAlloc`，所有权交 client）。返回元素数 `n`。
+fn prealloc_item_states(
+    dwcount: u32,
+    phserver: *const u32,
+    ppitemvalues: *mut *mut tagOPCITEMSTATE,
+    pperrors: *mut *mut HRESULT,
+) -> Result<usize> {
+    if dwcount == 0 || phserver.is_null() || ppitemvalues.is_null() || pperrors.is_null() {
+        return Err(Error::from(E_POINTER));
+    }
+    let n = dwcount as usize;
+    // SAFETY: CoTaskMemAlloc 分配 size_of*n 字节；失败返回 null。
+    let values_ptr =
+        unsafe { CoTaskMemAlloc(size_of::<tagOPCITEMSTATE>() * n) }.cast::<tagOPCITEMSTATE>();
+    let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+    if values_ptr.is_null() || errors_ptr.is_null() {
+        // SAFETY: 已分配的释放（可能 null，CoTaskMemFree 容忍 null）。
+        unsafe {
+            CoTaskMemFree(Some(values_ptr.cast()));
+            CoTaskMemFree(Some(errors_ptr.cast()));
+        }
+        return Err(Error::from(E_OUTOFMEMORY));
+    }
+    // SAFETY: 调用方提供的 out 指针，写入分配的数组基址。
+    unsafe {
+        *ppitemvalues = values_ptr;
+        *pperrors = errors_ptr;
+    }
+    Ok(n)
+}
+
 impl IOPCGroupStateMgt_Impl for GroupObj_Impl {
     fn GetState(
         &self,
@@ -448,22 +480,90 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
     fn Read(
         &self,
         _dwsource: tagOPCDATASOURCE,
-        _dwcount: u32,
-        _phserver: *const u32,
-        _ppitemvalues: *mut *mut tagOPCITEMSTATE,
-        _pperrors: *mut *mut HRESULT,
+        dwcount: u32,
+        phserver: *const u32,
+        ppitemvalues: *mut *mut tagOPCITEMSTATE,
+        pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
-        nyi()
+        // dwsource 忽略：SimDataSource 无 cache/device 之分，统一 read-time 现算
+        //（等价 device 读）。真 cache 语义待 publisher 引擎（§10）维护缓存后区分。
+        let n = prealloc_item_states(dwcount, phserver, ppitemvalues, pperrors)?;
+        // 锁内取每个 handle 对应的 (hClient, item_id)；未知 handle 记 None。
+        // 短持锁：仅查表 clone，DataSource::read 在锁外执行（避免长持锁期间做 IO）。
+        let lookups: Vec<(u32, Option<String>)> = {
+            let inner = locked(&self.inner);
+            (0..n)
+                .map(|i| {
+                    // SAFETY: phserver 含 dwcount 个 u32（调用方保证）；i < n。
+                    let h = unsafe { *phserver.add(i) };
+                    let entry = inner.items.get(&h);
+                    (
+                        entry.map_or(0, |e| e.h_client),
+                        entry.map(|e| e.item_id.clone()),
+                    )
+                })
+                .collect()
+        };
+        for (i, (h_client, maybe_id)) in lookups.into_iter().enumerate() {
+            // SAFETY: ppitemvalues / pperrors 各含 n 个槽（prealloc 分配）；i < n。
+            // 直接赋值覆盖未初始化槽（move VARIANT 进去，不 drop 旧值——裸内存）。
+            unsafe {
+                match maybe_id {
+                    Some(item_id) => {
+                        let (v, q, ts) = self.data_source.read(&item_id);
+                        *(*ppitemvalues).add(i) = tagOPCITEMSTATE {
+                            hClient: h_client,
+                            ftTimeStamp: ts,
+                            wQuality: q,
+                            wReserved: 0,
+                            vDataValue: v,
+                        };
+                        *(*pperrors).add(i) = S_OK;
+                    }
+                    None => {
+                        // 未知 handle：空 ITEMSTATE（vDataValue=VT_EMPTY）+ E_INVALIDARG。
+                        *(*ppitemvalues).add(i) = tagOPCITEMSTATE::default();
+                        *(*pperrors).add(i) = E_INVALIDARG;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn Write(
         &self,
-        _dwcount: u32,
-        _phserver: *const u32,
-        _pitemvalues: *const VARIANT,
-        _pperrors: *mut *mut HRESULT,
+        dwcount: u32,
+        phserver: *const u32,
+        pitemvalues: *const VARIANT,
+        pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
-        nyi()
+        let n = prealloc_errors(dwcount, phserver, pperrors)?;
+        let lookups: Vec<Option<String>> = {
+            let inner = locked(&self.inner);
+            (0..n)
+                .map(|i| {
+                    // SAFETY: phserver 含 dwcount 个 u32；i < n。
+                    let h = unsafe { *phserver.add(i) };
+                    inner.items.get(&h).map(|e| e.item_id.clone())
+                })
+                .collect()
+        };
+        for (i, maybe_id) in lookups.into_iter().enumerate() {
+            let hr = match maybe_id {
+                Some(item_id) => {
+                    // SAFETY: pitemvalues 含 dwcount 个 VARIANT（调用方保证）；i < n。
+                    let v = unsafe { &*pitemvalues.add(i) };
+                    self.data_source.write(&item_id, v)
+                }
+                None => E_INVALIDARG,
+            };
+            // SAFETY: pperrors 含 n 个槽；i < n。
+            unsafe {
+                *(*pperrors).add(i) = hr;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -521,10 +621,10 @@ impl IConnectionPointContainer_Impl for GroupObj_Impl {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::data_source::SimDataSource;
-    use opc_da_client::bindings::da::IOPCItemMgt;
+    use crate::data_source::{OPC_QUALITY_GOOD, SimDataSource};
+    use opc_da_client::bindings::da::{IOPCItemMgt, IOPCSyncIO, OPC_DS_DEVICE};
     use windows::Win32::System::Com::CoTaskMemFree;
-    use windows::Win32::System::Variant::{VT_I4, VT_R8};
+    use windows::Win32::System::Variant::{VARIANT, VT_I4, VT_R8};
     use windows::core::{IUnknown, Interface};
 
     /// 构造测试用 `OPCITEMDEF`（`szItemID` 借用 `wide` 的内存，`wide` 须在 AddItems 期间存活）。
@@ -700,6 +800,166 @@ mod tests {
                 .expect("SetClientHandles");
             assert_eq!(*errs, S_OK);
             CoTaskMemFree(Some(errs.cast()));
+        }
+    }
+
+    /// 构造 `VT_I4` VARIANT（测试用，集中 unsafe；镜像 `data_source::variant_i4`）。
+    fn variant_i4(value: i32) -> VARIANT {
+        let mut var = VARIANT::default();
+        // SAFETY: 设 vt 判别 + lVal 字段；var 按值返回，无并发/别名。
+        unsafe {
+            (*var.Anonymous.Anonymous).vt = VT_I4;
+            (*var.Anonymous.Anonymous).Anonymous.lVal = value;
+        }
+        var
+    }
+
+    /// `IOPCSyncIO::Read` 核心：已注册 item 读出正确类型 + GOOD quality + hClient 回传。
+    #[test]
+    fn sync_read_returns_value_quality_and_client_handle() {
+        let g = new_group();
+        let id = wide("Random.Int4");
+        let defs = [make_def(&id, 100, true)];
+        let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+        let mut add_errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: g 同进程 implement；指针有效。
+        unsafe {
+            g.AddItems(1, defs.as_ptr(), &raw mut results, &raw mut add_errs)
+                .expect("AddItems");
+        }
+        let h_server;
+        // SAFETY: AddItems 成功写入 results[0]。
+        unsafe {
+            h_server = (*results).hServer;
+            CoTaskMemFree(Some(results.cast()));
+            CoTaskMemFree(Some(add_errs.cast()));
+        }
+        // 同一对象 QI 到 IOPCSyncIO（多接口 implement）。
+        let sync: IOPCSyncIO = g.cast::<IOPCSyncIO>().expect("QI IOPCSyncIO");
+        let handles = [h_server];
+        let mut states: *mut tagOPCITEMSTATE = core::ptr::null_mut();
+        let mut errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: sync 同进程；handles/states/errs 指针有效。
+        unsafe {
+            sync.Read(
+                OPC_DS_DEVICE,
+                1,
+                handles.as_ptr(),
+                &raw mut states,
+                &raw mut errs,
+            )
+            .expect("Read");
+        }
+        // SAFETY: Read 成功写入 states[0]/errs[0]；vDataValue 是 VT_I4 纯标量，按位读安全。
+        unsafe {
+            let s = &*states;
+            assert_eq!(*errs, S_OK, "Read 已注册 item 应 S_OK");
+            assert_eq!(s.hClient, 100, "hClient 回传 AddItems 时的值");
+            assert_eq!(s.wQuality, OPC_QUALITY_GOOD, "quality GOOD");
+            assert_eq!(
+                (*s.vDataValue.Anonymous.Anonymous).vt,
+                VT_I4,
+                "vDataValue 应 VT_I4"
+            );
+            CoTaskMemFree(Some(states.cast()));
+            CoTaskMemFree(Some(errs.cast()));
+        }
+    }
+
+    /// `IOPCSyncIO::Read` 核心：未知 handle 返回 E_INVALIDARG（不 panic）。
+    #[test]
+    fn sync_read_unknown_handle_is_invalid_arg() {
+        let g = new_group();
+        let sync: IOPCSyncIO = g.cast::<IOPCSyncIO>().expect("QI IOPCSyncIO");
+        let handles = [9999u32];
+        let mut states: *mut tagOPCITEMSTATE = core::ptr::null_mut();
+        let mut errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: sync 同进程；指针有效。
+        unsafe {
+            sync.Read(
+                OPC_DS_DEVICE,
+                1,
+                handles.as_ptr(),
+                &raw mut states,
+                &raw mut errs,
+            )
+            .expect("Read 调用本身成功");
+        }
+        // SAFETY: Read 写入 errs[0]（即使 handle 无效）。
+        unsafe {
+            assert_eq!(*errs, E_INVALIDARG, "未知 handle 应 E_INVALIDARG");
+            CoTaskMemFree(Some(states.cast()));
+            CoTaskMemFree(Some(errs.cast()));
+        }
+    }
+
+    /// `IOPCSyncIO::Write` + `Read` round-trip 核心：写可写 tag 后读反映写入值。
+    #[test]
+    fn sync_write_then_read_round_trip() {
+        let g = new_group();
+        let id = wide("Bucket Brigade.Int4");
+        let defs = [make_def(&id, 1, true)];
+        let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+        let mut add_errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: 同上。
+        unsafe {
+            g.AddItems(1, defs.as_ptr(), &raw mut results, &raw mut add_errs)
+                .expect("AddItems");
+        }
+        let h_server;
+        // SAFETY: AddItems 成功。
+        unsafe {
+            h_server = (*results).hServer;
+            CoTaskMemFree(Some(results.cast()));
+            CoTaskMemFree(Some(add_errs.cast()));
+        }
+        let sync: IOPCSyncIO = g.cast::<IOPCSyncIO>().expect("QI IOPCSyncIO");
+        let handles = [h_server];
+
+        // Write 42。
+        let write_val = variant_i4(42);
+        let mut werrs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: sync 同进程；write_val/handles/werrs 有效。
+        unsafe {
+            sync.Write(1, handles.as_ptr(), &raw const write_val, &raw mut werrs)
+                .expect("Write");
+        }
+        // SAFETY: Write 写入 werrs[0]。
+        unsafe {
+            assert_eq!(*werrs, S_OK, "写 Bucket Brigade 应 S_OK");
+            CoTaskMemFree(Some(werrs.cast()));
+        }
+
+        // Read 回 → 应为 42（round trip）。
+        let mut states: *mut tagOPCITEMSTATE = core::ptr::null_mut();
+        let mut rerrs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: sync 同进程；指针有效。
+        unsafe {
+            sync.Read(
+                OPC_DS_DEVICE,
+                1,
+                handles.as_ptr(),
+                &raw mut states,
+                &raw mut rerrs,
+            )
+            .expect("Read");
+        }
+        // SAFETY: Read 写入 states[0]/rerrs[0]；vDataValue VT_I4 标量，按位读安全。
+        unsafe {
+            let s = &*states;
+            assert_eq!(*rerrs, S_OK);
+            assert_eq!(
+                (*s.vDataValue.Anonymous.Anonymous).vt,
+                VT_I4,
+                "read 回应 VT_I4"
+            );
+            assert_eq!(
+                (*s.vDataValue.Anonymous.Anonymous).Anonymous.lVal,
+                42,
+                "read 应反映写入的 42（round trip）"
+            );
+            CoTaskMemFree(Some(states.cast()));
+            CoTaskMemFree(Some(rerrs.cast()));
         }
     }
 }
