@@ -85,7 +85,7 @@ struct ItemEntry {
 }
 
 /// Group 的可变状态（item 注册表 + handle 分配器 + group state）。`Mutex` 守护，跨 COM 调用线程。
-struct GroupInner {
+pub struct GroupInner {
     items: HashMap<u32, ItemEntry>,
     next_handle: u32,
     // —— IOPCGroupStateMgt 状态（GetState/SetState/SetName 读写）——
@@ -110,6 +110,17 @@ impl GroupInner {
             }
         }
     }
+
+    /// publisher 用：快照 `(h_client_group, [(h_client, item_id)])`，供推送引擎在锁外
+    /// 读取 + 打包 `OnDataChange`（避免长持锁）。
+    pub fn snapshot_for_publish(&self) -> (u32, Vec<(u32, String)>) {
+        let frames = self
+            .items
+            .values()
+            .map(|e| (e.h_client, e.item_id.clone()))
+            .collect();
+        (self.h_client_group, frames)
+    }
 }
 
 /// OPC DA Group COM 对象。
@@ -124,7 +135,7 @@ impl GroupInner {
     IConnectionPointContainer
 )]
 pub struct GroupObj {
-    inner: Mutex<GroupInner>,
+    inner: Arc<Mutex<GroupInner>>,
     data_source: Arc<dyn DataSource>,
     /// 订阅 sink 连接点（`IConnectionPoint` 接口，指向 `ConnectionPoint<IOPCDataCallback>`
     /// COM 对象，refcount 由 COM 自管）。`FindConnectionPoint(IOPCDataCallback)` 返回它的
@@ -150,21 +161,30 @@ impl GroupObj {
         h_client_group: u32,
         h_server_group: u32,
     ) -> Self {
+        let inner = Arc::new(Mutex::new(GroupInner {
+            items: HashMap::new(),
+            next_handle: 1,
+            update_rate,
+            active,
+            name,
+            time_bias,
+            percent_deadband,
+            locale,
+            h_client_group,
+            h_server_group,
+        }));
+        let data_cp: IConnectionPoint = ConnectionPoint::<IOPCDataCallback>::new().into();
+        // 启动 publisher 线程：周期读 DataSource + 遍历 data_cp sink 调 OnDataChange。
+        crate::objects::publisher::spawn(
+            Arc::clone(&inner),
+            data_source.clone(),
+            data_cp.clone(),
+            update_rate,
+        );
         Self {
-            inner: Mutex::new(GroupInner {
-                items: HashMap::new(),
-                next_handle: 1,
-                update_rate,
-                active,
-                name,
-                time_bias,
-                percent_deadband,
-                locale,
-                h_client_group,
-                h_server_group,
-            }),
+            inner,
             data_source,
-            data_cp: ConnectionPoint::<IOPCDataCallback>::new().into(),
+            data_cp,
         }
     }
 }
@@ -1215,6 +1235,41 @@ mod tests {
             err.code(),
             E_NOINTERFACE,
             "Group 不支持 IOPCShutdown（那是 Server 的 cp），应 E_NOINTERFACE"
+        );
+    }
+
+    /// `GroupInner::snapshot_for_publish`：返回 h_client_group + items 的 (h_client, item_id)，
+    /// 供 publisher 在锁外读取 + 打包 OnDataChange。
+    #[test]
+    fn snapshot_for_publish_returns_group_handle_and_items() {
+        let mut inner = GroupInner {
+            items: HashMap::new(),
+            next_handle: 1,
+            update_rate: 500,
+            active: true,
+            name: "test".into(),
+            time_bias: 0,
+            percent_deadband: 0.0,
+            locale: 0,
+            h_client_group: 42,
+            h_server_group: 7,
+        };
+        inner.items.insert(
+            1,
+            ItemEntry {
+                item_id: "Random.Int4".into(),
+                h_client: 100,
+                active: true,
+                data_type: VT_I4,
+            },
+        );
+        let (h_group, frames) = inner.snapshot_for_publish();
+        assert_eq!(h_group, 42, "h_client_group 回传");
+        assert_eq!(frames.len(), 1, "1 个 item");
+        assert_eq!(
+            frames[0],
+            (100, "Random.Int4".to_string()),
+            "h_client + item_id"
         );
     }
 }

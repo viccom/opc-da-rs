@@ -8,6 +8,7 @@
 
 mod connection_point;
 mod group;
+mod publisher;
 mod server;
 
 pub use connection_point::ConnectionPoint;

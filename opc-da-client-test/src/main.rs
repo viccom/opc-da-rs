@@ -21,6 +21,8 @@
 //!
 //! 后续 milestone 追加 browse / subscribe / item_properties / list_servers。
 
+use std::time::Duration;
+
 use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, OpcValue};
 
 /// 自建 server 的 ProgID（`opc-da-server/src/bin/opc-da-server.rs` /RegServer 注册）。
@@ -129,18 +131,30 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // 5. subscribe（AddGroup + AddItems + FindConnectionPoint[M5a] + Advise DataCallbackSink）。
-    //    M5a 验证 advise 链路通（handle 返回 + cookie 非 0）；OnDataChange 推送待 M5b publisher。
+    // 5. subscribe（AddGroup + AddItems + FindConnectionPoint[M5a] + Advise + publisher 推送[M5b]）。
+    //    等 OnDataChange 帧（publisher 每 update_rate=500ms 推一帧；3s 内应收到）。
     match client
         .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
         .await
     {
-        Ok(handle) => {
-            println!(
-                "✓ subscribe (Random.Int4): cookie={} advise 通 [M5a FindConnectionPoint]",
-                handle.cookie
-            );
-            passed += 1;
+        Ok(mut handle) => {
+            match tokio::time::timeout(Duration::from_secs(3), handle.rx.recv()).await {
+                Ok(Some(tv)) => {
+                    println!(
+                        "✓ subscribe 收 OnDataChange: {} value={} quality={} [M5a FindConnectionPoint + M5b publisher]",
+                        tv.tag_id, tv.value, tv.quality
+                    );
+                    passed += 1;
+                }
+                Ok(None) => {
+                    println!("✗ subscribe: rx 关闭，未收数据");
+                    failed += 1;
+                }
+                Err(_) => {
+                    println!("✗ subscribe: 3s 内未收 OnDataChange（publisher 未推送）");
+                    failed += 1;
+                }
+            }
         }
         Err(e) => {
             println!("✗ subscribe (Random.Int4): {e}");
