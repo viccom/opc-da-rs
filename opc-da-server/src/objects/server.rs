@@ -10,7 +10,9 @@
 //! `EnumConnectionPoints` 暂 `E_NOTIMPL`。
 //! `IOPCBrowseServerAddressSpace`（M6）：flat 命名空间 browse（`QueryOrganization` /
 //! `BrowseOPCItemIDs` / `GetItemID` / `ChangeBrowsePosition` / `BrowseAccessPaths`）已实装。
-//! `IOPCCommon` / `IOPCItemProperties` 当前 stub（M7 实装）。
+//! `IOPCItemProperties`（M7a）：`QueryAvailableProperties` / `GetItemProperties` /
+//! `LookupItemIDs` 已实装（DATATYPE/VALUE/QUALITY/ACCESS_RIGHTS 4 property）。
+//! `IOPCCommon` 当前 stub（M7b 实装 GetErrorString 等）。
 
 // `#[implement]` 展开的 COM 胶水触发若干 pedantic lints；与 `subscription.rs` 同模式 allow。
 #![allow(

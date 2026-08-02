@@ -106,7 +106,8 @@
 - [x] M5a: `FindConnectionPoint`（`f22d93f`；Group data_cp + Server shutdown_cp 接入；subscribe advise 端到端 cookie=1）
 - [x] M5b: publisher 推送引擎（`51b1b83`；std::thread 周期推送 OnDataChange；subscribe 端到端收帧 5 passed）
 - [x] M6: `IOPCBrowseServerAddressSpace`（`ff9132c`；QueryOrganization=FLAT + BrowseOPCItemIDs；browse 端到端列 4 tag，6 passed）
-- [ ] M7: `IOPCItemProperties` + `IOPCCommon` 完整 + `list_servers`
+- [x] M7a: `IOPCItemProperties`（`956b4f6`；QueryAvailableProperties/GetItemProperties/LookupItemIDs；get_item_properties 端到端 4 property，7 passed）
+- [ ] M7b: `IOPCCommon` 完整（GetErrorString）+ `list_servers`
 - [ ] M8: 端到端全量验证（所有接口 pass）
 
 ### 需用户回（循环遇即停）
