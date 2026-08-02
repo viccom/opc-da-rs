@@ -4,13 +4,13 @@
 //! + `Implemented Categories\{CATID}`（让 OPCEnum / client 按位宽枚举发现）
 //! + `HKCR\AppID\{AppID}`（DCOM 远程激活所需）。
 //!
-//! 位宽（已知坑，见 CLAUDE.md）：显式 `KEY_WOW64_64KEY` 写 64 位视图。若要 32 位 client
-//! 枚举到，需另行注册 32 位视图（阶段 3 DCOM 时处理）。
+//! 位宽（已知坑，见 CLAUDE.md）：双视图写入（`KEY_WOW64_64KEY` + `KEY_WOW64_32KEY`），
+//! 让 32 位 OPCEnum 也能枚举到（否则 OPCEnum 读 WOW6432Node 32 位视图，单写 64 位视图找不到）。
 
 use std::path::Path;
 use windows::Win32::System::Registry::{
-    HKEY, HKEY_CLASSES_ROOT, KEY_CREATE_SUB_KEY, KEY_SET_VALUE, KEY_WOW64_64KEY,
-    REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+    HKEY, HKEY_CLASSES_ROOT, KEY_CREATE_SUB_KEY, KEY_SET_VALUE, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
+    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
 };
 use windows::core::{GUID, PCWSTR, Result};
 
@@ -98,8 +98,19 @@ pub fn unregister(reg: &ServerRegistration<'_>) -> Result<()> {
     Ok(())
 }
 
-/// 写一个 HKCR `REG_SZ` 值（创建所需子键，64 位视图）。
+/// 写一个 HKCR `REG_SZ` 值到 **64 位 + 32 位视图**（创建所需子键）。
+///
+/// 双视图写入让 32 位 OPCEnum 也能枚举到自建 server（CLAUDE.md 位宽坑：32 位 client/OPCEnum
+/// 读 WOW6432Node 视图，单写 64 位视图则枚举不到）。64 位 `LocalServer32` exe 被 32 位 client
+/// 激活时，SCM 跨位宽启动 out-of-process（无问题）。
 fn set_reg_sz(parent: HKEY, subkey: &str, value: &str) -> Result<()> {
+    set_reg_sz_view(parent, subkey, value, KEY_WOW64_64KEY)?;
+    set_reg_sz_view(parent, subkey, value, KEY_WOW64_32KEY)?;
+    Ok(())
+}
+
+/// 写一个 HKCR `REG_SZ` 值到指定视图（64/32 位）。
+fn set_reg_sz_view(parent: HKEY, subkey: &str, value: &str, view: REG_SAM_FLAGS) -> Result<()> {
     // SAFETY: `subkey_wide` 为 null 结尾 wide string；`parent` 为系统预定义 HKEY；
     // 句柄 `hkey` 由 RegCreateKeyExW 写出后立即 RegCloseKey。
     unsafe {
@@ -111,7 +122,7 @@ fn set_reg_sz(parent: HKEY, subkey: &str, value: &str) -> Result<()> {
             None,
             None,
             REG_OPTION_NON_VOLATILE,
-            KEY_CREATE_SUB_KEY | KEY_SET_VALUE | KEY_WOW64_64KEY,
+            KEY_CREATE_SUB_KEY | KEY_SET_VALUE | view,
             None,
             &raw mut hkey,
             None,

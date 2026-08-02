@@ -219,6 +219,43 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 8. get_error_string（IOPCCommon::GetErrorString[M7b]：HRESULT→可读描述）。
+    match client.get_error_string(PROG_ID, 0).await {
+        Ok(s) => {
+            if !s.is_empty() {
+                println!("✓ get_error_string (S_OK): {s} [M7b IOPCCommon]");
+                passed += 1;
+            } else {
+                println!("✗ get_error_string: 返回空串");
+                failed += 1;
+            }
+        }
+        Err(e) => {
+            println!("✗ get_error_string: {e}");
+            failed += 1;
+        }
+    }
+
+    // 9. list_servers（CATID 注册[M7b]：client 经 Implemented Categories 枚举自建 server）。
+    match client.list_servers("localhost").await {
+        Ok(servers) => {
+            if servers.iter().any(|s| s.contains("opc-da-rs")) {
+                println!(
+                    "✓ list_servers: 枚举 {} 个 server（含 opc-da-rs）[M7b CATID 注册]",
+                    servers.len()
+                );
+                passed += 1;
+            } else {
+                println!("✗ list_servers: {:?}（未含 opc-da-rs）", servers);
+                failed += 1;
+            }
+        }
+        Err(e) => {
+            println!("✗ list_servers: {e}");
+            failed += 1;
+        }
+    }
+
     println!("\n=== 汇总: {passed} passed, {failed} failed ===");
     if failed > 0 {
         anyhow::bail!("{failed} 个接口失败");

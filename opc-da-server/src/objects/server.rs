@@ -119,6 +119,20 @@ fn nyi<T>() -> Result<T> {
     Err(E_NOTIMPL.into())
 }
 
+/// `HRESULT` → 可读描述串（`IOPCCommon::GetErrorString` 用）。
+#[allow(clippy::cast_sign_loss)] // i32→u32 bit 重解释（HRESULT 失败码 hex 显示）
+fn error_string(hr: HRESULT) -> String {
+    let core = match hr {
+        S_OK => "Success",
+        E_NOTIMPL => "Not implemented",
+        E_INVALIDARG => "Invalid argument",
+        E_POINTER => "Invalid pointer",
+        E_OUTOFMEMORY => "Out of memory",
+        _ => return format!("HRESULT 0x{:08X}", hr.0 as u32),
+    };
+    core.to_string()
+}
+
 impl IOPCServer_Impl for ServerObj_Impl {
     fn AddGroup(
         &self,
@@ -254,23 +268,52 @@ impl IOPCServer_Impl for ServerObj_Impl {
 
 impl IOPCCommon_Impl for ServerObj_Impl {
     fn SetLocaleID(&self, _dwlcid: u32) -> Result<()> {
-        nyi()
+        // 简化：不维护 locale（错误串固定英文）。后续按需存 Mutex<u32>。
+        Ok(())
     }
 
     fn GetLocaleID(&self) -> Result<u32> {
-        nyi()
+        // 0 = 系统默认 locale。
+        Ok(0)
     }
 
-    fn QueryAvailableLocaleIDs(&self, _pdwcount: *mut u32, _pdwlcid: *mut *mut u32) -> Result<()> {
-        nyi()
+    fn QueryAvailableLocaleIDs(&self, pdwcount: *mut u32, pdwlcid: *mut *mut u32) -> Result<()> {
+        if pdwcount.is_null() || pdwlcid.is_null() {
+            return Err(E_POINTER.into());
+        }
+        // 返回 1 个 locale（0 = system default）。
+        // SAFETY: CoTaskMemAlloc 1 个 u32，所有权交 client。
+        let lcid_ptr = unsafe { CoTaskMemAlloc(size_of::<u32>()) }.cast::<u32>();
+        if lcid_ptr.is_null() {
+            return Err(E_OUTOFMEMORY.into());
+        }
+        // SAFETY: lcid_ptr 刚分配 1 u32 槽；2 个 out 指针非空（上面校验）。
+        unsafe {
+            *lcid_ptr = 0;
+            *pdwcount = 1;
+            *pdwlcid = lcid_ptr;
+        }
+        Ok(())
     }
 
-    fn GetErrorString(&self, _dwerror: HRESULT) -> Result<PWSTR> {
-        nyi()
+    fn GetErrorString(&self, dwerror: HRESULT) -> Result<PWSTR> {
+        let msg = error_string(dwerror);
+        let w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: CoTaskMemAlloc w.len()*2 字节；失败 null。
+        let ptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
+        if ptr.is_null() {
+            return Err(E_OUTOFMEMORY.into());
+        }
+        // SAFETY: ptr 刚分配足够空间；拷贝描述串 wide（含 null）。
+        unsafe {
+            copy_nonoverlapping(w.as_ptr(), ptr, w.len());
+        }
+        Ok(PWSTR(ptr))
     }
 
     fn SetClientName(&self, _szname: &PCWSTR) -> Result<()> {
-        nyi()
+        // 简化：不存 client name（无多 client 区分需求）。
+        Ok(())
     }
 }
 
@@ -539,10 +582,12 @@ impl IOPCBrowseServerAddressSpace_Impl for ServerObj_Impl {
 #[cfg(test)]
 mod tests {
     use super::ServerObj;
+    use crate::objects::pwstr_to_string;
     use opc_da_client::bindings::comn::IOPCCommon;
     use opc_da_client::bindings::da::{
         IOPCBrowseServerAddressSpace, IOPCItemProperties, IOPCServer, OPC_NS_FLAT,
     };
+    use windows::Win32::Foundation::{E_NOTIMPL, S_OK};
     use windows::Win32::System::Com::{CoTaskMemFree, IConnectionPointContainer};
     use windows::core::{IUnknown, Interface, PCWSTR, PWSTR};
 
@@ -620,6 +665,18 @@ mod tests {
             CoTaskMemFree(Some(descs.cast()));
             CoTaskMemFree(Some(vts.cast()));
         }
+    }
+
+    /// `IOPCCommon::GetErrorString`：HRESULT → 可读描述串。
+    #[test]
+    fn common_get_error_string_returns_description() {
+        let server: IOPCCommon = ServerObj::new().into();
+        // SAFETY: server 同进程；GetErrorString 返回 CoTaskMemAlloc wide（pwstr_to_string 解析）。
+        let s_ok = unsafe { server.GetErrorString(S_OK) }.expect("GetErrorString S_OK");
+        assert_eq!(pwstr_to_string(s_ok), "Success");
+        let s_notimpl =
+            unsafe { server.GetErrorString(E_NOTIMPL) }.expect("GetErrorString E_NOTIMPL");
+        assert_eq!(pwstr_to_string(s_notimpl), "Not implemented");
     }
 
     /// AddGroup/RemoveGroup/GetStatus 联动：add 后 group_count 增，remove 后减。
