@@ -2281,6 +2281,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-da-client-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "opc-da-client",
+ "tokio",
+]
+
+[[package]]
 name = "opc-da-desktop"
 version = "0.1.0"
 dependencies = [

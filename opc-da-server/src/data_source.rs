@@ -229,7 +229,7 @@ fn square_wave(elapsed: Duration) -> f64 {
 /// 当前 UTC 时间转 Windows `FILETIME`（1601-01-01 起的 100ns 计数）。
 ///
 /// 用 `std::time::SystemTime` 手工转换，避免引入 `Win32_System_Time` feature。
-fn now_filetime() -> FILETIME {
+pub(crate) fn now_filetime() -> FILETIME {
     let dur = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();

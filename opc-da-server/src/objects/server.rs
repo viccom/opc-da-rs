@@ -16,17 +16,28 @@
     clippy::not_unsafe_ptr_arg_deref
 )]
 
-use windows::Win32::Foundation::{E_NOTIMPL, E_OUTOFMEMORY, FILETIME};
-use windows::Win32::System::Com::{CoTaskMemAlloc, CoTaskMemFree};
+use windows::Win32::Foundation::{E_NOTIMPL, E_OUTOFMEMORY};
+use windows::Win32::System::Com::{
+    CoTaskMemAlloc, CoTaskMemFree, IConnectionPoint, IConnectionPointContainer,
+    IConnectionPointContainer_Impl, IEnumConnectionPoints,
+};
+use windows::Win32::System::Variant::VARIANT;
 use windows::core::{BOOL, GUID, HRESULT, IUnknown, OutRef, PCWSTR, PWSTR, Result, implement};
 
 use opc_da_client::bindings::comn::{IOPCCommon, IOPCCommon_Impl};
 use opc_da_client::bindings::da::{
-    IOPCServer, IOPCServer_Impl, OPC_STATUS_RUNNING, tagOPCENUMSCOPE, tagOPCSERVERSTATUS,
+    IOPCItemProperties, IOPCItemProperties_Impl, IOPCServer, IOPCServer_Impl, OPC_STATUS_RUNNING,
+    tagOPCENUMSCOPE, tagOPCSERVERSTATUS,
 };
 
-/// OPC DA Server COM 对象（空壳 spike）。
-#[implement(IOPCServer, IOPCCommon)]
+use crate::data_source::now_filetime;
+
+/// OPC DA Server COM 对象。
+///
+/// 实现 client（`opc-da-client` 的 `v2::Server::try_from`）connect 时强制 cast 的 4 接口：
+/// `IOPCServer`（`GetStatus` 已实装，其余 nyi）/ `IOPCCommon` / `IConnectionPointContainer`
+/// / `IOPCItemProperties`。后两者当前 stub（`E_NOTIMPL`），仅满足 QI——M2/M5/M7 逐步实装。
+#[implement(IOPCServer, IOPCCommon, IConnectionPointContainer, IOPCItemProperties)]
 pub struct ServerObj;
 
 /// 通用"未实装"错误：spike 阶段所有方法暂返回 `E_NOTIMPL`。
@@ -78,12 +89,12 @@ impl IOPCServer_Impl for ServerObj_Impl {
                 CoTaskMemFree(Some(vendor_ptr as *const _));
                 return Err(E_OUTOFMEMORY.into());
             }
-            // spike：时间字段置零（后续用 GetSystemTimeAsFileTime 填真实时间）。
-            let zero_ft = FILETIME::default();
+            // 当前时间（client 解析 FILETIME 需 >= UNIX_EPOCH；零值会被判 before-epoch）。
+            let now = now_filetime();
             *status = tagOPCSERVERSTATUS {
-                ftStartTime: zero_ft,
-                ftCurrentTime: zero_ft,
-                ftLastUpdateTime: zero_ft,
+                ftStartTime: now,
+                ftCurrentTime: now,
+                ftLastUpdateTime: now,
                 dwServerState: OPC_STATUS_RUNNING,
                 dwGroupCount: 0,
                 dwBandWidth: 0,
@@ -132,11 +143,57 @@ impl IOPCCommon_Impl for ServerObj_Impl {
     }
 }
 
+impl IConnectionPointContainer_Impl for ServerObj_Impl {
+    fn EnumConnectionPoints(&self) -> Result<IEnumConnectionPoints> {
+        nyi()
+    }
+
+    fn FindConnectionPoint(&self, _riid: *const GUID) -> Result<IConnectionPoint> {
+        nyi()
+    }
+}
+
+impl IOPCItemProperties_Impl for ServerObj_Impl {
+    fn QueryAvailableProperties(
+        &self,
+        _szitemid: &PCWSTR,
+        _pdwcount: *mut u32,
+        _pppropertyids: *mut *mut u32,
+        _ppdescriptions: *mut *mut PWSTR,
+        _ppvtdatatypes: *mut *mut u16,
+    ) -> Result<()> {
+        nyi()
+    }
+
+    fn GetItemProperties(
+        &self,
+        _szitemid: &PCWSTR,
+        _dwcount: u32,
+        _pdwpropertyids: *const u32,
+        _ppvdata: *mut *mut VARIANT,
+        _pperrors: *mut *mut HRESULT,
+    ) -> Result<()> {
+        nyi()
+    }
+
+    fn LookupItemIDs(
+        &self,
+        _szitemid: &PCWSTR,
+        _dwcount: u32,
+        _pdwpropertyids: *const u32,
+        _ppsznewitemids: *mut *mut PWSTR,
+        _pperrors: *mut *mut HRESULT,
+    ) -> Result<()> {
+        nyi()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ServerObj;
     use opc_da_client::bindings::comn::IOPCCommon;
-    use opc_da_client::bindings::da::IOPCServer;
+    use opc_da_client::bindings::da::{IOPCItemProperties, IOPCServer};
+    use windows::Win32::System::Com::IConnectionPointContainer;
     use windows::core::{IUnknown, Interface};
 
     /// spike：验证多接口 `#[implement(IOPCServer, IOPCCommon)]` 共存——QI 到三个
@@ -147,6 +204,14 @@ mod tests {
         let obj: IUnknown = ServerObj.into();
         assert!(obj.cast::<IOPCServer>().is_ok(), "QI IOPCServer 失败");
         assert!(obj.cast::<IOPCCommon>().is_ok(), "QI IOPCCommon 失败");
+        assert!(
+            obj.cast::<IConnectionPointContainer>().is_ok(),
+            "QI IConnectionPointContainer 失败"
+        );
+        assert!(
+            obj.cast::<IOPCItemProperties>().is_ok(),
+            "QI IOPCItemProperties 失败"
+        );
         assert!(obj.cast::<IUnknown>().is_ok(), "QI IUnknown 失败");
     }
 }

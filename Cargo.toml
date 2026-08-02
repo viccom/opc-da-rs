@@ -2,6 +2,7 @@
 members = [
     "opc-cli",
     "opc-da-client",
+    "opc-da-client-test",
     "opc-da-desktop",
     "opc-da-server",
 ]

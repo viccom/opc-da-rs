@@ -1,0 +1,17 @@
+[package]
+name = "opc-da-client-test"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "End-to-end test program: drives opc-da-client against the self-built opc-da-server"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+opc-da-client = { path = "../opc-da-client" }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
