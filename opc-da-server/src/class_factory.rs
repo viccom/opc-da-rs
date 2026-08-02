@@ -27,7 +27,7 @@ impl IClassFactory_Impl for Factory_Impl {
     ) -> Result<()> {
         // 不支持 aggregation。后续改返回 CLASS_E_NOAGGREGATION（不 panic）。
         assert!(outer.is_null(), "aggregation not supported");
-        let unknown: IUnknown = ServerObj.into();
+        let unknown: IUnknown = ServerObj::new().into();
         // SAFETY: `riid`（COM 运行时提供）为有效 GUID；`object` 为调用方提供的 out 指针。
         // query 成功则写入请求接口指针，失败则不改 `*object`（COM QueryInterface 语义）。
         unsafe { unknown.query(riid, object).ok() }

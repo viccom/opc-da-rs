@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ComConnector::default() = localhost；OpcDaClient 内部 worker 线程做 CoInitializeEx(MTA)。
     let client = OpcDaClient::new(ComConnector::default())?;
-    let (mut passed, mut failed) = (0u32, 0u32);
+    let (mut passed, mut failed, mut pending) = (0u32, 0u32, 0u32);
 
     // IOPCServer::GetStatus（server 阶段 0 已实装）。
     match client.get_server_status(PROG_ID).await {
@@ -43,7 +43,32 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("\n=== 汇总: {passed} passed, {failed} failed ===");
+    // read_tag_values（触发 AddGroup[M2] + AddItems[M1] + IOPCSyncIO::Read[M3]）。
+    // M2 预期：AddGroup + AddItems 端到端通，Read 仍 E_NOTIMPL——错误若为 Read 阶段
+    // 即证明 AddGroup 链路打通（M3 实装 Read 后整条 read 通）。
+    match client
+        .read_tag_values(PROG_ID, vec!["Random.Int4".to_string()])
+        .await
+    {
+        Ok(vals) => {
+            println!("✓ read_tag_values (Random.Int4): {vals:?}");
+            passed += 1;
+        }
+        Err(e) => {
+            // E_NOTIMPL (0x80004001) = server 接口尚未实装（当前 Read 待 M3），算 pending
+            // 而非 fail——证明前置的 AddGroup + AddItems 链路已通（否则错误会更早）。
+            let msg = format!("{e}");
+            if msg.contains("0x80004001") {
+                println!("⊘ read_tag_values (Random.Int4): pending (Read 待 M3) — {e}");
+                pending += 1;
+            } else {
+                println!("✗ read_tag_values (Random.Int4): {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    println!("\n=== 汇总: {passed} passed, {pending} pending, {failed} failed ===");
     if failed > 0 {
         anyhow::bail!("{failed} 个接口失败");
     }
