@@ -1,12 +1,16 @@
 //! Server 对象——OPC DA Server COM 对象。
 //!
-//! 实现 client（`opc-da-client` 的 `v2::Server::try_from`）connect 时强制 cast 的 4 接口：
-//! `IOPCServer` / `IOPCCommon` / `IConnectionPointContainer` / `IOPCItemProperties`。
+//! 实现 5 接口：`IOPCServer` / `IOPCCommon` / `IConnectionPointContainer` /
+//! `IOPCItemProperties` / `IOPCBrowseServerAddressSpace`。前 4 个是 client（`v2::Server::
+//! try_from`）connect 时强制 cast 的；`IOPCBrowseServerAddressSpace` 供 client browse 时 QI。
 //!
 //! `IOPCServer`：`AddGroup` / `RemoveGroup` / `GetStatus`（group_count 接实际计数）已实装；
-//! `GetGroupByName` / `CreateGroupEnumerator` / `GetErrorString` 暂 `E_NOTIMPL`（后续）。
-//! `IOPCCommon` / `IConnectionPointContainer` / `IOPCItemProperties` 当前 stub（`E_NOTIMPL`），
-//! 仅满足 QI——M5/M7 逐步实装。
+//! `GetGroupByName` / `CreateGroupEnumerator` / `GetErrorString` 暂 `E_NOTIMPL`。
+//! `IConnectionPointContainer`：`FindConnectionPoint`（IOPCShutdown，M5a）已实装；
+//! `EnumConnectionPoints` 暂 `E_NOTIMPL`。
+//! `IOPCBrowseServerAddressSpace`（M6）：flat 命名空间 browse（`QueryOrganization` /
+//! `BrowseOPCItemIDs` / `GetItemID` / `ChangeBrowsePosition` / `BrowseAccessPaths`）已实装。
+//! `IOPCCommon` / `IOPCItemProperties` 当前 stub（M7 实装）。
 
 // `#[implement]` 展开的 COM 胶水触发若干 pedantic lints；与 `subscription.rs` 同模式 allow。
 #![allow(
