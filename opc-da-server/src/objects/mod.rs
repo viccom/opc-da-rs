@@ -12,4 +12,5 @@ mod server;
 
 pub use connection_point::ConnectionPoint;
 pub use group::GroupObj;
+pub use group::pwstr_to_string;
 pub use server::ServerObj;

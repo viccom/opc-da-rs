@@ -54,7 +54,7 @@ fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// 读 `PWSTR`（0 结尾 UTF-16）→ `String`。null 指针返回空串。
-fn pwstr_to_string(p: PWSTR) -> String {
+pub fn pwstr_to_string(p: PWSTR) -> String {
     if p.is_null() {
         return String::new();
     }
@@ -78,21 +78,22 @@ struct ItemEntry {
     data_type: VARENUM,
 }
 
-/// Group 的可变状态（item 注册表 + server handle 分配器）。`Mutex` 守护，跨 COM 调用线程。
+/// Group 的可变状态（item 注册表 + handle 分配器 + group state）。`Mutex` 守护，跨 COM 调用线程。
 struct GroupInner {
     items: HashMap<u32, ItemEntry>,
     next_handle: u32,
+    // —— IOPCGroupStateMgt 状态（GetState/SetState/SetName 读写）——
+    update_rate: u32,
+    active: bool,
+    name: String,
+    time_bias: i32,
+    percent_deadband: f32,
+    locale: u32,
+    h_client_group: u32,
+    h_server_group: u32,
 }
 
 impl GroupInner {
-    #[allow(dead_code)] // GroupObj::new 调用；后者待 IOPCServer::AddGroup 接入
-    fn new() -> Self {
-        Self {
-            items: HashMap::new(),
-            next_handle: 1,
-        }
-    }
-
     /// 分配下一个未用的 server handle（0 永不返回——0 = 无效）。
     fn alloc_handle(&mut self) -> u32 {
         loop {
@@ -126,11 +127,36 @@ pub struct GroupObj {
 }
 
 impl GroupObj {
-    /// 新建 Group（空 item 注册表，绑定 DataSource）。
-    #[allow(dead_code)] // 待 IOPCServer::AddGroup 接入（当前仅测试构造）
-    pub(crate) fn new(data_source: Arc<dyn DataSource>) -> Self {
+    /// 新建 Group（空 item 注册表 + 初始 group state，绑定 DataSource）。
+    ///
+    /// group state 由 `IOPCServer::AddGroup` 的参数初始化（name/active/update_rate/
+    /// time_bias/percent_deadband/locale/h_client/h_server）；后续 `IOPCGroupStateMgt`
+    /// 的 `GetState`/`SetState`/`SetName` 读写。
+    #[allow(clippy::too_many_arguments)] // COM AddGroup 参数集，作 group state 初值
+    pub(crate) fn new(
+        data_source: Arc<dyn DataSource>,
+        name: String,
+        active: bool,
+        update_rate: u32,
+        time_bias: i32,
+        percent_deadband: f32,
+        locale: u32,
+        h_client_group: u32,
+        h_server_group: u32,
+    ) -> Self {
         Self {
-            inner: Mutex::new(GroupInner::new()),
+            inner: Mutex::new(GroupInner {
+                items: HashMap::new(),
+                next_handle: 1,
+                update_rate,
+                active,
+                name,
+                time_bias,
+                percent_deadband,
+                locale,
+                h_client_group,
+                h_server_group,
+            }),
             data_source,
             data_cp: ConnectionPoint::new(),
         }
@@ -443,33 +469,107 @@ fn prealloc_item_states(
 impl IOPCGroupStateMgt_Impl for GroupObj_Impl {
     fn GetState(
         &self,
-        _pupdaterate: *mut u32,
-        _pactive: *mut BOOL,
-        _ppname: *mut PWSTR,
-        _ptimebias: *mut i32,
-        _ppercentdeadband: *mut f32,
-        _plcid: *mut u32,
-        _phclientgroup: *mut u32,
-        _phservergroup: *mut u32,
+        pupdaterate: *mut u32,
+        pactive: *mut BOOL,
+        ppname: *mut PWSTR,
+        ptimebias: *mut i32,
+        ppercentdeadband: *mut f32,
+        plcid: *mut u32,
+        phclientgroup: *mut u32,
+        phservergroup: *mut u32,
     ) -> Result<()> {
-        nyi()
+        if pupdaterate.is_null()
+            || pactive.is_null()
+            || ppname.is_null()
+            || ptimebias.is_null()
+            || ppercentdeadband.is_null()
+            || plcid.is_null()
+            || phclientgroup.is_null()
+            || phservergroup.is_null()
+        {
+            return Err(Error::from(E_POINTER));
+        }
+        // 锁内读出标量 + 构造 name wide（encode 后 Vec 独立，锁可释放）。
+        let name_wide = {
+            let inner = locked(&self.inner);
+            // SAFETY: 8 个 out 指针非空（上面校验）；从锁内 state 读标量写入。
+            unsafe {
+                *pupdaterate = inner.update_rate;
+                *pactive = BOOL::from(inner.active);
+                *ptimebias = inner.time_bias;
+                *ppercentdeadband = inner.percent_deadband;
+                *plcid = inner.locale;
+                *phclientgroup = inner.h_client_group;
+                *phservergroup = inner.h_server_group;
+            }
+            inner
+                .name
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect::<Vec<u16>>()
+        };
+        // name: CoTaskMemAlloc wide string（所有权交 client，client CoTaskMemFree）。
+        // SAFETY: 分配 name_wide.len()*2 字节；失败返回 null。
+        let name_ptr = unsafe { CoTaskMemAlloc(name_wide.len() * 2) }.cast::<u16>();
+        if name_ptr.is_null() {
+            return Err(Error::from(E_OUTOFMEMORY));
+        }
+        // SAFETY: name_ptr 刚分配足够空间；拷贝 name_wide（含 null 终止）。
+        unsafe {
+            std::ptr::copy_nonoverlapping(name_wide.as_ptr(), name_ptr, name_wide.len());
+            *ppname = PWSTR(name_ptr);
+        }
+        Ok(())
     }
 
     fn SetState(
         &self,
-        _prequestedupdaterate: *const u32,
-        _previsedupdaterate: *mut u32,
-        _pactive: *const BOOL,
-        _ptimebias: *const i32,
-        _ppercentdeadband: *const f32,
-        _plcid: *const u32,
-        _phclientgroup: *const u32,
+        prequestedupdaterate: *const u32,
+        previsedupdaterate: *mut u32,
+        pactive: *const BOOL,
+        ptimebias: *const i32,
+        ppercentdeadband: *const f32,
+        plcid: *const u32,
+        phclientgroup: *const u32,
     ) -> Result<()> {
-        nyi()
+        // 各 in 指针 null = 不改该字段（OPC DA 语义）。as_ref() null → None。
+        let revised = {
+            let mut inner = locked(&self.inner);
+            // SAFETY: 6 个 in 指针由调用方提供（COM 契约：指向有效 T 或 null）。
+            // as_ref null → None（不改字段）；非 null 读值赋字段。
+            unsafe {
+                if let Some(&rate) = prequestedupdaterate.as_ref() {
+                    inner.update_rate = rate;
+                }
+                if let Some(&a) = pactive.as_ref() {
+                    inner.active = a.as_bool();
+                }
+                if let Some(&tb) = ptimebias.as_ref() {
+                    inner.time_bias = tb;
+                }
+                if let Some(&pd) = ppercentdeadband.as_ref() {
+                    inner.percent_deadband = pd;
+                }
+                if let Some(&lc) = plcid.as_ref() {
+                    inner.locale = lc;
+                }
+                if let Some(&hc) = phclientgroup.as_ref() {
+                    inner.h_client_group = hc;
+                }
+                inner.update_rate
+            }
+        };
+        if !previsedupdaterate.is_null() {
+            // SAFETY: previsedupdaterate 非空时为调用方 out 值。
+            unsafe { *previsedupdaterate = revised };
+        }
+        Ok(())
     }
 
-    fn SetName(&self, _szname: &PCWSTR) -> Result<()> {
-        nyi()
+    fn SetName(&self, szname: &PCWSTR) -> Result<()> {
+        let name = pwstr_to_string(PWSTR(szname.as_ptr().cast_mut()));
+        locked(&self.inner).name = name;
+        Ok(())
     }
 
     fn CloneGroup(&self, _szname: &PCWSTR, _riid: *const GUID) -> Result<IUnknown> {
@@ -648,7 +748,7 @@ mod tests {
 
     fn new_group() -> IOPCItemMgt {
         let ds: Arc<dyn DataSource> = Arc::new(SimDataSource::new());
-        GroupObj::new(ds).into()
+        GroupObj::new(ds, String::new(), true, 1000, 0, 0.0, 0, 0, 0).into()
     }
 
     /// AddItems 核心：有效 item 注册成功，返回非 0 hServer + canonical 类型 + S_OK。
@@ -703,7 +803,7 @@ mod tests {
     #[test]
     fn multi_interface_qi_succeeds() {
         let ds: Arc<dyn DataSource> = Arc::new(SimDataSource::new());
-        let obj: IUnknown = GroupObj::new(ds).into();
+        let obj: IUnknown = GroupObj::new(ds, String::new(), true, 1000, 0, 0.0, 0, 0, 0).into();
         use opc_da_client::bindings::da::{IOPCAsyncIO2, IOPCGroupStateMgt, IOPCSyncIO};
         use windows::Win32::System::Com::IConnectionPointContainer;
         assert!(obj.cast::<IOPCItemMgt>().is_ok());
@@ -961,6 +1061,104 @@ mod tests {
             );
             CoTaskMemFree(Some(states.cast()));
             CoTaskMemFree(Some(rerrs.cast()));
+        }
+    }
+
+    /// `IOPCGroupStateMgt::SetState` + `GetState` round-trip 核心：SetState 改 update_rate/
+    /// active 后，GetState 反映新值（其余 in 指针 null = 不改）。
+    #[test]
+    fn set_state_then_get_state_reflects() {
+        let g = new_group(); // 初值 update_rate=1000, active=true
+        let mgt: IOPCGroupStateMgt = g.cast::<IOPCGroupStateMgt>().expect("QI IOPCGroupStateMgt");
+        let requested_rate = 250u32;
+        let active_false = BOOL::from(false);
+        let mut revised = 0u32;
+        // SAFETY: mgt 同进程；requested_rate/active_false/out 指针有效；其余 in 指针 null=不改。
+        unsafe {
+            mgt.SetState(
+                &raw const requested_rate,
+                &raw mut revised,
+                &raw const active_false,
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+                core::ptr::null(),
+            )
+            .expect("SetState");
+        }
+        assert_eq!(revised, 250, "revised = requested（无最小 rate 约束）");
+
+        // GetState 验证 update_rate/active 已改。
+        let mut rate = 0u32;
+        let mut active = BOOL::default();
+        let mut name = PWSTR::null();
+        let mut tb = 0i32;
+        let mut pd = 0.0f32;
+        let mut lcid = 0u32;
+        let mut hc = 0u32;
+        let mut hs = 0u32;
+        // SAFETY: mgt 同进程；8 个 out 指针有效。
+        unsafe {
+            mgt.GetState(
+                &raw mut rate,
+                &raw mut active,
+                &raw mut name,
+                &raw mut tb,
+                &raw mut pd,
+                &raw mut lcid,
+                &raw mut hc,
+                &raw mut hs,
+            )
+            .expect("GetState");
+        }
+        assert_eq!(rate, 250, "GetState update_rate 反映 SetState");
+        assert!(!active.as_bool(), "GetState active=false 反映 SetState");
+        // SAFETY: name 由 GetState CoTaskMemAlloc 分配，调用方释放。
+        unsafe {
+            CoTaskMemFree(Some(name.as_ptr() as *const _));
+        }
+    }
+
+    /// `IOPCGroupStateMgt::SetName` + `GetState` 核心：SetName 后 GetState 的 name 反映。
+    #[test]
+    fn set_name_then_get_state_reflects() {
+        let g = new_group(); // 初值 name=""
+        let mgt: IOPCGroupStateMgt = g.cast::<IOPCGroupStateMgt>().expect("QI IOPCGroupStateMgt");
+        let name_wide = wide("my-group");
+        // SAFETY: mgt 同进程；PCWSTR 借用 name_wide（0 结尾 UTF-16）。
+        unsafe {
+            mgt.SetName(PCWSTR(name_wide.as_ptr())).expect("SetName");
+        }
+        let mut rate = 0u32;
+        let mut active = BOOL::default();
+        let mut name = PWSTR::null();
+        let mut tb = 0i32;
+        let mut pd = 0.0f32;
+        let mut lcid = 0u32;
+        let mut hc = 0u32;
+        let mut hs = 0u32;
+        // SAFETY: 同上。
+        unsafe {
+            mgt.GetState(
+                &raw mut rate,
+                &raw mut active,
+                &raw mut name,
+                &raw mut tb,
+                &raw mut pd,
+                &raw mut lcid,
+                &raw mut hc,
+                &raw mut hs,
+            )
+            .expect("GetState");
+        }
+        assert_eq!(
+            pwstr_to_string(name),
+            "my-group",
+            "SetName 后 GetState name 反映"
+        );
+        // SAFETY: name CoTaskMemAlloc 分配。
+        unsafe {
+            CoTaskMemFree(Some(name.as_ptr() as *const _));
         }
     }
 }

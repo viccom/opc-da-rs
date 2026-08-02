@@ -38,7 +38,7 @@ use opc_da_client::bindings::da::{
 };
 
 use crate::data_source::{DataSource, SimDataSource, now_filetime};
-use crate::objects::{ConnectionPoint, GroupObj};
+use crate::objects::{ConnectionPoint, GroupObj, pwstr_to_string};
 
 /// OPC DA Server COM 对象。
 ///
@@ -105,13 +105,13 @@ fn nyi<T>() -> Result<T> {
 impl IOPCServer_Impl for ServerObj_Impl {
     fn AddGroup(
         &self,
-        _szname: &PCWSTR,
-        _bactive: BOOL,
+        szname: &PCWSTR,
+        bactive: BOOL,
         dwrequestedupdaterate: u32,
-        _hclientgroup: u32,
-        _ptimebias: *const i32,
-        _ppercentdeadband: *const f32,
-        _dwlcid: u32,
+        hclientgroup: u32,
+        ptimebias: *const i32,
+        ppercentdeadband: *const f32,
+        dwlcid: u32,
         phservergroup: *mut u32,
         previsedupdaterate: *mut u32,
         riid: *const GUID,
@@ -120,29 +120,51 @@ impl IOPCServer_Impl for ServerObj_Impl {
         if phservergroup.is_null() || ppunk.is_null() || riid.is_null() {
             return Err(E_POINTER.into());
         }
-        // 创建 GroupObj（克隆 DataSource 引用），转 IUnknown（COM 对象 + 引用计数）。
-        let group_obj = GroupObj::new(self.data_source.clone());
-        let group_unk: IUnknown = group_obj.into();
-        // client 传 riid（通常 IID_IOPCItemMgt）——QI 到该接口，返回对应 vtable 指针。
+        // group state 初值：name/active 取参数；time_bias/percent_deadband 可选（非 null 取值）。
+        let name = pwstr_to_string(PWSTR(szname.as_ptr().cast_mut()));
+        let active = bactive.as_bool();
+        // SAFETY: ptimebias / ppercentdeadband 为 COM in 指针（调用方契约：非 null 时有效）。
+        let (time_bias, percent_deadband) = unsafe {
+            (
+                ptimebias.as_ref().copied().unwrap_or(0),
+                ppercentdeadband.as_ref().copied().unwrap_or(0.0),
+            )
+        };
         let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
-        // SAFETY: riid 由调用方提供（client 传 IOPCItemMgt::IID）；query 成功则 raw 填该
-        // 接口指针并 AddRef（+1），失败 raw 不改。
-        let hr = unsafe { group_unk.query(riid, &raw mut raw) };
-        if hr != S_OK || raw.is_null() {
-            return Err(E_NOINTERFACE.into());
+        {
+            let mut inner = locked(&self.inner);
+            let h = inner.alloc_handle();
+            // 创建 GroupObj（DataSource + group state 初值，含 h_server=h）。
+            let group_obj = GroupObj::new(
+                self.data_source.clone(),
+                name,
+                active,
+                dwrequestedupdaterate,
+                time_bias,
+                percent_deadband,
+                dwlcid,
+                hclientgroup,
+                h,
+            );
+            let group_unk: IUnknown = group_obj.into();
+            // client 传 riid（通常 IID_IOPCItemMgt）——QI 到该接口返回对应 vtable 指针。
+            // SAFETY: riid 调用方提供；query 成功填 raw + AddRef，失败 raw 不改。
+            let hr = unsafe { group_unk.query(riid, &raw mut raw) };
+            if hr != S_OK || raw.is_null() {
+                // QI 失败：group_unk drop（未 insert），不占注册表槽。
+                return Err(E_NOINTERFACE.into());
+            }
+            // 注册 group：server 持 group_unk（client 释放后仍存活到 RemoveGroup）。
+            inner.groups.insert(h, group_unk);
+            drop(inner);
+            // SAFETY: phservergroup 非空（上面校验）；h 为 u32 副本，锁已释放仍有效。
+            unsafe { *phservergroup = h };
         }
-        // SAFETY: raw 非 null（上面校验）；from_raw 包成 IUnknown，其 ABI 指向 riid vtable。
+        // SAFETY: raw 非 null（上面校验）；from_raw 包成 IUnknown，ABI 指向 riid vtable。
         let requested = unsafe { IUnknown::from_raw(raw) };
         // OutRef::write 用 transmute_copy + forget：把 requested 的 ABI（riid 指针）写入
         // ppunk，forget 避免局部 Release——该引用转交给 client。
         ppunk.write(Some(requested))?;
-        // 注册 group：server 持 group_unk（GroupObj 在 client 释放后仍存活到 RemoveGroup）。
-        let mut inner = locked(&self.inner);
-        let h = inner.alloc_handle();
-        inner.groups.insert(h, group_unk);
-        drop(inner);
-        // SAFETY: phservergroup 非空（上面校验）。
-        unsafe { *phservergroup = h };
         if !previsedupdaterate.is_null() {
             // SAFETY: previsedupdaterate 非空时为调用方 out 值。
             unsafe { *previsedupdaterate = dwrequestedupdaterate };
