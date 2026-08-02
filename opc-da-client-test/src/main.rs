@@ -256,6 +256,71 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 10. write_tag_values（多 tag write，IOPCSyncIO::Write[M8 扩展覆盖]）。
+    match client
+        .write_tag_values(
+            PROG_ID,
+            vec![("Bucket Brigade.Int4".to_string(), OpcValue::Int(99))],
+        )
+        .await
+    {
+        Ok(results) => {
+            if !results.is_empty() {
+                println!(
+                    "✓ write_tag_values (Bucket Brigade=99): {} 个结果 [M8]",
+                    results.len()
+                );
+                passed += 1;
+            } else {
+                println!("✗ write_tag_values: 返回空");
+                failed += 1;
+            }
+        }
+        Err(e) => {
+            println!("✗ write_tag_values: {e}");
+            failed += 1;
+        }
+    }
+
+    // 11. set_locale_id（IOPCCommon::SetLocaleID[M8]）。
+    match client.set_locale_id(PROG_ID, 0).await {
+        Ok(()) => {
+            println!("✓ set_locale_id (0=system default): Ok [M8 IOPCCommon]");
+            passed += 1;
+        }
+        Err(e) => {
+            println!("✗ set_locale_id: {e}");
+            failed += 1;
+        }
+    }
+
+    // 12. set_client_name（IOPCCommon::SetClientName[M8]）。
+    match client.set_client_name(PROG_ID, "opc-da-client-test").await {
+        Ok(()) => {
+            println!("✓ set_client_name: Ok [M8 IOPCCommon]");
+            passed += 1;
+        }
+        Err(e) => {
+            println!("✗ set_client_name: {e}");
+            failed += 1;
+        }
+    }
+
+    // 13. subscribe_shutdown（IOPCShutdown cp advise[M8]）。
+    match client.subscribe_shutdown(PROG_ID).await {
+        Ok(handle) => {
+            println!(
+                "✓ subscribe_shutdown: cookie={} advise 通 [M8 IOPCShutdown]",
+                handle.cookie
+            );
+            passed += 1;
+        }
+        Err(e) => {
+            println!("✗ subscribe_shutdown: {e}");
+            failed += 1;
+        }
+    }
+
     println!("\n=== 汇总: {passed} passed, {failed} failed ===");
     if failed > 0 {
         anyhow::bail!("{failed} 个接口失败");
