@@ -31,6 +31,8 @@ compile_error!(
 #[cfg(target_os = "windows")]
 pub mod class_factory;
 #[cfg(target_os = "windows")]
+pub mod data_source;
+#[cfg(target_os = "windows")]
 pub mod objects;
 #[cfg(target_os = "windows")]
 pub mod registry;
