@@ -102,7 +102,7 @@
 - [x] M1: 骨架 + `get_server_status` 端到端通（`375a388`；ServerObj 补 IConnectionPointContainer/IOPCItemProperties stub 满足 client v2::Server 强制 cast 4 接口）
 - [x] M2: `IOPCServer::AddGroup/RemoveGroup`（`b0ae27f`；端到端 read 探针验证 AddGroup+AddItems 通，Read 待 M3）
 - [x] M3: `IOPCSyncIO::Read/Write`（`46672bf`；端到端 read Random.Int4 + write Bucket Brigade=42 + round-trip=42 全 pass）
-- [ ] M4: `IOPCGroupStateMgt` + 测试 `set_subscription_rate`
+- [x] M4: `IOPCGroupStateMgt`（`c22b8ef`；GetState/SetState/SetName 实装 + 白盒 round-trip；set_subscription_rate 端到端待 M5 依赖 subscribe）
 - [ ] M5: `FindConnectionPoint` + publisher + `subscribe`
 - [ ] M6: `IOPCBrowseServerAddressSpace` + 测试 `browse`
 - [ ] M7: `IOPCItemProperties` + `IOPCCommon` 完整 + `list_servers`

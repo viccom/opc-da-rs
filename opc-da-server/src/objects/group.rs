@@ -1,11 +1,13 @@
 //! Group 对象——阶段 1。
 //!
-//! [`GroupObj`] 实现 `IOPCItemMgt` + `IOPCSyncIO`（已实装）+ 3 个仍为骨架（`E_NOTIMPL`）
-//! 的接口（`IOPCGroupStateMgt` / `IOPCAsyncIO2` / `IConnectionPointContainer`）。
+//! [`GroupObj`] 实现 `IOPCItemMgt` + `IOPCSyncIO` + `IOPCGroupStateMgt`（已实装）+ 2 个仍为
+//! 骨架（`E_NOTIMPL`）的接口（`IOPCAsyncIO2` / `IConnectionPointContainer`）。
 //! `IOPCItemMgt`：`AddItems` / `ValidateItems` / `RemoveItems` / `SetActiveState` /
 //! `SetClientHandles`——item 注册表（[`GroupInner`]）+ DataSource 元数据 + COM 内存。
 //! `IOPCSyncIO`：`Read`（DataSource::read → OPCITEMSTATE[]{hClient,ft,quality,vDataValue}）
 //! / `Write`（VARIANT → DataSource::write）；未知 handle 返回 `E_INVALIDARG`。
+//! `IOPCGroupStateMgt`：`GetState`（读 group state + name wide）/ `SetState`（null=不改）
+//! / `SetName`；`CloneGroup` 暂 `E_NOTIMPL`。
 //!
 //! `SetDatatypes` / `CreateEnumerator` 暂 `E_NOTIMPL`（后续阶段）。
 
