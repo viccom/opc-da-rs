@@ -198,6 +198,27 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // 7. get_item_properties（IOPCItemProperties[M7a]：QueryAvailableProperties +
+    //    GetItemProperties）。验证 Random.Int4 返回 property 列表（DATATYPE/VALUE/QUALITY/...）。
+    match client.get_item_properties(PROG_ID, "Random.Int4").await {
+        Ok(props) => {
+            if !props.is_empty() {
+                println!(
+                    "✓ get_item_properties (Random.Int4): {} 个 property [M7a]",
+                    props.len()
+                );
+                passed += 1;
+            } else {
+                println!("✗ get_item_properties: 返回空");
+                failed += 1;
+            }
+        }
+        Err(e) => {
+            println!("✗ get_item_properties: {e}");
+            failed += 1;
+        }
+    }
+
     println!("\n=== 汇总: {passed} passed, {failed} failed ===");
     if failed > 0 {
         anyhow::bail!("{failed} 个接口失败");

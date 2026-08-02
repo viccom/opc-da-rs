@@ -21,6 +21,7 @@
 )]
 
 use std::collections::HashMap;
+use std::mem::size_of;
 use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -31,20 +32,21 @@ use windows::Win32::System::Com::{
     CoTaskMemAlloc, CoTaskMemFree, IConnectionPoint, IConnectionPointContainer,
     IConnectionPointContainer_Impl, IEnumConnectionPoints, IEnumString,
 };
-use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Variant::{VARIANT, VT_I2, VT_I4};
 use windows::core::{
-    BOOL, GUID, HRESULT, IUnknown, Interface, OutRef, PCWSTR, PWSTR, Result, implement,
+    BOOL, Error, GUID, HRESULT, IUnknown, Interface, OutRef, PCWSTR, PWSTR, Result, implement,
 };
 
 use opc_da_client::bindings::comn::{IOPCCommon, IOPCCommon_Impl, IOPCShutdown};
 use opc_da_client::bindings::da::{
     IOPCBrowseServerAddressSpace, IOPCBrowseServerAddressSpace_Impl, IOPCItemProperties,
     IOPCItemProperties_Impl, IOPCServer, IOPCServer_Impl, OPC_BRANCH, OPC_NS_FLAT,
+    OPC_PROPERTY_ACCESS_RIGHTS, OPC_PROPERTY_DATATYPE, OPC_PROPERTY_QUALITY, OPC_PROPERTY_VALUE,
     OPC_STATUS_RUNNING, tagOPCBROWSEDIRECTION, tagOPCBROWSETYPE, tagOPCENUMSCOPE,
     tagOPCNAMESPACETYPE, tagOPCSERVERSTATUS,
 };
 
-use crate::data_source::{DataSource, SimDataSource, now_filetime};
+use crate::data_source::{DataSource, SimDataSource, now_filetime, variant_i2, variant_i4};
 use crate::objects::{ConnectionPoint, GroupObj, StringEnum, pwstr_to_string};
 
 /// OPC DA Server COM 对象。
@@ -293,35 +295,189 @@ impl IConnectionPointContainer_Impl for ServerObj_Impl {
 impl IOPCItemProperties_Impl for ServerObj_Impl {
     fn QueryAvailableProperties(
         &self,
-        _szitemid: &PCWSTR,
-        _pdwcount: *mut u32,
-        _pppropertyids: *mut *mut u32,
-        _ppdescriptions: *mut *mut PWSTR,
-        _ppvtdatatypes: *mut *mut u16,
+        szitemid: &PCWSTR,
+        pdwcount: *mut u32,
+        pppropertyids: *mut *mut u32,
+        ppdescriptions: *mut *mut PWSTR,
+        ppvtdatatypes: *mut *mut u16,
     ) -> Result<()> {
-        nyi()
+        if pdwcount.is_null()
+            || pppropertyids.is_null()
+            || ppdescriptions.is_null()
+            || ppvtdatatypes.is_null()
+        {
+            return Err(E_POINTER.into());
+        }
+        let item_id = pwstr_to_string(PWSTR(szitemid.as_ptr().cast_mut()));
+        let meta = self
+            .data_source
+            .item_meta(&item_id)
+            .ok_or_else(|| Error::from(E_INVALIDARG))?;
+        // 4 property: DATATYPE / VALUE / QUALITY / ACCESS_RIGHTS。
+        // (id, property 值的 VT, 描述)
+        let props: [(u32, u16, &str); 4] = [
+            (OPC_PROPERTY_DATATYPE, VT_I2.0, "Data type"),
+            (OPC_PROPERTY_VALUE, meta.data_type.0, "Value"),
+            (OPC_PROPERTY_QUALITY, VT_I2.0, "Quality"),
+            (OPC_PROPERTY_ACCESS_RIGHTS, VT_I4.0, "Access Rights"),
+        ];
+        let n = props.len();
+        // SAFETY: CoTaskMemAlloc 3 数组（ids/descs/vts），所有权交 client。
+        let ids_ptr = unsafe { CoTaskMemAlloc(size_of::<u32>() * n) }.cast::<u32>();
+        let descs_ptr = unsafe { CoTaskMemAlloc(size_of::<PWSTR>() * n) }.cast::<PWSTR>();
+        let vts_ptr = unsafe { CoTaskMemAlloc(size_of::<u16>() * n) }.cast::<u16>();
+        if ids_ptr.is_null() || descs_ptr.is_null() || vts_ptr.is_null() {
+            // SAFETY: 已分配的释放（可能 null，CoTaskMemFree 容忍）。
+            unsafe {
+                CoTaskMemFree(Some(ids_ptr.cast()));
+                CoTaskMemFree(Some(descs_ptr.cast()));
+                CoTaskMemFree(Some(vts_ptr.cast()));
+            }
+            return Err(E_OUTOFMEMORY.into());
+        }
+        for (i, (id, vt, desc)) in props.iter().enumerate() {
+            // SAFETY: ids_ptr / vts_ptr 各 n 槽；i < n。
+            unsafe {
+                *ids_ptr.add(i) = *id;
+                *vts_ptr.add(i) = *vt;
+            }
+            // desc → wide（CoTaskMemAlloc，所有权交 client）。
+            let w: Vec<u16> = desc.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: 分配 w.len()*2 字节。
+            let dptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
+            if dptr.is_null() {
+                return Err(E_OUTOFMEMORY.into());
+            }
+            // SAFETY: dptr 刚分配；拷贝 desc wide（含 null）。
+            unsafe {
+                copy_nonoverlapping(w.as_ptr(), dptr, w.len());
+                *descs_ptr.add(i) = PWSTR(dptr);
+            }
+        }
+        // SAFETY: 4 个 out 指针非空（上面校验）。
+        unsafe {
+            *pdwcount = u32::try_from(n).unwrap_or(u32::MAX);
+            *pppropertyids = ids_ptr;
+            *ppdescriptions = descs_ptr;
+            *ppvtdatatypes = vts_ptr;
+        }
+        Ok(())
     }
 
+    #[allow(clippy::cast_possible_wrap)] // VT/quality 值小，u16→i16 安全
     fn GetItemProperties(
         &self,
-        _szitemid: &PCWSTR,
-        _dwcount: u32,
-        _pdwpropertyids: *const u32,
-        _ppvdata: *mut *mut VARIANT,
-        _pperrors: *mut *mut HRESULT,
+        szitemid: &PCWSTR,
+        dwcount: u32,
+        pdwpropertyids: *const u32,
+        ppvdata: *mut *mut VARIANT,
+        pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
-        nyi()
+        if dwcount == 0 || pdwpropertyids.is_null() || ppvdata.is_null() || pperrors.is_null() {
+            return Err(E_POINTER.into());
+        }
+        let n = dwcount as usize;
+        let item_id = pwstr_to_string(PWSTR(szitemid.as_ptr().cast_mut()));
+        let meta = self
+            .data_source
+            .item_meta(&item_id)
+            .ok_or_else(|| Error::from(E_INVALIDARG))?;
+        // SAFETY: CoTaskMemAlloc values[n] + errors[n]。
+        let values_ptr = unsafe { CoTaskMemAlloc(size_of::<VARIANT>() * n) }.cast::<VARIANT>();
+        let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+        if values_ptr.is_null() || errors_ptr.is_null() {
+            // SAFETY: 已分配的释放。
+            unsafe {
+                CoTaskMemFree(Some(values_ptr.cast()));
+                CoTaskMemFree(Some(errors_ptr.cast()));
+            }
+            return Err(E_OUTOFMEMORY.into());
+        }
+        let (read_v, read_q, _) = self.data_source.read(&item_id);
+        let rights = if meta.writable { 3i32 } else { 1 }; // readable=1 | writable=2
+        for i in 0..n {
+            // SAFETY: pdwpropertyids 含 dwcount 个 u32；i < n。
+            let pid = unsafe { *pdwpropertyids.add(i) };
+            let (v, hr) = match pid {
+                OPC_PROPERTY_DATATYPE => (variant_i2(meta.data_type.0 as i16), S_OK),
+                OPC_PROPERTY_VALUE => (read_v.clone(), S_OK),
+                OPC_PROPERTY_QUALITY => (variant_i2(read_q as i16), S_OK),
+                OPC_PROPERTY_ACCESS_RIGHTS => (variant_i4(rights), S_OK),
+                _ => (VARIANT::default(), E_INVALIDARG),
+            };
+            // SAFETY: values_ptr / errors_ptr 各 n 槽；i < n。直接写（裸内存，move VARIANT）。
+            unsafe {
+                *values_ptr.add(i) = v;
+                *errors_ptr.add(i) = hr;
+            }
+        }
+        // SAFETY: out 指针非空。
+        unsafe {
+            *ppvdata = values_ptr;
+            *pperrors = errors_ptr;
+        }
+        Ok(())
     }
 
     fn LookupItemIDs(
         &self,
-        _szitemid: &PCWSTR,
-        _dwcount: u32,
-        _pdwpropertyids: *const u32,
-        _ppsznewitemids: *mut *mut PWSTR,
-        _pperrors: *mut *mut HRESULT,
+        szitemid: &PCWSTR,
+        dwcount: u32,
+        pdwpropertyids: *const u32,
+        ppsznewitemids: *mut *mut PWSTR,
+        pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
-        nyi()
+        if dwcount == 0
+            || pdwpropertyids.is_null()
+            || ppsznewitemids.is_null()
+            || pperrors.is_null()
+        {
+            return Err(E_POINTER.into());
+        }
+        let n = dwcount as usize;
+        let item_id = pwstr_to_string(PWSTR(szitemid.as_ptr().cast_mut()));
+        if self.data_source.item_meta(&item_id).is_none() {
+            return Err(E_INVALIDARG.into());
+        }
+        // SAFETY: CoTaskMemAlloc ids[n] + errors[n]。
+        let ids_ptr = unsafe { CoTaskMemAlloc(size_of::<PWSTR>() * n) }.cast::<PWSTR>();
+        let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+        if ids_ptr.is_null() || errors_ptr.is_null() {
+            // SAFETY: 已分配的释放。
+            unsafe {
+                CoTaskMemFree(Some(ids_ptr.cast()));
+                CoTaskMemFree(Some(errors_ptr.cast()));
+            }
+            return Err(E_OUTOFMEMORY.into());
+        }
+        for i in 0..n {
+            // SAFETY: pdwpropertyids 含 dwcount 个 u32；i < n。
+            let pid = unsafe { *pdwpropertyids.add(i) };
+            // flat: VALUE/QUALITY 可作为 item browse → property item id = item_id；
+            // 其他 property 非 item → 空串 + E_INVALIDARG。
+            let (id_str, hr) = match pid {
+                OPC_PROPERTY_VALUE | OPC_PROPERTY_QUALITY => (item_id.clone(), S_OK),
+                _ => (String::new(), E_INVALIDARG),
+            };
+            let w: Vec<u16> = id_str.encode_utf16().chain(std::iter::once(0)).collect();
+            // SAFETY: 分配 w.len()*2（≥2，含 null）。
+            let iptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
+            if iptr.is_null() {
+                return Err(E_OUTOFMEMORY.into());
+            }
+            // SAFETY: iptr 刚分配；拷贝 wide（含 null）。
+            unsafe {
+                copy_nonoverlapping(w.as_ptr(), iptr, w.len());
+                *ids_ptr.add(i) = PWSTR(iptr);
+                *errors_ptr.add(i) = hr;
+            }
+        }
+        // SAFETY: out 指针非空。
+        unsafe {
+            *ppsznewitemids = ids_ptr;
+            *pperrors = errors_ptr;
+        }
+        Ok(())
     }
 }
 
@@ -385,8 +541,8 @@ mod tests {
     use opc_da_client::bindings::da::{
         IOPCBrowseServerAddressSpace, IOPCItemProperties, IOPCServer, OPC_NS_FLAT,
     };
-    use windows::Win32::System::Com::IConnectionPointContainer;
-    use windows::core::{IUnknown, Interface, PCWSTR};
+    use windows::Win32::System::Com::{CoTaskMemFree, IConnectionPointContainer};
+    use windows::core::{IUnknown, Interface, PCWSTR, PWSTR};
 
     /// 验证 4 接口 `#[implement]` 共存——QI 到 client connect 强制 cast 的 4 接口 +
     /// `IUnknown` 都成功。
@@ -420,6 +576,48 @@ mod tests {
         // SAFETY: browse 同进程 implement 对象；QueryOrganization 返回 namespace 类型。
         let org = unsafe { browse.QueryOrganization() }.expect("QueryOrganization");
         assert_eq!(org, OPC_NS_FLAT, "SimDataSource flat 命名空间");
+    }
+
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// `IOPCItemProperties::QueryAvailableProperties`：已知 item 返回 4 property
+    ///（DATATYPE/VALUE/QUALITY/ACCESS_RIGHTS）。
+    #[test]
+    fn item_properties_query_returns_4_for_known_item() {
+        let server: IOPCItemProperties = ServerObj::new().into();
+        let id = wide("Random.Int4");
+        let mut count = 0u32;
+        let mut ids: *mut u32 = core::ptr::null_mut();
+        let mut descs: *mut PWSTR = core::ptr::null_mut();
+        let mut vts: *mut u16 = core::ptr::null_mut();
+        // SAFETY: server 同进程 implement 对象；id 为 0 结尾 UTF-16。
+        unsafe {
+            server
+                .QueryAvailableProperties(
+                    PCWSTR(id.as_ptr()),
+                    &raw mut count,
+                    &raw mut ids,
+                    &raw mut descs,
+                    &raw mut vts,
+                )
+                .expect("QueryAvailableProperties");
+        }
+        assert_eq!(
+            count, 4,
+            "Random.Int4 应有 4 property（DATATYPE/VALUE/QUALITY/ACCESS_RIGHTS）"
+        );
+        // 释放 descs（每个 wide）+ 3 个数组（CoTaskMemFree）。
+        // SAFETY: count=4；descs 含 4 个 CoTaskMemAlloc 的 PWSTR。
+        unsafe {
+            for i in 0..count as usize {
+                CoTaskMemFree(Some(descs.add(i).read().as_ptr() as *const _));
+            }
+            CoTaskMemFree(Some(ids.cast()));
+            CoTaskMemFree(Some(descs.cast()));
+            CoTaskMemFree(Some(vts.cast()));
+        }
     }
 
     /// AddGroup/RemoveGroup/GetStatus 联动：add 后 group_count 增，remove 后减。

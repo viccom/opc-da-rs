@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, E_INVALIDARG, FILETIME, S_OK};
-use windows::Win32::System::Variant::{VARENUM, VARIANT, VT_I4, VT_R8};
+use windows::Win32::System::Variant::{VARENUM, VARIANT, VT_I2, VT_I4, VT_R8};
 use windows::core::HRESULT;
 
 /// OPC 质量掩码（低 6 位为质量；高 2 位为 limit）。`GOOD`=0xC0，`BAD`=0x00。
@@ -168,7 +168,7 @@ impl DataSource for SimDataSource {
 // client 禁止"，server 侧自实现，不暴露 client internals）。
 
 /// 构造 `VT_I4` VARIANT。
-fn variant_i4(value: i32) -> VARIANT {
+pub(crate) fn variant_i4(value: i32) -> VARIANT {
     let mut var = VARIANT::default();
     // SAFETY: 设 vt 判别 + 对应 union 字段 lVal。var 按值返回，无并发/别名。
     unsafe {
@@ -179,12 +179,23 @@ fn variant_i4(value: i32) -> VARIANT {
 }
 
 /// 构造 `VT_R8` VARIANT。
-fn variant_r8(value: f64) -> VARIANT {
+pub(crate) fn variant_r8(value: f64) -> VARIANT {
     let mut var = VARIANT::default();
     // SAFETY: 同 `variant_i4`；dblVal 为 f64 union 字段。
     unsafe {
         (*var.Anonymous.Anonymous).vt = VT_R8;
         (*var.Anonymous.Anonymous).Anonymous.dblVal = value;
+    }
+    var
+}
+
+/// 构造 `VT_I2` VARIANT（property DATATYPE/QUALITY 用）。
+pub(crate) fn variant_i2(value: i16) -> VARIANT {
+    let mut var = VARIANT::default();
+    // SAFETY: 同 `variant_i4`；iVal 为 i16 union 字段。
+    unsafe {
+        (*var.Anonymous.Anonymous).vt = VT_I2;
+        (*var.Anonymous.Anonymous).Anonymous.iVal = value;
     }
     var
 }
