@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Explicit DCOM credentials** (`AuthCredentials` + `OpcDaClient::with_credentials` / `ComConnector::with_credentials`): inject `COAUTHIDENTITY` for cross-domain / service-account remote access. Empty `user` falls back to the current logged-in user (DCOM default auth).
+- **Fusion reader** (`FusionReader` / `FusionEvent` / `FusionReaderOptions`): a push-preferred / synchronous-polling-fallback stream. Prefers an `IOPCDataCallback` subscription and automatically falls back to polling when the reverse-DCOM callback is blocked. Teardown runs on a dedicated OS thread (`DetachingClient`) so dropping a remote client cannot block the tokio runtime, and it unsubscribes the server group gracefully.
+- **Server details** (`list_servers_with_details` / `ServerDesc`): enriches the server list with CLSID + vendor user-type via `IOPCServerList::GetClassDetails`. The default trait impl degrades to ProgID-only, so simple backends stay compatible.
+- **DCOM auth example** (`examples/verify_dcom_auth.rs`): minimal credential-verification CLI.
+
+### Fixed
+- **`AuthInfo` / `ServerInfo` bridge ownership**: the bridge now owns `COAUTHINFO` / `COAUTHIDENTITY` on the heap (`Box`), eliminating the dangling-pointer crash (`0x800703E6` on 32-bit) that the previous `pAuthInfo: null` workaround papered over — and enabling real explicit credentials.
+- **Fusion teardown**: `FusionReader::drop` now signals graceful shutdown and unsubscribes the cookie (with timeout guards) instead of `abort`-ing the task and relying on server lease expiry (e2e-verified via `remove_group_count`).
+
+### Security
+- `AuthIdentity` / `AuthCredentials` `Debug` impls now mask the password (`***`), so credentials never reach logs or error messages.
+
 ## [0.3.1] - 2026-07-31
 
 ### Added

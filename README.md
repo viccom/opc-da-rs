@@ -1,23 +1,39 @@
 # OPC DA Client CLI
 
+> **Language**: [English](README.md) | [简体中文](README.zh-CN.md)
+
 A modern, asynchronous TUI (Terminal User Interface) client for browsing, reading, and writing OPC DA (Data Access) tags on Windows.
+
+## 🧩 Components
+
+This repository is a Cargo workspace with three crates:
+
+| Crate | Description |
+| :--- | :--- |
+| **[`opc-cli`](./opc-cli/)** | The interactive TUI application (`ratatui` + `crossterm`). The binary this README focuses on. |
+| **[`opc-da-client`](./opc-da-client/)** | The async OPC DA library — the `OpcProvider` trait + native `windows-rs` COM backend, used by both apps. ([README](./opc-da-client/README.md)) |
+| **[`opc-da-desktop`](./opc-da-desktop/)** | A Tauri 2 desktop GUI (React + TypeScript) for browsing, subscribing, and writing tags. ([README](./opc-da-desktop/README.md)) |
+
+Further reading: high-level map in **[ARCHITECTURE_DIAGRAM.md](./ARCHITECTURE_DIAGRAM.md)**, library deep-dive in **[opc-da-client/architecture.md](./opc-da-client/architecture.md)**, and the sync/async/subscription + DCOM walkthrough in **[DCOM_GUIDE.md](./DCOM_GUIDE.md)**.
 
 ## 🏗️ Architecture
 
-The project is structured as a Cargo workspace with two crates:
+The project is structured as a Cargo workspace (see above):
 
 - **`opc-cli`**: The interactive TUI application built with `ratatui` + `crossterm`.
 - **`opc-da-client`**: A native Windows COM library (using `windows-rs`) that abstracts OPC DA communication through an async trait (`OpcProvider`). Generic over `ServerConnector` for easy mocking.
 
-See **[architecture.md](./architecture.md)** for the full design, state machine, and data flow diagrams.
+See **[opc-da-client/architecture.md](./opc-da-client/architecture.md)** for the full design, state machine, and data flow diagrams.
 
 ## ✨ Features
 
-- **Server Discovery**: Enumerate OPC DA servers on local or remote hosts (DCOM).
-- **Hierarchical Browsing**: Recursive exploration of complex server namespaces with partial-result harvesting on timeout, data-type/access-rights filtering.
-- **Real-time Subscription**: Event-driven data-change notifications via `IOPCDataCallback` (true push, not polling). The TUI also supports 1-second auto-refresh polling as a fallback.
+- **Server Discovery**: Enumerate OPC DA servers on local or remote hosts (DCOM), with optional CLSID + vendor description (`list_servers_with_details`).
+- **Explicit DCOM Credentials**: Authenticate to remote servers with a dedicated user/password/domain — for cross-domain or service-account access.
+- **Hierarchical Browsing**: Recursive exploration of complex server namespaces with partial-result harvesting on timeout, data-type/access-rights filtering, and lazy one-level browse (`browse_children`).
+- **Real-time Subscription**: Event-driven data-change notifications via `IOPCDataCallback` (true push, not polling), with self-healing on a silently-dead callback. The TUI also supports 1-second auto-refresh polling as a fallback.
+- **Fusion Reader**: A push-preferred / polling-fallback stream (`FusionReader`) so a blocked reverse-DCOM callback can never leave consumers with stale data — used by the desktop app.
 - **Tag Read/Write**: Synchronous read, MaxAge read (`IOPCSyncIO2`), VQT write (value + quality + timestamp), and batch operations.
-- **Diagnostics**: Server status, item properties (EU/data type/access rights), localized error strings, server-shutdown notifications.
+- **Diagnostics**: Server status (`IOPCServer::GetStatus`), item properties (EU/data type/access rights), localized error strings, server-shutdown notifications.
 - **Connection Resilience**: Connection pooling with stale-proxy eviction, exponential-backoff reconnect, explicit disconnect/reconnect API.
 - **Search & Filter**: Substring search with `Tab`/`Shift+Tab` cycling through matches.
 - **Rich Error Hints**: Human-readable explanations for cryptic Windows COM/DCOM HRESULT codes.
