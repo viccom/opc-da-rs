@@ -33,6 +33,8 @@
 9. 勾选本 Runbook checklist（`[ ]` → `[x]`）+ `git add` Runbook + `git commit -m "chore(runbook): 勾选 <task>"` + push 两 remote。
 10. 判断：§5 还有"能自主" `[ ]`？有 → 调度下一轮（ScheduleWakeup）；无 → §4 停止（完成报告）。
 
+**端到端验证（计划 `purring-chasing-dusk.md`）**：每轮 server 接口实装 + verify + commit 后，在 `opc-da-client-test` 加对应命令，`opc-da-server /RegServer` + 跑端到端实测 pass。改 server 后须先 `taskkill /F /IM opc-da-server.exe`（释放 exe 锁）才能重 build；Git Bash 调 `/RegServer` 用 pwsh 绕过 MSYS2 路径转换。
+
 ## 3. 关键技术约定（避免重复踩坑，详见设计文档 §18）
 
 - 多接口 `#[implement(A, B)]` → `impl A_Impl for XXX_Impl`（宏生成的 `_Impl` 类型，非原始）。
@@ -95,6 +97,16 @@
 - [ ] unsafe / 内存 review（每个 unsafe 块 SAFETY 注释完备）
 - [ ] 并发同步（`Mutex` 守护 group/item 注册表 + sink 表）
 - [ ] 阶段 1 自闭环 e2e 入 `verify.ps1`（Windows job）
+
+### 端到端 milestone（opc-da-client-test，计划 `purring-chasing-dusk.md`）
+- [x] M1: 骨架 + `get_server_status` 端到端通（`375a388`；ServerObj 补 IConnectionPointContainer/IOPCItemProperties stub 满足 client v2::Server 强制 cast 4 接口）
+- [ ] M2: `IOPCServer::AddGroup/RemoveGroup` + 测试 `add_group`
+- [ ] M3: `IOPCSyncIO::Read/Write` + 测试 `read`/`write`
+- [ ] M4: `IOPCGroupStateMgt` + 测试 `set_subscription_rate`
+- [ ] M5: `FindConnectionPoint` + publisher + `subscribe`
+- [ ] M6: `IOPCBrowseServerAddressSpace` + 测试 `browse`
+- [ ] M7: `IOPCItemProperties` + `IOPCCommon` 完整 + `list_servers`
+- [ ] M8: 端到端全量验证（所有接口 pass）
 
 ### 需用户回（循环遇即停）
 - 阶段 3 DCOM 远程验证 / 真实 client 互操作 / `/RegServer` 实跑 / CLSID 正式分配 / crates.io 发版
