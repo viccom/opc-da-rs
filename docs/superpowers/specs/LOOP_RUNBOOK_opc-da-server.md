@@ -66,7 +66,7 @@
 - [x] verify.ps1 全门过 + commit + push
 
 ### 阶段 1 — MVP（client read/write/subscribe 自建 server）
-- [ ] `objects/connection_point.rs`：通用 `ConnectionPoint`（Advise/Unadvise/EnumConnections，持有 client sink 表）
+- [x] `objects/connection_point.rs`：通用 `ConnectionPoint`（Advise/Unadvise/EnumConnections，持有 client sink 表）
 - [ ] `objects/group.rs`：Group 对象骨架 `#[implement(IOPCItemMgt, IOPCGroupStateMgt, IOPCSyncIO, IOPCAsyncIO2, IConnectionPointContainer)]`（注意 `_Impl` target）
 - [ ] `data_source.rs`：`DataSource` trait + `SimDataSource`（tag 树 + Random/Counter 值产生器 + 后台刷新）
 - [ ] `IOPCItemMgt`：AddItems / RemoveItems / ValidateItems / SetActiveState / SetClientHandles
