@@ -24,13 +24,17 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use windows::Win32::Foundation::{E_INVALIDARG, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, S_OK};
+use windows::Win32::Foundation::{
+    E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, S_OK,
+};
 use windows::Win32::System::Com::{
     CoTaskMemAlloc, CoTaskMemFree, IConnectionPoint, IConnectionPointContainer,
     IConnectionPointContainer_Impl, IEnumConnectionPoints,
 };
 use windows::Win32::System::Variant::{VARENUM, VARIANT};
-use windows::core::{BOOL, Error, GUID, HRESULT, IUnknown, PCWSTR, PWSTR, Result, implement};
+use windows::core::{
+    BOOL, Error, GUID, HRESULT, IUnknown, Interface, PCWSTR, PWSTR, Result, implement,
+};
 
 use opc_da_client::bindings::da::{
     IOPCAsyncIO2, IOPCAsyncIO2_Impl, IOPCDataCallback, IOPCGroupStateMgt, IOPCGroupStateMgt_Impl,
@@ -122,10 +126,10 @@ impl GroupInner {
 pub struct GroupObj {
     inner: Mutex<GroupInner>,
     data_source: Arc<dyn DataSource>,
-    /// 订阅 sink 连接点。后续 `IConnectionPointContainer::FindConnectionPoint` 返回它，
-    /// publisher 引擎（§10）遍历推送 `OnDataChange`。
-    #[allow(dead_code)] // 后续 FindConnectionPoint + publisher 接入
-    pub(crate) data_cp: ConnectionPoint<IOPCDataCallback>,
+    /// 订阅 sink 连接点（`IConnectionPoint` 接口，指向 `ConnectionPoint<IOPCDataCallback>`
+    /// COM 对象，refcount 由 COM 自管）。`FindConnectionPoint(IOPCDataCallback)` 返回它的
+    /// clone（AddRef）；publisher 引擎（§10）经 `EnumConnections` 遍历 sink 推送 `OnDataChange`。
+    pub(crate) data_cp: IConnectionPoint,
 }
 
 impl GroupObj {
@@ -160,7 +164,7 @@ impl GroupObj {
                 h_server_group,
             }),
             data_source,
-            data_cp: ConnectionPoint::new(),
+            data_cp: ConnectionPoint::<IOPCDataCallback>::new().into(),
         }
     }
 }
@@ -716,8 +720,19 @@ impl IConnectionPointContainer_Impl for GroupObj_Impl {
         nyi()
     }
 
-    fn FindConnectionPoint(&self, _riid: *const GUID) -> Result<IConnectionPoint> {
-        nyi()
+    fn FindConnectionPoint(&self, riid: *const GUID) -> Result<IConnectionPoint> {
+        if riid.is_null() {
+            return Err(Error::from(E_POINTER));
+        }
+        // SAFETY: riid 非空（上面校验）；调用方提供的有效 GUID。
+        let iid = unsafe { *riid };
+        if iid == <IOPCDataCallback as Interface>::IID {
+            // data_cp 是 IConnectionPoint 接口；clone = AddRef，返回独立指针指向同一
+            // ConnectionPoint 对象，所有权交 client（client Unadvise/Release 时减 ref）。
+            Ok(self.data_cp.clone())
+        } else {
+            Err(Error::from(E_NOINTERFACE))
+        }
     }
 }
 
@@ -725,6 +740,7 @@ impl IConnectionPointContainer_Impl for GroupObj_Impl {
 mod tests {
     use super::*;
     use crate::data_source::{OPC_QUALITY_GOOD, SimDataSource};
+    use opc_da_client::bindings::comn::IOPCShutdown;
     use opc_da_client::bindings::da::{IOPCItemMgt, IOPCSyncIO, OPC_DS_DEVICE};
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::Variant::{VARIANT, VT_I4, VT_R8};
@@ -1162,5 +1178,43 @@ mod tests {
         unsafe {
             CoTaskMemFree(Some(name.as_ptr() as *const _));
         }
+    }
+
+    /// `IConnectionPointContainer::FindConnectionPoint(IOPCDataCallback::IID)` 返回 data_cp
+    /// 的 IConnectionPoint，其 `GetConnectionInterface` == IOPCDataCallback::IID。
+    #[test]
+    fn find_connection_point_returns_data_cp_for_datacallback() {
+        let g = new_group();
+        let cpc: IConnectionPointContainer = g
+            .cast::<IConnectionPointContainer>()
+            .expect("QI IConnectionPointContainer");
+        // SAFETY: cpc 同进程 implement 对象；iid_dc 有效 GUID。
+        let iid_dc = IOPCDataCallback::IID;
+        let cp = unsafe { cpc.FindConnectionPoint(&raw const iid_dc) }
+            .expect("FindConnectionPoint IOPCDataCallback");
+        // SAFETY: cp 同进程；GetConnectionInterface 返回 cp 注册的 sink IID。
+        let iid = unsafe { cp.GetConnectionInterface() }.expect("GetConnectionInterface");
+        assert_eq!(
+            iid,
+            IOPCDataCallback::IID,
+            "data_cp 的连接接口应是 IOPCDataCallback"
+        );
+    }
+
+    /// `FindConnectionPoint` 不支持的 sink IID（IOPCShutdown）返回 E_NOINTERFACE。
+    #[test]
+    fn find_connection_point_unsupported_iid_returns_nointerface() {
+        let g = new_group();
+        let cpc: IConnectionPointContainer = g
+            .cast::<IConnectionPointContainer>()
+            .expect("QI IConnectionPointContainer");
+        // SAFETY: cpc 同进程。
+        let iid_shutdown = IOPCShutdown::IID;
+        let err = unsafe { cpc.FindConnectionPoint(&raw const iid_shutdown) }.unwrap_err();
+        assert_eq!(
+            err.code(),
+            E_NOINTERFACE,
+            "Group 不支持 IOPCShutdown（那是 Server 的 cp），应 E_NOINTERFACE"
+        );
     }
 }

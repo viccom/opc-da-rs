@@ -27,6 +27,7 @@ use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, OpcValue};
 const PROG_ID: &str = "opc-da-rs.Server.1";
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)] // 端到端探针线性排列，拆分无收益
 async fn main() -> anyhow::Result<()> {
     println!("=== opc-da-client-test: client ↔ opc-da-server 端到端 ===");
     println!("目标 ProgID: {PROG_ID}\n");
@@ -124,6 +125,25 @@ async fn main() -> anyhow::Result<()> {
         },
         Err(e) => {
             println!("✗ read round-trip Bucket Brigade.Int4: {e}");
+            failed += 1;
+        }
+    }
+
+    // 5. subscribe（AddGroup + AddItems + FindConnectionPoint[M5a] + Advise DataCallbackSink）。
+    //    M5a 验证 advise 链路通（handle 返回 + cookie 非 0）；OnDataChange 推送待 M5b publisher。
+    match client
+        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .await
+    {
+        Ok(handle) => {
+            println!(
+                "✓ subscribe (Random.Int4): cookie={} advise 通 [M5a FindConnectionPoint]",
+                handle.cookie
+            );
+            passed += 1;
+        }
+        Err(e) => {
+            println!("✗ subscribe (Random.Int4): {e}");
             failed += 1;
         }
     }

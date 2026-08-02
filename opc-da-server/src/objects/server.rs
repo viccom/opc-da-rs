@@ -48,9 +48,9 @@ use crate::objects::{ConnectionPoint, GroupObj, pwstr_to_string};
 pub struct ServerObj {
     inner: Mutex<ServerInner>,
     data_source: Arc<dyn DataSource>,
-    /// shutdown sink 连接点。后续 `FindConnectionPoint(IOPCShutdown)` 返回它（M5）。
-    #[allow(dead_code)]
-    shutdown_cp: ConnectionPoint<IOPCShutdown>,
+    /// shutdown sink 连接点（`IConnectionPoint` 接口，指向 `ConnectionPoint<IOPCShutdown>`
+    /// COM 对象，refcount 由 COM 自管）。`FindConnectionPoint(IOPCShutdown)` 返回它的 clone。
+    shutdown_cp: IConnectionPoint,
 }
 
 impl ServerObj {
@@ -59,7 +59,7 @@ impl ServerObj {
         Self {
             inner: Mutex::new(ServerInner::new()),
             data_source: Arc::new(SimDataSource::new()),
-            shutdown_cp: ConnectionPoint::new(),
+            shutdown_cp: ConnectionPoint::<IOPCShutdown>::new().into(),
         }
     }
 }
@@ -262,8 +262,18 @@ impl IConnectionPointContainer_Impl for ServerObj_Impl {
         nyi()
     }
 
-    fn FindConnectionPoint(&self, _riid: *const GUID) -> Result<IConnectionPoint> {
-        nyi()
+    fn FindConnectionPoint(&self, riid: *const GUID) -> Result<IConnectionPoint> {
+        if riid.is_null() {
+            return Err(E_POINTER.into());
+        }
+        // SAFETY: riid 非空（上面校验）；调用方提供的有效 GUID。
+        let iid = unsafe { *riid };
+        if iid == <IOPCShutdown as Interface>::IID {
+            // clone = AddRef，返回独立 IConnectionPoint 指向同一 ConnectionPoint 对象。
+            Ok(self.shutdown_cp.clone())
+        } else {
+            Err(E_NOINTERFACE.into())
+        }
     }
 }
 
