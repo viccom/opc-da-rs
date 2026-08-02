@@ -3,6 +3,7 @@ members = [
     "opc-cli",
     "opc-da-client",
     "opc-da-desktop",
+    "opc-da-server",
 ]
 exclude = [
     "compat/*",

@@ -2303,6 +2303,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-da-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "opc-da-client",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
