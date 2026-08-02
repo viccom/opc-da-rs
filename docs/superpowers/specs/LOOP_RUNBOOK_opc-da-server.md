@@ -100,7 +100,7 @@
 
 ### 端到端 milestone（opc-da-client-test，计划 `purring-chasing-dusk.md`）
 - [x] M1: 骨架 + `get_server_status` 端到端通（`375a388`；ServerObj 补 IConnectionPointContainer/IOPCItemProperties stub 满足 client v2::Server 强制 cast 4 接口）
-- [ ] M2: `IOPCServer::AddGroup/RemoveGroup` + 测试 `add_group`
+- [x] M2: `IOPCServer::AddGroup/RemoveGroup`（`b0ae27f`；端到端 read 探针验证 AddGroup+AddItems 通，Read 待 M3）
 - [ ] M3: `IOPCSyncIO::Read/Write` + 测试 `read`/`write`
 - [ ] M4: `IOPCGroupStateMgt` + 测试 `set_subscription_rate`
 - [ ] M5: `FindConnectionPoint` + publisher + `subscribe`
