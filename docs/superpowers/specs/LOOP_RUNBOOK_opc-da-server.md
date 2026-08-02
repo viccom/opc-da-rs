@@ -108,7 +108,7 @@
 - [x] M6: `IOPCBrowseServerAddressSpace`（`ff9132c`；QueryOrganization=FLAT + BrowseOPCItemIDs；browse 端到端列 4 tag，6 passed）
 - [x] M7a: `IOPCItemProperties`（`956b4f6`；QueryAvailableProperties/GetItemProperties/LookupItemIDs；get_item_properties 端到端 4 property，7 passed）
 - [x] M7b: `IOPCCommon` GetErrorString + `list_servers`（`bbb4c67`；双视图注册解决位宽坑；list_servers 枚举到 opc-da-rs，9 passed）
-- [ ] M8: 端到端全量验证（所有接口 pass）
+- [x] M8: 端到端全量验证（`5f3e53b`；13 探针全 pass——server 全部已实装接口覆盖；read_max_age/write_vqt/set_keep_alive 待 DA3 阶段 2）
 
 ### 需用户回（循环遇即停）
 - 阶段 3 DCOM 远程验证 / 真实 client 互操作 / `/RegServer` 实跑 / CLSID 正式分配 / crates.io 发版

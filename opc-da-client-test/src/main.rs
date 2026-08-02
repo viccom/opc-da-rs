@@ -11,15 +11,19 @@
 //! 2. server EXE 在 `target/{debug,release}/opc-da-server.exe`（SCM 按注册的
 //!    `LocalServer32` 路径拉起）。
 //!
-//! # 当前覆盖（M3）
+//! # 当前覆盖（M8：全量验证）
 //!
-//! - `get_server_status`（`IOPCServer::GetStatus`）。
-//! - `read_tag_values`（AddGroup + AddItems + `IOPCSyncIO::Read`）——读 `Random.Int4`，
-//!   断言 quality=Good + 值在 read-time 产生器范围 0..=100。
-//! - `write_tag_value`（`IOPCSyncIO::Write`）——写 `Bucket Brigade.Int4=42`。
-//! - read round-trip——读回 `Bucket Brigade.Int4` 应为 42（Write+Read 闭环）。
+//! 13 探针覆盖 opc-da-server 全部已实装接口：
+//! - `get_server_status` / `read` / `write` / read round-trip（IOPCServer / ItemMgt / SyncIO）
+//! - `subscribe`（FindConnectionPoint + publisher 推送 `OnDataChange`）
+//! - `browse`（IOPCBrowseServerAddressSpace）
+//! - `get_item_properties`（IOPCItemProperties）
+//! - `get_error_string` / `set_locale_id` / `set_client_name`（IOPCCommon）
+//! - `list_servers`（CATID 双视图注册）
+//! - `write_tag_values`（多 tag write）/ `subscribe_shutdown`（IOPCShutdown cp）
 //!
-//! 后续 milestone 追加 browse / subscribe / item_properties / list_servers。
+//! 未覆盖：`read_tag_values_max_age` / `write_tag_value_vqt` / `set_keep_alive`
+//!（依赖 SyncIO2 / GroupStateMgt2，DA3 阶段 2 未实装）。
 
 use std::sync::Arc;
 use std::sync::Mutex;
