@@ -1,7 +1,7 @@
 //! Group 对象——阶段 1。
 //!
-//! [`GroupObj`] 实现 `IOPCItemMgt` + `IOPCSyncIO` + `IOPCGroupStateMgt`（已实装）+ 2 个仍为
-//! 骨架（`E_NOTIMPL`）的接口（`IOPCAsyncIO2` / `IConnectionPointContainer`）。
+//! [`GroupObj`] 实现 `IOPCItemMgt` + `IOPCSyncIO` + `IOPCGroupStateMgt` + `IConnectionPointContainer`
+//! （`FindConnectionPoint` 已实装；`EnumConnectionPoints` 暂 `E_NOTIMPL`）+ `IOPCAsyncIO2`（骨架）。
 //! `IOPCItemMgt`：`AddItems` / `ValidateItems` / `RemoveItems` / `SetActiveState` /
 //! `SetClientHandles`——item 注册表（[`GroupInner`]）+ DataSource 元数据 + COM 内存。
 //! `IOPCSyncIO`：`Read`（DataSource::read → OPCITEMSTATE[]{hClient,ft,quality,vDataValue}）
