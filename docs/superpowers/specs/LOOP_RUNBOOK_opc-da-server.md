@@ -68,7 +68,7 @@
 ### 阶段 1 — MVP（client read/write/subscribe 自建 server）
 - [x] `objects/connection_point.rs`：通用 `ConnectionPoint`（Advise/Unadvise/EnumConnections，持有 client sink 表）
 - [x] `objects/group.rs`：Group 对象骨架 `#[implement(IOPCItemMgt, IOPCGroupStateMgt, IOPCSyncIO, IOPCAsyncIO2, IConnectionPointContainer)]`（注意 `_Impl` target）
-- [ ] `data_source.rs`：`DataSource` trait + `SimDataSource`（tag 树 + Random/Counter 值产生器 + 后台刷新）
+- [x] `data_source.rs`：`DataSource` trait + `SimDataSource`（tag 树 + Random/Counter 值产生器；后台刷新用 read-time 计算，独立 task 留 §10 publisher）
 - [ ] `IOPCItemMgt`：AddItems / RemoveItems / ValidateItems / SetActiveState / SetClientHandles
 - [ ] `IOPCGroupStateMgt`：GetState / SetState / CloneGroup
 - [ ] `IOPCSyncIO`：Read（DataSource 读 → OPCITEMSTATE[]）/ Write
