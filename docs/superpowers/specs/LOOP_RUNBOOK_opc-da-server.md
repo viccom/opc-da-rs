@@ -96,7 +96,7 @@
 ### 阶段 4 — 硬化
 - [ ] unsafe / 内存 review（每个 unsafe 块 SAFETY 注释完备）
 - [ ] 并发同步（`Mutex` 守护 group/item 注册表 + sink 表）
-- [ ] 阶段 1 自闭环 e2e 入 `verify.ps1`（Windows job）
+- [x] 阶段 1 自闭环 e2e 入 `verify.ps1`（End-to-End Gate：taskkill + build server + /RegServer + cargo run opc-da-client-test；固化 13 探针，每 verify 自动跑）
 
 ### 端到端 milestone（opc-da-client-test，计划 `purring-chasing-dusk.md`）
 - [x] M1: 骨架 + `get_server_status` 端到端通（`375a388`；ServerObj 补 IConnectionPointContainer/IOPCItemProperties stub 满足 client v2::Server 强制 cast 4 接口）

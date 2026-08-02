@@ -71,6 +71,16 @@ if (Test-Path $compatDir) {
     }
 }
 
+# End-to-End Gate — opc-da-client-test 对自建 server 跑 13 探针（Windows COM job，阶段 4 硬化）。
+# 释放旧 server exe → 重 build → /RegServer（双视图注册）→ 跑 client-test（exit 0 = 13 passed）→ 清理。
+$serverExe = Join-Path $PSScriptRoot ".." "target" "debug" "opc-da-server.exe"
+taskkill /F /IM opc-da-server.exe 2>$null | Out-Null
+Invoke-Gate -GateName "End-to-End Server Build" -Command "cargo build -p opc-da-server"
+$regCommand = "& '" + $serverExe + "' '/RegServer'"
+Invoke-Gate -GateName "End-to-End Register (/RegServer)" -Command $regCommand
+Invoke-Gate -GateName "End-to-End Client Test (13 probes)" -Command "cargo run -p opc-da-client-test"
+taskkill /F /IM opc-da-server.exe 2>$null | Out-Null
+
 # Cleanup temp log
 if (Test-Path $script:LogFile) { Remove-Item $script:LogFile -ErrorAction SilentlyContinue }
 
