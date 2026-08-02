@@ -107,7 +107,7 @@
 - [x] M5b: publisher 推送引擎（`51b1b83`；std::thread 周期推送 OnDataChange；subscribe 端到端收帧 5 passed）
 - [x] M6: `IOPCBrowseServerAddressSpace`（`ff9132c`；QueryOrganization=FLAT + BrowseOPCItemIDs；browse 端到端列 4 tag，6 passed）
 - [x] M7a: `IOPCItemProperties`（`956b4f6`；QueryAvailableProperties/GetItemProperties/LookupItemIDs；get_item_properties 端到端 4 property，7 passed）
-- [ ] M7b: `IOPCCommon` 完整（GetErrorString）+ `list_servers`
+- [x] M7b: `IOPCCommon` GetErrorString + `list_servers`（`bbb4c67`；双视图注册解决位宽坑；list_servers 枚举到 opc-da-rs，9 passed）
 - [ ] M8: 端到端全量验证（所有接口 pass）
 
 ### 需用户回（循环遇即停）

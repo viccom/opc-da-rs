@@ -12,7 +12,8 @@
 //! `BrowseOPCItemIDs` / `GetItemID` / `ChangeBrowsePosition` / `BrowseAccessPaths`）已实装。
 //! `IOPCItemProperties`（M7a）：`QueryAvailableProperties` / `GetItemProperties` /
 //! `LookupItemIDs` 已实装（DATATYPE/VALUE/QUALITY/ACCESS_RIGHTS 4 property）。
-//! `IOPCCommon` 当前 stub（M7b 实装 GetErrorString 等）。
+//! `IOPCCommon`（M7b）：`GetErrorString` 已实装（HRESULT→描述串）；
+//! `SetLocaleID` / `GetLocaleID` / `QueryAvailableLocaleIDs` / `SetClientName` 简化实装。
 
 // `#[implement]` 展开的 COM 胶水触发若干 pedantic lints；与 `subscription.rs` 同模式 allow。
 #![allow(
