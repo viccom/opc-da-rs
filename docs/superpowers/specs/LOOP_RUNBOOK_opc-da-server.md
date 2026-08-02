@@ -72,16 +72,16 @@
 - [x] `objects/group.rs`：Group 对象骨架 `#[implement(IOPCItemMgt, IOPCGroupStateMgt, IOPCSyncIO, IOPCAsyncIO2, IConnectionPointContainer)]`（注意 `_Impl` target）
 - [x] `data_source.rs`：`DataSource` trait + `SimDataSource`（tag 树 + Random/Counter 值产生器；后台刷新用 read-time 计算，独立 task 留 §10 publisher）
 - [x] `IOPCItemMgt`：AddItems / RemoveItems / ValidateItems / SetActiveState / SetClientHandles
-- [ ] `IOPCGroupStateMgt`：GetState / SetState / CloneGroup
-- [ ] `IOPCSyncIO`：Read（DataSource 读 → OPCITEMSTATE[]）/ Write
-- [ ] `IOPCAsyncIO2`：Read / Write / Refresh2（CancelID + 走 callback）
-- [ ] `IOPCServer`：AddGroup / RemoveGroup / GetGroupByName / CreateGroupEnumerator（Group 注册表 + GetStatus 的 dwGroupCount 接上实际计数）
-- [ ] `publisher.rs`：订阅推送引擎（周期 = update_rate + deadband 过滤 + 并行数组打包 + `OnDataChange`）
-- [ ] **阶段 1 自闭环 e2e 测试**：client（`OpcDaClient` 或裸 COM）经 `CoCreateInstance` 对自建 server read/write/subscribe
+- [x] `IOPCGroupStateMgt`（`c22b8ef` M4；GetState/SetState/SetName 实装；CloneGroup 暂 nyi）
+- [x] `IOPCSyncIO`（`46672bf` M3；Read/Write，端到端 round-trip=42）
+- [ ] `IOPCAsyncIO2`：Read / Write / Refresh2（CancelID + 走 callback）——骨架 nyi，待 DA3
+- [x] `IOPCServer`（`b0ae27f` M2；AddGroup/RemoveGroup/GetStatus；GetGroupByName/CreateGroupEnumerator 暂 nyi）
+- [x] `publisher.rs`（`51b1b83` M5b；周期推送 OnDataChange，跨进程 callback 端到端通）
+- [x] **阶段 1 自闭环 e2e 测试**（opc-da-client-test 13 探针全 pass）
 
 ### 阶段 2 — Browse + DA3
-- [ ] `IOPCBrowseServerAddressSpace`（QueryOrganization / BrowseOPCItemIDs / GetItemID）
-- [ ] `IOPCItemProperties`
+- [x] `IOPCBrowseServerAddressSpace`（`ff9132c` M6；QueryOrganization=FLAT + BrowseOPCItemIDs）
+- [x] `IOPCItemProperties`（`956b4f6` M7a；QueryAvailableProperties/GetItemProperties/LookupItemIDs）
 - [ ] `IOPCGroupStateMgt2`（SetKeepAlive / GetKeepAlive）
 - [ ] `IOPCSyncIO2`（ReadMaxAge / WriteVQT）
 - [ ] `IOPCAsyncIO3`
