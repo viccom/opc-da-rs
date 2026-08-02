@@ -17,6 +17,7 @@
 )]
 
 use std::collections::HashMap;
+use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::Foundation::{
@@ -24,7 +25,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::System::Com::{
     CoTaskMemAlloc, CoTaskMemFree, IConnectionPoint, IConnectionPointContainer,
-    IConnectionPointContainer_Impl, IEnumConnectionPoints,
+    IConnectionPointContainer_Impl, IEnumConnectionPoints, IEnumString,
 };
 use windows::Win32::System::Variant::VARIANT;
 use windows::core::{
@@ -33,18 +34,26 @@ use windows::core::{
 
 use opc_da_client::bindings::comn::{IOPCCommon, IOPCCommon_Impl, IOPCShutdown};
 use opc_da_client::bindings::da::{
-    IOPCItemProperties, IOPCItemProperties_Impl, IOPCServer, IOPCServer_Impl, OPC_STATUS_RUNNING,
-    tagOPCENUMSCOPE, tagOPCSERVERSTATUS,
+    IOPCBrowseServerAddressSpace, IOPCBrowseServerAddressSpace_Impl, IOPCItemProperties,
+    IOPCItemProperties_Impl, IOPCServer, IOPCServer_Impl, OPC_BRANCH, OPC_NS_FLAT,
+    OPC_STATUS_RUNNING, tagOPCBROWSEDIRECTION, tagOPCBROWSETYPE, tagOPCENUMSCOPE,
+    tagOPCNAMESPACETYPE, tagOPCSERVERSTATUS,
 };
 
 use crate::data_source::{DataSource, SimDataSource, now_filetime};
-use crate::objects::{ConnectionPoint, GroupObj, pwstr_to_string};
+use crate::objects::{ConnectionPoint, GroupObj, StringEnum, pwstr_to_string};
 
 /// OPC DA Server COM 对象。
 ///
 /// 持有 group 注册表（`inner`）+ 数据源（`data_source`，`AddGroup` 时克隆给新建 Group）+
 /// shutdown 连接点（`shutdown_cp`，client `Advise` `IOPCShutdown` 于此——M5 实装暴露）。
-#[implement(IOPCServer, IOPCCommon, IConnectionPointContainer, IOPCItemProperties)]
+#[implement(
+    IOPCServer,
+    IOPCCommon,
+    IConnectionPointContainer,
+    IOPCItemProperties,
+    IOPCBrowseServerAddressSpace
+)]
 pub struct ServerObj {
     inner: Mutex<ServerInner>,
     data_source: Arc<dyn DataSource>,
@@ -312,11 +321,66 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
     }
 }
 
+impl IOPCBrowseServerAddressSpace_Impl for ServerObj_Impl {
+    fn QueryOrganization(&self) -> Result<tagOPCNAMESPACETYPE> {
+        // SimDataSource flat 命名空间（点号分隔 leaf id，无 branch 层级）。
+        Ok(OPC_NS_FLAT)
+    }
+
+    fn ChangeBrowsePosition(
+        &self,
+        _dwbrowsedirection: tagOPCBROWSEDIRECTION,
+        _szstring: &PCWSTR,
+    ) -> Result<()> {
+        // flat 命名空间无层级位置，忽略（client 在 root 枚举所有 leaf）。
+        Ok(())
+    }
+
+    fn BrowseOPCItemIDs(
+        &self,
+        dwbrowsefiltertype: tagOPCBROWSETYPE,
+        _szfiltercriteria: &PCWSTR,
+        _vtdatatypefilter: u16,
+        _dwaccessrightsfilter: u32,
+    ) -> Result<IEnumString> {
+        // flat 无 branch：OPC_BRANCH → 空；其余（OPC_LEAF / OPC_FLAT）→ 全部 leaf。
+        let items = if dwbrowsefiltertype == OPC_BRANCH {
+            Vec::new()
+        } else {
+            self.data_source.namespace().leaves().to_vec()
+        };
+        Ok(StringEnum::new(items).into())
+    }
+
+    fn GetItemID(&self, szitemdataid: &PCWSTR) -> Result<PWSTR> {
+        // flat 命名空间：item data id == item id，原样返回（CoTaskMemAlloc wide 交 client）。
+        let s = pwstr_to_string(PWSTR(szitemdataid.as_ptr().cast_mut()));
+        let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: CoTaskMemAlloc 分配 w.len()*2 字节；失败 null。
+        let ptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
+        if ptr.is_null() {
+            return Err(E_OUTOFMEMORY.into());
+        }
+        // SAFETY: ptr 刚分配足够空间；copy 拷贝 w（含 null 终止）。
+        unsafe {
+            copy_nonoverlapping(w.as_ptr(), ptr, w.len());
+        }
+        Ok(PWSTR(ptr))
+    }
+
+    fn BrowseAccessPaths(&self, _szitemid: &PCWSTR) -> Result<IEnumString> {
+        // flat 命名空间无 access path → 空枚举（client 期望枚举器，非 E_NOTIMPL）。
+        Ok(StringEnum::new(Vec::new()).into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ServerObj;
     use opc_da_client::bindings::comn::IOPCCommon;
-    use opc_da_client::bindings::da::{IOPCItemProperties, IOPCServer};
+    use opc_da_client::bindings::da::{
+        IOPCBrowseServerAddressSpace, IOPCItemProperties, IOPCServer, OPC_NS_FLAT,
+    };
     use windows::Win32::System::Com::IConnectionPointContainer;
     use windows::core::{IUnknown, Interface, PCWSTR};
 
@@ -335,7 +399,23 @@ mod tests {
             obj.cast::<IOPCItemProperties>().is_ok(),
             "QI IOPCItemProperties 失败"
         );
+        assert!(
+            obj.cast::<IOPCBrowseServerAddressSpace>().is_ok(),
+            "QI IOPCBrowseServerAddressSpace 失败"
+        );
         assert!(obj.cast::<IUnknown>().is_ok(), "QI IUnknown 失败");
+    }
+
+    /// `IOPCBrowseServerAddressSpace::QueryOrganization` 返回 OPC_NS_FLAT（SimDataSource flat）。
+    #[test]
+    fn browse_query_organization_returns_flat() {
+        let server: IUnknown = ServerObj::new().into();
+        let browse: IOPCBrowseServerAddressSpace = server
+            .cast::<IOPCBrowseServerAddressSpace>()
+            .expect("QI IOPCBrowseServerAddressSpace");
+        // SAFETY: browse 同进程 implement 对象；QueryOrganization 返回 namespace 类型。
+        let org = unsafe { browse.QueryOrganization() }.expect("QueryOrganization");
+        assert_eq!(org, OPC_NS_FLAT, "SimDataSource flat 命名空间");
     }
 
     /// AddGroup/RemoveGroup/GetStatus 联动：add 后 group_count 增，remove 后减。

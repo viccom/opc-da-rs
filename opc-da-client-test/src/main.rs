@@ -21,6 +21,9 @@
 //!
 //! 后续 milestone 追加 browse / subscribe / item_properties / list_servers。
 
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, OpcValue};
@@ -158,6 +161,39 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => {
             println!("✗ subscribe (Random.Int4): {e}");
+            failed += 1;
+        }
+    }
+
+    // 6. browse（IOPCBrowseServerAddressSpace[M6]：QueryOrganization=FLAT + BrowseOPCItemIDs
+    //    枚举 leaf）。验证列出 SimDataSource 的 4 个 tag。
+    let progress = Arc::new(AtomicUsize::new(0));
+    let tags_sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    match client
+        .browse_tags(PROG_ID, 100, progress, tags_sink, 0, 0)
+        .await
+    {
+        Ok(tags) => {
+            let expected = [
+                "Random.Int4",
+                "Random.Real8",
+                "Square Waves.Real8",
+                "Bucket Brigade.Int4",
+            ];
+            let all_found = expected.iter().all(|t| tags.contains(&(*t).to_string()));
+            if all_found {
+                println!(
+                    "✓ browse: 列出 {} tag（含 4 SimDataSource）[M6 BrowseOPCItemIDs]",
+                    tags.len()
+                );
+                passed += 1;
+            } else {
+                println!("✗ browse: tags={:?}（缺预期 tag）", tags);
+                failed += 1;
+            }
+        }
+        Err(e) => {
+            println!("✗ browse: {e}");
             failed += 1;
         }
     }
