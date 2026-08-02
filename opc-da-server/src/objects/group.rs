@@ -2,6 +2,7 @@
 //!
 //! [`GroupObj`] 实现 `IOPCItemMgt` + `IOPCSyncIO` + `IOPCGroupStateMgt` + `IConnectionPointContainer`
 //! （`FindConnectionPoint` 已实装；`EnumConnectionPoints` 暂 `E_NOTIMPL`）+ `IOPCAsyncIO2`（骨架）。
+//! 订阅推送由 `publisher` 模块（§10）周期调 `OnDataChange`（`GroupObj::new` 启动后台线程）。
 //! `IOPCItemMgt`：`AddItems` / `ValidateItems` / `RemoveItems` / `SetActiveState` /
 //! `SetClientHandles`——item 注册表（[`GroupInner`]）+ DataSource 元数据 + COM 内存。
 //! `IOPCSyncIO`：`Read`（DataSource::read → OPCITEMSTATE[]{hClient,ft,quality,vDataValue}）

@@ -104,7 +104,7 @@
 - [x] M3: `IOPCSyncIO::Read/Write`（`46672bf`；端到端 read Random.Int4 + write Bucket Brigade=42 + round-trip=42 全 pass）
 - [x] M4: `IOPCGroupStateMgt`（`c22b8ef`；GetState/SetState/SetName 实装 + 白盒 round-trip；set_subscription_rate 端到端待 M5 依赖 subscribe）
 - [x] M5a: `FindConnectionPoint`（`f22d93f`；Group data_cp + Server shutdown_cp 接入；subscribe advise 端到端 cookie=1）
-- [ ] M5b: publisher 推送引擎 + subscribe 收 OnDataChange
+- [x] M5b: publisher 推送引擎（`51b1b83`；std::thread 周期推送 OnDataChange；subscribe 端到端收帧 5 passed）
 - [ ] M6: `IOPCBrowseServerAddressSpace` + 测试 `browse`
 - [ ] M7: `IOPCItemProperties` + `IOPCCommon` 完整 + `list_servers`
 - [ ] M8: 端到端全量验证（所有接口 pass）
