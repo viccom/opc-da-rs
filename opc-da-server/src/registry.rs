@@ -43,6 +43,16 @@ pub fn register(reg: &ServerRegistration<'_>) -> Result<()> {
     let clsid = clsid_string(&reg.clsid);
     let exe = reg.exe_path.to_string_lossy().into_owned();
 
+    // CLSID 顶层 default = 服务器描述（COM 标准：CLSID 键默认值 = 人类可读类名）。
+    // 标准 OPC client（Prosys/KEPware/Takebishi）按 Implemented Categories 收集候选 CLSID 后，
+    // 读此 default 值作服务器显示名；为空则条目被过滤/不显示 → 表现为"枚举不到"。
+    // （Rust opc-da-client 走 OPCEnum + ProgID 子键，不读此值，故能枚举到——掩盖了此缺陷。）
+    set_reg_sz(
+        HKEY_CLASSES_ROOT,
+        &format!("CLSID\\{clsid}"),
+        reg.description,
+    )?;
+
     set_reg_sz(
         HKEY_CLASSES_ROOT,
         &format!("CLSID\\{clsid}\\LocalServer32"),
