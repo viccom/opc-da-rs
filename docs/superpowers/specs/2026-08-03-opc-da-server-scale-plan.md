@@ -522,7 +522,7 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 - [x] `SimDataSource` 适配（flat 保留）—— `query_organization` 默认 `Flat`，namespace 单层 leaves
 - [x] `ServerObj` 加 `browse_pos` + 重写 browse 5 方法 —— P2.3：`QueryOrganization` 取 ds 类型；`ChangeBrowsePosition` 维护 `browse_pos`（DOWN/UP/TO）；`BrowseOPCItemIDs` hierarchical 返相对名（client 经 `GetItemID` 转 full id）/ flat 返 full id / `OPC_FLAT` 跨分支全量；`GetItemID` 相对名拼 full path
 - [x] 单测：树构造 + browse 状态机 + 10w item O(1) 查找 —— `generated_data_source_tree_and_read`（树构造）+ `browse_hierarchical_*` 7 测（DOWN/UP/TO/BRANCH/LEAF/FLAT/GetItemID 状态机）+ `browse_flat_sim_namespace_unchanged` 回归；`HashSet` O(1) 查找
-- [ ] opc-da-client-test browse 探针扩展（hierarchical）—— **留 P4**：需 server 运行时切 `GeneratedDataSource`（factory 持 ds + bin env），与压测 stress 工具一并做；hierarchical browse 逻辑已由 server 单测确定性覆盖，跨进程 e2e 非本阶段阻塞
+- [x] opc-da-client-test browse 探针扩展（hierarchical）—— P4.1 完成（`d0428cc` server env 切 ds + `4ab83ad` client-test e2e）：spawn GeneratedDataSource server + browse_children 下钻 plant0→line0→sensor，验证 GetItemID 相对名→full path（实测 17 passed）
 - [x] verify 全门 —— 13 探针无回归（browse flat 探针仍过）
 - [x] commit + 勾选 —— P2.3 feat `0df5a2f` + 本 chore
 
@@ -532,7 +532,8 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 - [ ] P3.4 ServerObj RwLock（P4 发现建连瓶颈后）
 - [ ] P3.3 VARIANT 池（仅强制时）
 
-### P4 — 压测
+### P4 — e2e + 压测（P4.1 e2e 全流程完成 `d0428cc`+`4ab83ad`；P4.2 stress 待做）
+- [x] P4.1 e2e 载体：server env 切数据源 + client-test 模块化（server_proc/e2e/report）+ 13 flat + hierarchical 探针（实测 17 passed，verify 全门过）
 - [ ] stress 工具骨架（起 server + M mock client + 指标采集）
 - [ ] mock client（复用 opc-da-client subscribe + 计数）
 - [ ] v1 矩阵（P0 后）：1w 组 / 100 client / 线程数
