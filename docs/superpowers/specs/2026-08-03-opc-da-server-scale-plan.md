@@ -504,16 +504,16 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 - [x] verify 全门 + 13 探针无回归（subscribe 探针验证统一调度推送实际工作）
 - [x] commit + 勾选
 
-### P1 — deadband 变化检测
-- [ ] `ItemEntry` + `last_pushed` + `PushState`
-- [ ] `item_id: Arc<str>`（P3.1 并入）
-- [ ] `should_push` + VARIANT→f64 规范化
-- [ ] worker 推送循环加变化检测
-- [ ] `DataSource::item_range` trait 扩展
-- [ ] Refresh2 保留全推路径（绕过 deadband）
-- [ ] 单测：should_push 各分支；deadband 效果；关闭=全推回归
-- [ ] verify 全门
-- [ ] commit + 勾选
+### P1 — deadband 变化检测（`ce81148`，完成）
+- [x] `ItemEntry` + `last_pushed: Option<PushState>` + `PushState{value:f64, quality:u16}`
+- [x] `item_id: Arc<str>`（P3.1 并入，snapshot/推送路径避免 String clone）
+- [x] `should_push` + `normalize_variant`（VT_I4/R8/I2/BOOL → f64）
+- [x] worker `push_one` 加 deadband 循环（锁内 read + should_push + 更新 last_pushed + 收集变化帧）
+- [x] `DataSource::item_range` trait 扩展（默认 `None`，SimDataSource 继承）
+- [x] Refresh2 保留全推路径（绕过 deadband，`read_frames` + push_data_change）
+- [x] 单测：`should_push_deadband_semantics`（各分支）+ `normalize_variant_numeric_types`；e2e subscribe 验证 deadband=0 全推回归
+- [x] verify 全门
+- [x] commit + 勾选
 
 ### P2 — hierarchical + 10w item
 - [ ] `NamespaceTree` 树化（NsNode + index + leaves_flat）
