@@ -10,6 +10,7 @@
 //! 刷新的缓存。`IOPCSyncIO::Read` 完全正确；publisher 引擎（§10）若需推送缓存
 //! 再加独立 task。这是未来"协议网关 DataSource"（Modbus/S7/UA 桥接）的扩展点。
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,26 +23,103 @@ use windows::core::HRESULT;
 pub const OPC_QUALITY_GOOD: u16 = 0xC0;
 pub const OPC_QUALITY_BAD: u16 = 0x00;
 
+/// 命名空间组织方式（`IOPCBrowseServerAddressSpace::QueryOrganization` 返回）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NsOrganization {
+    /// flat（所有 leaf 同层，`SimDataSource`）。
+    Flat,
+    /// hierarchical（分支树，`GeneratedDataSource` 及真实数据源）。
+    Hierarchical,
+}
+
+/// 命名空间树节点（hierarchical browse 用）。
+#[derive(Debug, Clone)]
+pub enum NsNode {
+    /// 分支：名字 + 子节点。
+    Branch { name: Arc<str>, children: Vec<Self> },
+    /// 叶子：item 全路径 id。
+    Leaf { id: Arc<str> },
+}
+
 /// 命名空间——server 暴露的可寻址 item 列表（browse 用）。
 ///
-/// `SimDataSource` 用 flat 命名空间（点号分隔的 leaf id，如 `Random.Int4`）。
-/// hierarchical 分支结构留待阶段 2（`IOPCBrowseServerAddressSpace`）。
+/// 同时维护 flat leaves（`leaves()`，FLAT browse + 兼容现有 flat browse）与 hierarchical
+/// 树（`root()`/`browse_children()`，HIERARCHICAL browse，P2）。
 #[derive(Debug, Clone)]
 pub struct NamespaceTree {
     leaves: Vec<String>,
+    root: NsNode,
 }
 
 impl NamespaceTree {
-    /// 从 leaf id 列表构造。
+    /// flat 命名空间（单层：root 下直接 leaves）。`SimDataSource` 用。
     #[must_use]
     pub fn new(leaves: Vec<String>) -> Self {
-        Self { leaves }
+        let children = leaves
+            .iter()
+            .map(|s| NsNode::Leaf {
+                id: Arc::from(s.as_str()),
+            })
+            .collect();
+        let root = NsNode::Branch {
+            name: Arc::from(""),
+            children,
+        };
+        Self { leaves, root }
     }
 
-    /// 所有 leaf id（browse 顺序）。
+    /// hierarchical 命名空间（自定义树）。`GeneratedDataSource` 用。
+    #[must_use]
+    pub fn from_tree(root: NsNode) -> Self {
+        let mut leaves = Vec::new();
+        collect_leaves(&root, &mut leaves);
+        Self { leaves, root }
+    }
+
+    /// 所有 leaf id（flat 顺序，FLAT browse 用）。
     #[must_use]
     pub fn leaves(&self) -> &[String] {
         &self.leaves
+    }
+
+    /// 树根（hierarchical browse 用）。
+    #[must_use]
+    pub fn root(&self) -> &NsNode {
+        &self.root
+    }
+
+    /// hierarchical browse：`path`（分支名序列）→ 该位置子节点；路径不存在返空切片。
+    #[must_use]
+    pub fn browse_children(&self, path: &[&str]) -> &[NsNode] {
+        let mut node = &self.root;
+        for name in path {
+            match node {
+                NsNode::Branch { children, .. } => match children
+                    .iter()
+                    .find(|c| matches!(c, NsNode::Branch { name: n, .. } if n.as_ref() == *name))
+                {
+                    Some(b) => node = b,
+                    None => return &[],
+                },
+                NsNode::Leaf { .. } => return &[],
+            }
+        }
+        match node {
+            NsNode::Branch { children, .. } => children,
+            NsNode::Leaf { .. } => &[],
+        }
+    }
+}
+
+/// 递归收集树的所有 leaf id（`NamespaceTree::from_tree` 用）。
+fn collect_leaves(node: &NsNode, out: &mut Vec<String>) {
+    match node {
+        NsNode::Branch { children, .. } => {
+            for c in children {
+                collect_leaves(c, out);
+            }
+        }
+        NsNode::Leaf { id } => out.push((*id).to_string()),
     }
 }
 
@@ -84,6 +162,15 @@ pub trait DataSource: Send + Sync {
     /// 默认 `None`（无 EU → deadband 退化为"任意值变化即推"）。真实数据源应覆盖提供。
     fn item_range(&self, _item_id: &str) -> Option<(f64, f64)> {
         None
+    }
+    /// 命名空间组织方式（`QueryOrganization`）。默认 flat。
+    fn query_organization(&self) -> NsOrganization {
+        NsOrganization::Flat
+    }
+    /// hierarchical browse：`path`（分支名序列）→ 该位置子节点。
+    /// 默认委托 `namespace().browse_children(path)`。
+    fn browse_branch(&self, path: &[&str]) -> &[NsNode] {
+        self.namespace().browse_children(path)
     }
 }
 
