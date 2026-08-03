@@ -89,7 +89,7 @@
 ### 阶段 3 — 代码部分（远程验证属"需用户"）
 - [ ] `CoInitializeSecurity` 实装（注册类对象前调）
 - [ ] Windows Service 包装（`windows-service` crate 或自写 ServiceMain）
-- [ ] `unregister` 完整实装（`SHDeleteKey` 递归删）
+- [x] `unregister` 完整实装（`RegDeleteTreeW` 递归删 CLSID/{prog_id}/AppID 子树，双视图 64+32 幂等）
 - [ ] proxy/stub 配置文档（说明依赖 OPC Core Components，非编码）
 - [ ] **→ 停止**：DCOM 远程真实验证（需用户配 DCOM + 第三方 client 跨机）
 

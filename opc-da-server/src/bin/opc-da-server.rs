@@ -61,7 +61,10 @@ fn run_unregister() -> Result<()> {
         app_id: CLSID_OPC_DA_SERVER,
     };
     unregister(&reg)?;
-    eprintln!("opc-da-server: unregistered (占位)");
+    eprintln!(
+        "opc-da-server: unregistered (ProgID={}, CLSID={{...}})",
+        reg.prog_id
+    );
     Ok(())
 }
 

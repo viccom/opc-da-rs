@@ -8,9 +8,11 @@
 //! 让 32 位 OPCEnum 也能枚举到（否则 OPCEnum 读 WOW6432Node 32 位视图，单写 64 位视图找不到）。
 
 use std::path::Path;
+use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, KEY_CREATE_SUB_KEY, KEY_SET_VALUE, KEY_WOW64_32KEY, KEY_WOW64_64KEY,
-    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RegCloseKey, RegCreateKeyExW, RegSetValueExW,
+    REG_OPTION_NON_VOLATILE, REG_SAM_FLAGS, REG_SZ, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW,
+    RegSetValueExW,
 };
 use windows::core::{GUID, PCWSTR, Result};
 
@@ -89,13 +91,42 @@ pub fn register(reg: &ServerRegistration<'_>) -> Result<()> {
     Ok(())
 }
 
-/// `/UnregServer`：删 HKCR 注册项。
+/// `/UnregServer`：递归删 HKCR 注册项（64 + 32 位视图，幂等）。
+///
+/// 删 register 写的 3 个子树：`CLSID\{clsid}` / `{prog_id}` / `AppID\{appid}`。
+/// 键不存在（未注册/已删）不算错误——幂等，可重复运行。
 ///
 /// # Errors
-/// 当前为占位实现（阶段 0）。完整删除需 `SHDeleteKey` 递归清子键，后续补。
+/// 任何一次删除失败（非"键不存在"）即返回 `Err`。
 pub fn unregister(reg: &ServerRegistration<'_>) -> Result<()> {
-    let _ = reg;
+    let clsid = clsid_string(&reg.clsid);
+    let appid = clsid_string(&reg.app_id);
+    // 递归删 register 写的子树（64 + 32 视图）。
+    delete_subtree(&format!("CLSID\\{clsid}"))?;
+    delete_subtree(reg.prog_id)?;
+    delete_subtree(&format!("AppID\\{appid}"))?;
     Ok(())
+}
+
+/// 递归删 HKCR 下 `{path}` 子键树（64 位视图 + 32 位 WOW6432Node 视图）。
+fn delete_subtree(path: &str) -> Result<()> {
+    delete_subtree_view(path, "")?;
+    delete_subtree_view(path, "WOW6432Node\\")?;
+    Ok(())
+}
+
+/// 递归删 HKCR\`{prefix}{path}` 子键树。键不存在（`ERROR_FILE_NOT_FOUND`）忽略（幂等）。
+fn delete_subtree_view(path: &str, prefix: &str) -> Result<()> {
+    let full = format!("{prefix}{path}");
+    let wide = wide(&full);
+    // SAFETY: RegDeleteTreeW 递归删 HKCR 下子键树（含所有子键）；返回 WIN32_ERROR。
+    let err = unsafe { RegDeleteTreeW(HKEY_CLASSES_ROOT, PCWSTR(wide.as_ptr())) };
+    // 键不存在（未注册/已删）忽略——unregister 幂等；其他失败返回。
+    if err == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        err.ok()
+    }
 }
 
 /// 写一个 HKCR `REG_SZ` 值到 **64 位 + 32 位视图**（创建所需子键）。
