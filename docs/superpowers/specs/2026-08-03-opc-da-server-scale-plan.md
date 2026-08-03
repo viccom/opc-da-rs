@@ -158,7 +158,7 @@ for task in job_rx:
 ```
 
 **改造点**：
-1. `publisher.rs` 拆为 `publisher/{mod,scheduler,worker}.rs`；保留 `enumerate_sinks`/`push_data_change`（已 `pub`）。
+1. 新增 `objects/scheduler.rs`（Scheduler + PublishJob + tick/worker 线程）；`publisher.rs` 精简为推送数据函数（`enumerate_sinks`/`push_data_change`，已 `pub`，worker 复用）。未拆 `publisher/` 目录——职责已分（scheduler 调度+worker，publisher 数据函数）。
 2. 删 `publisher.rs:41-49` `spawn()` 的 `thread::spawn`；改为 `Scheduler::register(job)`。
 3. `group.rs:194` `GroupObj::new`：不再 `spawn`，改为向全局 Scheduler 注册 job。
 4. `bin/opc-da-server.rs` `run_server`（87-120）：创建全局 `Scheduler`（`OnceCell` 或经 `ServerObj` 下发）。
@@ -493,16 +493,16 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 
 ## 9. 进度跟踪 Checklist
 
-### P0 — 统一推送调度
-- [ ] `publisher/` 模块拆分（scheduler.rs / worker.rs / mod.rs）
-- [ ] `Scheduler` 数据结构 + 时间轮 + worker 线程池
-- [ ] `PublishJob` + `GroupKey` 注册/注销
-- [ ] `GroupObj::new` 改注册 Scheduler；`GroupObj::Drop` 注销
-- [ ] `bin/opc-da-server.rs` 创建全局 Scheduler
-- [ ] 单测：1000 组线程数稳定
-- [ ] 单测：job 注册/注销
-- [ ] verify 全门 + 13 探针无回归
-- [ ] commit + 勾选
+### P0 — 统一推送调度（`cae5f13`，完成）
+- [x] 新增 `objects/scheduler.rs`（Scheduler + PublishJob + tick/worker 线程）；`publisher.rs` 精简为推送数据函数（`enumerate_sinks`/`push_data_change`）。未拆 `publisher/` 目录——scheduler.rs 含调度+worker、publisher.rs 含数据函数，职责已分。
+- [x] `Scheduler` 数据结构 + 时间轮（按 rate 分桶）+ N worker 线程池（纯 std：`Mutex<VecDeque>`+`Condvar` MPMC，零新依赖）
+- [x] `PublishJob` + GroupKey（=`h_server_group`）注册/注销
+- [x] `GroupObj::new` 改注册 Scheduler；`GroupObj::Drop` 注销
+- [x] `bin/opc-da-server.rs` init 全局 Scheduler（workers = 核数）
+- [ ] ~~单测：1000 组线程数稳定~~ → 移 **P4**（线程数需进程级查询，压测时验）
+- [x] 单测：job 注册/注销（`scheduler_register_unregister_updates_count`，含多桶 + 幂等）
+- [x] verify 全门 + 13 探针无回归（subscribe 探针验证统一调度推送实际工作）
+- [x] commit + 勾选
 
 ### P1 — deadband 变化检测
 - [ ] `ItemEntry` + `last_pushed` + `PushState`
