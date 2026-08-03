@@ -190,18 +190,32 @@ impl GroupObj {
             h_server_group,
         }));
         let data_cp: IConnectionPoint = ConnectionPoint::<IOPCDataCallback>::new().into();
-        // 启动 publisher 线程：周期读 DataSource + 遍历 data_cp sink 调 OnDataChange。
-        crate::objects::publisher::spawn(
-            Arc::clone(&inner),
-            data_source.clone(),
-            data_cp.clone(),
-            update_rate,
-        );
+        // 注册全局推送调度器（替代旧 per-group spawn；Scheduler 未 init 时 global() 返
+        // None 跳过——兼容单测。h_server_group 作 GroupKey，update_rate 作周期）。
+        if let Some(sched) = crate::objects::scheduler::global() {
+            sched.register(
+                h_server_group,
+                Arc::clone(&inner),
+                data_source.clone(),
+                data_cp.clone(),
+                update_rate,
+            );
+        }
         Self {
             inner,
             data_source,
             data_cp,
             next_cancel_id: AtomicU32::new(1),
+        }
+    }
+}
+
+/// GroupObj 释放时从调度器注销推送任务（幂等；Scheduler 未 init 时跳过）。
+impl Drop for GroupObj {
+    fn drop(&mut self) {
+        if let Some(sched) = crate::objects::scheduler::global() {
+            let key = locked(&self.inner).h_server_group;
+            sched.unregister(key);
         }
     }
 }
@@ -1463,5 +1477,38 @@ mod tests {
         let (tid, _hgroup, count) = captured.expect("Refresh2 应触发 OnDataChange");
         assert_eq!(tid, 12345, "dwTransactionID 应透传到 OnDataChange");
         assert_eq!(count, 1, "只推 1 个 active item（inactive 过滤）");
+    }
+
+    /// `Scheduler` register/unregister 计数（P0）：注册增、注销减、跨 rate 桶、幂等。
+    #[test]
+    fn scheduler_register_unregister_updates_count() {
+        use crate::objects::scheduler::Scheduler;
+        let s = Scheduler::new();
+        assert_eq!(s.registered_count(), 0, "初始 0");
+        let ds: Arc<dyn DataSource> = Arc::new(SimDataSource::new());
+        let inner = Arc::new(Mutex::new(GroupInner {
+            items: HashMap::new(),
+            next_handle: 1,
+            update_rate: 100,
+            active: true,
+            name: "t".into(),
+            time_bias: 0,
+            percent_deadband: 0.0,
+            locale: 0,
+            h_client_group: 0,
+            h_server_group: 1,
+        }));
+        let cp: IConnectionPoint = ConnectionPoint::<IOPCDataCallback>::new().into();
+        s.register(1, Arc::clone(&inner), Arc::clone(&ds), cp.clone(), 100);
+        assert_eq!(s.registered_count(), 1, "注册 1 个后 1");
+        // 不同 rate → 进不同桶（验证多桶注册/注销）。ds/cp 最后一次用，move 避免 redundant clone。
+        s.register(2, Arc::clone(&inner), ds, cp, 250);
+        assert_eq!(s.registered_count(), 2, "注册第 2 个（不同 rate）后 2");
+        s.unregister(1);
+        assert_eq!(s.registered_count(), 1, "注销 1 后 1");
+        s.unregister(2);
+        assert_eq!(s.registered_count(), 0, "全注销后 0");
+        s.unregister(999); // 幂等：不存在的 key no-op。
+        assert_eq!(s.registered_count(), 0, "注销不存在 key 幂等");
     }
 }

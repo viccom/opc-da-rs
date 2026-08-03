@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use opc_da_client::bindings::da::{CATID_OPCDAServer10, CATID_OPCDAServer20, CATID_OPCDAServer30};
 use opc_da_server::class_factory::{CLSID_OPC_DA_SERVER, Factory};
+use opc_da_server::objects::scheduler;
 use opc_da_server::registry::{ServerRegistration, register, unregister};
 use windows::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, CoIncrementMTAUsage, CoInitializeSecurity, CoRegisterClassObject,
@@ -88,6 +89,9 @@ fn run_server() -> Result<()> {
     // SAFETY: COM 注册/恢复为标准 EXE server 启动序列。
     unsafe {
         CoIncrementMTAUsage()?;
+        // 启动全局推送调度器（tick + N worker 线程，均 MTA）。worker 数 = 逻辑核数。
+        let workers = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        scheduler::init(workers);
         // DCOM 安全：注册类对象前调 CoInitializeSecurity（全进程一次，COM 初始化后 + 首次
         // 激活前）。CONNECT 认证级 + IDENTIFY 模拟 + EOAC_NONE——标准 OPC DA server 配置，
         // 本机/远程 client 均可连接（本机不受影响，远程 DCOM 需匹配 client 认证级）。

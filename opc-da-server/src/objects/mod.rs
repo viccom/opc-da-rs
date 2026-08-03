@@ -10,6 +10,7 @@ mod browse;
 mod connection_point;
 mod group;
 mod publisher;
+pub mod scheduler;
 mod server;
 
 pub use browse::StringEnum;
