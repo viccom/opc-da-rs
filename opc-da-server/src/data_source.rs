@@ -10,6 +10,7 @@
 //! 刷新的缓存。`IOPCSyncIO::Read` 完全正确；publisher 引擎（§10）若需推送缓存
 //! 再加独立 task。这是未来"协议网关 DataSource"（Modbus/S7/UA 桥接）的扩展点。
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -263,6 +264,106 @@ impl DataSource for SimDataSource {
             writable,
         })
     }
+}
+
+/// 可配置规模的 hierarchical 仿真数据源（P2）——按规则生成 `plant{p}.line{l}.sensor{s}`
+/// 树，用于压测与 hierarchical browse 验证。
+///
+/// `new(10, 10, 1000)` = 10 万 leaf（3 层树）。值产生器：每 item 按 id hash + 经过秒数
+/// 算 0..=100 计数器（read-time，无 IO）。只读（`Write` 返 `E_ACCESSDENIED`）。
+pub struct GeneratedDataSource {
+    ns: NamespaceTree,
+    start: Instant,
+    /// leaf item_id 集合（O(1) 存在性判断）。
+    leaves: HashSet<String>,
+}
+
+impl GeneratedDataSource {
+    /// 构造 `plants × lines × sensors` 规模的 hierarchical 树。leaf 总数 = 三者乘积。
+    #[must_use]
+    pub fn new(plants: usize, lines: usize, sensors: usize) -> Self {
+        let mut root_children = Vec::with_capacity(plants);
+        let mut leaves = HashSet::with_capacity(plants * lines * sensors);
+        for p in 0..plants {
+            let mut line_children = Vec::with_capacity(lines);
+            for l in 0..lines {
+                let mut sensor_children = Vec::with_capacity(sensors);
+                for s in 0..sensors {
+                    let id = format!("plant{p}.line{l}.sensor{s}");
+                    sensor_children.push(NsNode::Leaf {
+                        id: Arc::from(id.as_str()),
+                    });
+                    leaves.insert(id);
+                }
+                line_children.push(NsNode::Branch {
+                    name: Arc::from(format!("line{l}")),
+                    children: sensor_children,
+                });
+            }
+            root_children.push(NsNode::Branch {
+                name: Arc::from(format!("plant{p}")),
+                children: line_children,
+            });
+        }
+        let root = NsNode::Branch {
+            name: Arc::from(""),
+            children: root_children,
+        };
+        Self {
+            ns: NamespaceTree::from_tree(root),
+            start: Instant::now(),
+            leaves,
+        }
+    }
+}
+
+impl DataSource for GeneratedDataSource {
+    fn namespace(&self) -> &NamespaceTree {
+        &self.ns
+    }
+
+    fn read(&self, item_id: &str) -> (VARIANT, u16, FILETIME) {
+        let ts = now_filetime();
+        if !self.leaves.contains(item_id) {
+            return (VARIANT::default(), OPC_QUALITY_BAD, ts);
+        }
+        // 值 = (id hash + 经过秒) % 101 → 0..=100 计数器（read-time，确定性 + 随时间变）。
+        let v = (item_id_hash(item_id).wrapping_add(self.start.elapsed().as_secs())) % 101;
+        (
+            variant_i4(i32::try_from(v).unwrap_or(0)),
+            OPC_QUALITY_GOOD,
+            ts,
+        )
+    }
+
+    fn write(&self, _item_id: &str, _value: &VARIANT) -> HRESULT {
+        E_ACCESSDENIED // 全只读。
+    }
+
+    fn item_meta(&self, item_id: &str) -> Option<ItemMeta> {
+        if self.leaves.contains(item_id) {
+            Some(ItemMeta {
+                data_type: VT_I4,
+                writable: false,
+            })
+        } else {
+            None
+        }
+    }
+
+    fn query_organization(&self) -> NsOrganization {
+        NsOrganization::Hierarchical
+    }
+}
+
+/// item_id → u64 hash（`GeneratedDataSource::read` 值产生用，FNV-1a 风格确定性）。
+fn item_id_hash(id: &str) -> u64 {
+    let mut h = 0x811C_9DC5u64;
+    for b in id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0193);
+    }
+    h
 }
 
 // —— VARIANT 构造/解析辅助 ——
@@ -572,5 +673,42 @@ mod tests {
         assert!(should_push(last, Some(50.0), good, 0.0, Some((0.0, 100.0))));
         // 非数值（normalize=None）→ 推。
         assert!(should_push(last, None, good, 0.1, None));
+    }
+
+    /// `GeneratedDataSource`：hierarchical 树构造 + read/item_meta/browse_children 导航。
+    #[test]
+    fn generated_data_source_tree_and_read() {
+        let ds = GeneratedDataSource::new(2, 2, 3); // 2*2*3 = 12 leaf
+        assert_eq!(ds.query_organization(), NsOrganization::Hierarchical);
+        // 已知 leaf：GOOD + VT_I4。
+        let (v, q, _) = ds.read("plant0.line0.sensor0");
+        assert_eq!(q, OPC_QUALITY_GOOD);
+        assert_eq!(vt_of(&v), VT_I4);
+        // 未知 item：BAD。
+        let (_, qb, _) = ds.read("nope");
+        assert_eq!(qb, OPC_QUALITY_BAD);
+        // item_meta：已知 VT_I4 只读。
+        let m = ds.item_meta("plant1.line1.sensor2").expect("meta");
+        assert_eq!(m.data_type, VT_I4);
+        assert!(!m.writable);
+        assert!(ds.item_meta("nope").is_none());
+        // browse_children 导航：root → 2 plant → 2 line → 3 sensor。
+        assert_eq!(
+            ds.namespace().browse_children(&[]).len(),
+            2,
+            "root 下 2 plant"
+        );
+        assert_eq!(
+            ds.namespace().browse_children(&["plant0"]).len(),
+            2,
+            "plant0 下 2 line"
+        );
+        assert_eq!(
+            ds.namespace().browse_children(&["plant0", "line0"]).len(),
+            3,
+            "plant0.line0 下 3 sensor"
+        );
+        // 不存在分支 → 空。
+        assert!(ds.namespace().browse_children(&["plant9"]).is_empty());
     }
 }
