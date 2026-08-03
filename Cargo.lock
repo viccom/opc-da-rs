@@ -2287,6 +2287,7 @@ dependencies = [
  "anyhow",
  "opc-da-client",
  "tokio",
+ "windows",
 ]
 
 [[package]]
