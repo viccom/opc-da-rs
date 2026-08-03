@@ -43,13 +43,16 @@ use windows::core::{
 use opc_da_client::bindings::comn::{IOPCCommon, IOPCCommon_Impl, IOPCShutdown};
 use opc_da_client::bindings::da::{
     IOPCBrowseServerAddressSpace, IOPCBrowseServerAddressSpace_Impl, IOPCItemProperties,
-    IOPCItemProperties_Impl, IOPCServer, IOPCServer_Impl, OPC_BRANCH, OPC_NS_FLAT,
+    IOPCItemProperties_Impl, IOPCServer, IOPCServer_Impl, OPC_BRANCH, OPC_BROWSE_DOWN,
+    OPC_BROWSE_TO, OPC_BROWSE_UP, OPC_LEAF, OPC_NS_FLAT, OPC_NS_HIERARCHIAL,
     OPC_PROPERTY_ACCESS_RIGHTS, OPC_PROPERTY_DATATYPE, OPC_PROPERTY_QUALITY, OPC_PROPERTY_VALUE,
     OPC_STATUS_RUNNING, tagOPCBROWSEDIRECTION, tagOPCBROWSETYPE, tagOPCENUMSCOPE,
     tagOPCNAMESPACETYPE, tagOPCSERVERSTATUS,
 };
 
-use crate::data_source::{DataSource, SimDataSource, now_filetime, variant_i2, variant_i4};
+use crate::data_source::{
+    DataSource, NsNode, NsOrganization, SimDataSource, now_filetime, variant_i2, variant_i4,
+};
 use crate::objects::{ConnectionPoint, GroupObj, StringEnum, pwstr_to_string};
 
 /// OPC DA Server COM 对象。
@@ -74,9 +77,15 @@ pub struct ServerObj {
 impl ServerObj {
     /// 新建 Server（空 group 注册表 + `SimDataSource` + 空 shutdown cp）。
     pub(crate) fn new() -> Self {
+        Self::with_data_source(Arc::new(SimDataSource::new()))
+    }
+
+    /// 新建 Server 并注入指定数据源（测试注入 `GeneratedDataSource` 验 hierarchical browse；
+    /// 未来 bin 入口按配置选数据源时复用）。
+    pub(crate) fn with_data_source(data_source: Arc<dyn DataSource>) -> Self {
         Self {
             inner: Mutex::new(ServerInner::new()),
-            data_source: Arc::new(SimDataSource::new()),
+            data_source,
             shutdown_cp: ConnectionPoint::<IOPCShutdown>::new().into(),
         }
     }
@@ -87,6 +96,9 @@ struct ServerInner {
     /// `hServerGroup -> GroupObj` 的 IUnknown（server 持引用，防 client 释放后过早 drop）。
     groups: HashMap<u32, IUnknown>,
     next_handle: u32,
+    /// hierarchical browse 当前位置（分支名栈，root = 空）。`ChangeBrowsePosition` 维护。
+    /// `Mutex` 串行化（browse position 是 per-ServerObj 的；browse 非高频，串行可接受）。
+    browse_pos: Vec<String>,
 }
 
 impl ServerInner {
@@ -94,6 +106,7 @@ impl ServerInner {
         Self {
             groups: HashMap::new(),
             next_handle: 1,
+            browse_pos: Vec::new(),
         }
     }
 
@@ -529,16 +542,44 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
 
 impl IOPCBrowseServerAddressSpace_Impl for ServerObj_Impl {
     fn QueryOrganization(&self) -> Result<tagOPCNAMESPACETYPE> {
-        // SimDataSource flat 命名空间（点号分隔 leaf id，无 branch 层级）。
-        Ok(OPC_NS_FLAT)
+        // 取数据源的命名空间组织方式（SimDataSource=flat，GeneratedDataSource=hierarchical）。
+        Ok(match self.data_source.query_organization() {
+            NsOrganization::Flat => OPC_NS_FLAT,
+            NsOrganization::Hierarchical => OPC_NS_HIERARCHIAL,
+        })
     }
 
     fn ChangeBrowsePosition(
         &self,
-        _dwbrowsedirection: tagOPCBROWSEDIRECTION,
-        _szstring: &PCWSTR,
+        dwbrowsedirection: tagOPCBROWSEDIRECTION,
+        szstring: &PCWSTR,
     ) -> Result<()> {
-        // flat 命名空间无层级位置，忽略（client 在 root 枚举所有 leaf）。
+        // flat 命名空间无层级位置——忽略调用（保持 root，幂等 Ok）。
+        if self.data_source.query_organization() == NsOrganization::Flat {
+            return Ok(());
+        }
+        let name = pwstr_to_string(PWSTR(szstring.as_ptr().cast_mut()));
+        {
+            let mut inner = locked(&self.inner);
+            if dwbrowsedirection == OPC_BROWSE_UP {
+                // UP：弹栈；root 上 UP 留 root（幂等，不报错——client DOWN/UP 配对调用）。
+                inner.browse_pos.pop();
+            } else if dwbrowsedirection == OPC_BROWSE_DOWN {
+                // DOWN：非空名压栈（不校验存在性——不存在分支枚举时返空，client 容错跳过）。
+                if !name.is_empty() {
+                    inner.browse_pos.push(name);
+                }
+            } else if dwbrowsedirection == OPC_BROWSE_TO {
+                // TO：清栈后按 `.` 分段下钻（空串 → root）。兼容 client 单段 + 规范多段绝对路径。
+                inner.browse_pos.clear();
+                for seg in name.split('.') {
+                    if !seg.is_empty() {
+                        inner.browse_pos.push(seg.to_string());
+                    }
+                }
+            }
+        }
+        // 未知 direction → 幂等 Ok（锁已在块结束释放，不持锁到返回）。
         Ok(())
     }
 
@@ -549,19 +590,24 @@ impl IOPCBrowseServerAddressSpace_Impl for ServerObj_Impl {
         _vtdatatypefilter: u16,
         _dwaccessrightsfilter: u32,
     ) -> Result<IEnumString> {
-        // flat 无 branch：OPC_BRANCH → 空；其余（OPC_LEAF / OPC_FLAT）→ 全部 leaf。
-        let items = if dwbrowsefiltertype == OPC_BRANCH {
-            Vec::new()
-        } else {
-            self.data_source.namespace().leaves().to_vec()
-        };
-        Ok(StringEnum::new(items).into())
+        Ok(StringEnum::new(self.browse_items(dwbrowsefiltertype)).into())
     }
 
     fn GetItemID(&self, szitemdataid: &PCWSTR) -> Result<PWSTR> {
-        // flat 命名空间：item data id == item id，原样返回（CoTaskMemAlloc wide 交 client）。
-        let s = pwstr_to_string(PWSTR(szitemdataid.as_ptr().cast_mut()));
-        let w: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        let rel = pwstr_to_string(PWSTR(szitemdataid.as_ptr().cast_mut()));
+        // hierarchical：相对名 + browse_pos 拼 full path（client 经此把 browse leaf 名转 full id）。
+        // flat 或 root（pos 空）：原样（browse name == full item id）。
+        let full = if self.data_source.query_organization() == NsOrganization::Hierarchical {
+            let pos = locked(&self.inner).browse_pos.clone();
+            if pos.is_empty() {
+                rel
+            } else {
+                format!("{}.{}", pos.join("."), rel)
+            }
+        } else {
+            rel
+        };
+        let w: Vec<u16> = full.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: CoTaskMemAlloc 分配 w.len()*2 字节；失败 null。
         let ptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
         if ptr.is_null() {
@@ -575,18 +621,68 @@ impl IOPCBrowseServerAddressSpace_Impl for ServerObj_Impl {
     }
 
     fn BrowseAccessPaths(&self, _szitemid: &PCWSTR) -> Result<IEnumString> {
-        // flat 命名空间无 access path → 空枚举（client 期望枚举器，非 E_NOTIMPL）。
+        // flat/hierarchical 均无 access path → 空枚举（client 期望枚举器，非 E_NOTIMPL）。
         Ok(StringEnum::new(Vec::new()).into())
+    }
+}
+
+impl ServerObj_Impl {
+    /// 按 namespace 类型 + browse filter 收集要枚举的字符串。
+    ///
+    /// - flat：`BRANCH` 空；`LEAF`/`FLAT` → 全部 leaf full id。
+    /// - hierarchical：`BRANCH` → 当前位置子分支**相对名**；`LEAF` → 当前位置叶子**相对名**
+    ///   （client 经 `GetItemID` 转 full id）；`FLAT` → 跨分支全部 leaf full id。
+    fn browse_items(&self, browse_type: tagOPCBROWSETYPE) -> Vec<String> {
+        match self.data_source.query_organization() {
+            NsOrganization::Flat => {
+                if browse_type == OPC_BRANCH {
+                    Vec::new()
+                } else {
+                    self.data_source.namespace().leaves().to_vec()
+                }
+            }
+            NsOrganization::Hierarchical => {
+                let pos = locked(&self.inner).browse_pos.clone();
+                let pos_ref: Vec<&str> = pos.iter().map(String::as_str).collect();
+                let children = self.data_source.browse_branch(&pos_ref);
+                match browse_type {
+                    OPC_BRANCH => children
+                        .iter()
+                        .filter_map(|n| match n {
+                            NsNode::Branch { name, .. } => Some((*name).to_string()),
+                            NsNode::Leaf { .. } => None,
+                        })
+                        .collect(),
+                    OPC_LEAF => children
+                        .iter()
+                        .filter_map(|n| match n {
+                            // 相对叶名 = full id 最后一段（'.' 之后）；client 经 GetItemID 拼 full path。
+                            NsNode::Leaf { id } => {
+                                Some(id.rsplit('.').next().unwrap_or("").to_string())
+                            }
+                            NsNode::Branch { .. } => None,
+                        })
+                        .collect(),
+                    // FLAT browse（含 OPC_FLAT 及任何未知值）：跨分支全部 leaf full id。
+                    _ => self.data_source.namespace().leaves().to_vec(),
+                }
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::ServerObj;
+    use crate::data_source::GeneratedDataSource;
     use crate::objects::pwstr_to_string;
     use opc_da_client::bindings::comn::IOPCCommon;
     use opc_da_client::bindings::da::{
-        IOPCBrowseServerAddressSpace, IOPCItemProperties, IOPCServer, OPC_NS_FLAT,
+        IOPCBrowseServerAddressSpace, IOPCItemProperties, IOPCServer, OPC_BRANCH, OPC_BROWSE_DOWN,
+        OPC_BROWSE_TO, OPC_BROWSE_UP, OPC_FLAT, OPC_LEAF, OPC_NS_FLAT, OPC_NS_HIERARCHIAL,
+        tagOPCBROWSEDIRECTION, tagOPCBROWSETYPE,
     };
     use windows::Win32::Foundation::{E_NOTIMPL, S_OK};
     use windows::Win32::System::Com::{CoTaskMemFree, IConnectionPointContainer};
@@ -628,6 +724,152 @@ mod tests {
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    /// 构造 GeneratedDataSource(2,2,3)=12 leaf 的 Server，QI 到 browse 接口。
+    fn hier_browse() -> IOPCBrowseServerAddressSpace {
+        let obj: IUnknown =
+            ServerObj::with_data_source(Arc::new(GeneratedDataSource::new(2, 2, 3))).into();
+        obj.cast::<IOPCBrowseServerAddressSpace>()
+            .expect("QI browse")
+    }
+
+    /// `ChangeBrowsePosition(dir, s)`（封装 unsafe + wide 转换）。
+    fn change_pos(b: &IOPCBrowseServerAddressSpace, dir: tagOPCBROWSEDIRECTION, s: &str) {
+        // SAFETY: b 同进程 implement；ChangeBrowsePosition 改 browse_pos 栈。
+        unsafe {
+            b.ChangeBrowsePosition(dir, PCWSTR(wide(s).as_ptr()))
+                .expect("ChangeBrowsePosition");
+        }
+    }
+
+    /// `BrowseOPCItemIDs(browse_type)` → 收集全部枚举串（Next 到空）。
+    fn collect_browse(
+        b: &IOPCBrowseServerAddressSpace,
+        browse_type: tagOPCBROWSETYPE,
+    ) -> Vec<String> {
+        // SAFETY: b 同进程 implement；BrowseOPCItemIDs 返 IEnumString，Next 取串（CoTaskMemFree 每个）。
+        unsafe {
+            let en = b
+                .BrowseOPCItemIDs(browse_type, PCWSTR::null(), 0, 0)
+                .expect("BrowseOPCItemIDs");
+            let mut out = Vec::new();
+            loop {
+                let mut buf = [PWSTR::null(); 16];
+                let mut fetched = 0u32;
+                let hr = en.Next(&mut buf, Some(&raw mut fetched));
+                if !hr.is_ok() || fetched == 0 {
+                    break;
+                }
+                for p in buf.iter().take(fetched as usize) {
+                    out.push(pwstr_to_string(*p));
+                    CoTaskMemFree(Some(p.as_ptr() as *const _));
+                }
+            }
+            out
+        }
+    }
+
+    /// GeneratedDataSource(2,2,3)=12 leaf → QueryOrganization=OPC_NS_HIERARCHIAL。
+    #[test]
+    fn browse_hierarchical_query_organization() {
+        let b = hier_browse();
+        // SAFETY: b 同进程 implement；QueryOrganization 返 namespace 类型。
+        let org = unsafe { b.QueryOrganization() }.expect("QueryOrganization");
+        assert_eq!(org, OPC_NS_HIERARCHIAL, "GeneratedDataSource hierarchical");
+    }
+
+    /// root BrowseOPCItemIDs(BRANCH) → [plant0, plant1]（相对分支名）。
+    #[test]
+    fn browse_hierarchical_branch_at_root() {
+        let b = hier_browse();
+        let branches = collect_browse(&b, OPC_BRANCH);
+        assert_eq!(branches, vec!["plant0".to_string(), "plant1".to_string()]);
+    }
+
+    /// DOWN plant0 → BRANCH=[line0,line1]；再 DOWN line0 → LEAF=[sensor0,sensor1,sensor2]（相对名）。
+    #[test]
+    fn browse_hierarchical_down_then_leaf() {
+        let b = hier_browse();
+        change_pos(&b, OPC_BROWSE_DOWN, "plant0");
+        let lines = collect_browse(&b, OPC_BRANCH);
+        assert_eq!(lines, vec!["line0".to_string(), "line1".to_string()]);
+        change_pos(&b, OPC_BROWSE_DOWN, "line0");
+        let sensors = collect_browse(&b, OPC_LEAF);
+        assert_eq!(
+            sensors,
+            vec![
+                "sensor0".to_string(),
+                "sensor1".to_string(),
+                "sensor2".to_string(),
+            ]
+        );
+    }
+
+    /// DOWN plant0 DOWN line0 → UP → 回 plant0 → BRANCH=[line0,line1]。
+    #[test]
+    fn browse_hierarchical_up() {
+        let b = hier_browse();
+        change_pos(&b, OPC_BROWSE_DOWN, "plant0");
+        change_pos(&b, OPC_BROWSE_DOWN, "line0");
+        change_pos(&b, OPC_BROWSE_UP, "");
+        let lines = collect_browse(&b, OPC_BRANCH);
+        assert_eq!(lines, vec!["line0".to_string(), "line1".to_string()]);
+    }
+
+    /// DOWN plant0 DOWN line0 → TO "" → 回 root → BRANCH=[plant0,plant1]。
+    #[test]
+    fn browse_hierarchical_to_root() {
+        let b = hier_browse();
+        change_pos(&b, OPC_BROWSE_DOWN, "plant0");
+        change_pos(&b, OPC_BROWSE_DOWN, "line0");
+        change_pos(&b, OPC_BROWSE_TO, "");
+        let branches = collect_browse(&b, OPC_BRANCH);
+        assert_eq!(branches, vec!["plant0".to_string(), "plant1".to_string()]);
+    }
+
+    /// DOWN plant0 DOWN line0 → GetItemID("sensor0") → "plant0.line0.sensor0"（相对名拼 full path）。
+    #[test]
+    fn browse_hierarchical_getitemid_resolves_full_path() {
+        let b = hier_browse();
+        change_pos(&b, OPC_BROWSE_DOWN, "plant0");
+        change_pos(&b, OPC_BROWSE_DOWN, "line0");
+        // SAFETY: b 同进程；GetItemID 返 CoTaskMemAlloc wide（pwstr_to_string 解析后 CoTaskMemFree）。
+        let pwstr = unsafe { b.GetItemID(PCWSTR(wide("sensor0").as_ptr())) }.expect("GetItemID");
+        assert_eq!(pwstr_to_string(pwstr), "plant0.line0.sensor0");
+        unsafe { CoTaskMemFree(Some(pwstr.as_ptr() as *const _)) };
+    }
+
+    /// BrowseOPCItemIDs(FLAT) → 全部 12 leaf full id（跨分支，client 直接当 item id）。
+    #[test]
+    fn browse_hierarchical_flat_returns_all_full_ids() {
+        let b = hier_browse();
+        let all = collect_browse(&b, OPC_FLAT);
+        assert_eq!(all.len(), 12, "2*2*3 = 12 leaf");
+        assert!(
+            all.iter()
+                .all(|id| id.starts_with("plant") && id.matches('.').count() == 2),
+            "每个 full id 应为 plant{{p}}.line{{l}}.sensor{{s}} 三段: {all:?}"
+        );
+        assert!(all.contains(&"plant0.line0.sensor0".to_string()));
+        assert!(all.contains(&"plant1.line1.sensor2".to_string()));
+    }
+
+    /// flat 回归：SimDataSource → QueryOrganization=OPC_NS_FLAT，root LEAF=4 full id，BRANCH 空。
+    #[test]
+    fn browse_flat_sim_namespace_unchanged() {
+        let server: IUnknown = ServerObj::new().into();
+        let b: IOPCBrowseServerAddressSpace = server
+            .cast::<IOPCBrowseServerAddressSpace>()
+            .expect("QI browse");
+        // SAFETY: b 同进程；QueryOrganization 返 namespace 类型。
+        let org = unsafe { b.QueryOrganization() }.expect("QueryOrganization");
+        assert_eq!(org, OPC_NS_FLAT, "SimDataSource flat");
+        let leaves = collect_browse(&b, OPC_LEAF);
+        assert_eq!(leaves.len(), 4, "4 内置 tag");
+        assert!(leaves.contains(&"Random.Int4".to_string()));
+        assert!(leaves.contains(&"Bucket Brigade.Int4".to_string()));
+        assert!(collect_browse(&b, OPC_BRANCH).is_empty(), "flat 无 branch");
     }
 
     /// `IOPCItemProperties::QueryAvailableProperties`：已知 item 返回 4 property
