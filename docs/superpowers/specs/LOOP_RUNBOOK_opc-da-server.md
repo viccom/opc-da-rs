@@ -87,7 +87,7 @@
 - [ ] `IOPCAsyncIO3`
 
 ### 阶段 3 — 代码部分（远程验证属"需用户"）
-- [ ] `CoInitializeSecurity` 实装（注册类对象前调）
+- [x] `CoInitializeSecurity` 实装（CONNECT/IDENTIFY/EOAC_NONE，注册类对象前调；本机 e2e 兼容 13 passed）
 - [ ] Windows Service 包装（`windows-service` crate 或自写 ServiceMain）
 - [x] `unregister` 完整实装（`RegDeleteTreeW` 递归删 CLSID/{prog_id}/AppID 子树，双视图 64+32 幂等）
 - [ ] proxy/stub 配置文档（说明依赖 OPC Core Components，非编码）
