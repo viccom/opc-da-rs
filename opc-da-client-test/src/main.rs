@@ -11,6 +11,15 @@
 //! 2. server EXE 在 `target/{debug,release}/opc-da-server.exe`（SCM 按注册的
 //!    `LocalServer32` 路径拉起）。
 //!
+//! # 用法
+//!
+//! ```text
+//! opc-da-client-test.exe [host]
+//! ```
+//! - 无参：连本机 localhost（自建 server 本机验证，13 探针）。
+//! - `<host>`：DCOM 远程验证——连远程机的 opc-da-server。client 机也需 `/RegServer` 注册
+//!   ProgID/CLSID 供 `CLSIDFromProgID` 解析，再 `CoCreateInstanceEx` 连远程 host。
+//!
 //! # 当前覆盖（M8：全量验证）
 //!
 //! 13 探针覆盖 opc-da-server 全部已实装接口：
@@ -38,11 +47,15 @@ const PROG_ID: &str = "opc-da-rs.Server.1";
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // 端到端探针线性排列，拆分无收益
 async fn main() -> anyhow::Result<()> {
+    // 命令行第 1 参数 = server host（DCOM 远程验证用）；默认 localhost（本机测试）。
+    // 用法：opc-da-client-test.exe [host]  （host 如 192.168.1.10 / server-pc）
+    let args: Vec<String> = std::env::args().collect();
+    let host = args.get(1).map_or("localhost", String::as_str);
     println!("=== opc-da-client-test: client ↔ opc-da-server 端到端 ===");
-    println!("目标 ProgID: {PROG_ID}\n");
+    println!("目标 ProgID: {PROG_ID}  host: {host}\n");
 
-    // ComConnector::default() = localhost；OpcDaClient 内部 worker 线程做 CoInitializeEx(MTA)。
-    let client = OpcDaClient::new(ComConnector::default())?;
+    // ComConnector::new(host)：本机 localhost 或远程 host（DCOM）；OpcDaClient 内部 worker 做 CoInitializeEx(MTA)。
+    let client = OpcDaClient::new(ComConnector::new(host))?;
     let (mut passed, mut failed) = (0u32, 0u32);
 
     // 1. IOPCServer::GetStatus（server 阶段 0 已实装）。
@@ -241,7 +254,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 9. list_servers（CATID 注册[M7b]：client 经 Implemented Categories 枚举自建 server）。
-    match client.list_servers("localhost").await {
+    match client.list_servers(host).await {
         Ok(servers) => {
             if servers.iter().any(|s| s.contains("opc-da-rs")) {
                 println!(
