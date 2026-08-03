@@ -74,7 +74,8 @@
 - [x] `IOPCItemMgt`：AddItems / RemoveItems / ValidateItems / SetActiveState / SetClientHandles
 - [x] `IOPCGroupStateMgt`（`c22b8ef` M4；GetState/SetState/SetName 实装；CloneGroup 暂 nyi）
 - [x] `IOPCSyncIO`（`46672bf` M3；Read/Write，端到端 round-trip=42）
-- [ ] `IOPCAsyncIO2`：Read / Write / Refresh2（CancelID + 走 callback）——骨架 nyi，待 DA3
+- [x] `IOPCAsyncIO2::Refresh2`（`f4ad287`；client 主动刷新——同步推 `OnDataChange` 带 dwTransactionID，仅 active items；标准 client advise 后常调此拿初始全量快照）
+- [ ] `IOPCAsyncIO2::Read/Write`（CancelID + 走 callback）——仍 nyi，待 DA3
 - [x] `IOPCServer`（`b0ae27f` M2；AddGroup/RemoveGroup/GetStatus；GetGroupByName/CreateGroupEnumerator 暂 nyi）
 - [x] `publisher.rs`（`51b1b83` M5b；周期推送 OnDataChange，跨进程 callback 端到端通）
 - [x] **阶段 1 自闭环 e2e 测试**（opc-da-client-test 13 探针全 pass）
