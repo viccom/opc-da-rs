@@ -526,11 +526,11 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 - [x] verify 全门 —— 13 探针无回归（browse flat 探针仍过）
 - [x] commit + 勾选 —— P2.3 feat `0df5a2f` + 本 chore
 
-### P3 — 优化（按压测）
-- [ ] P3.1 `Arc<str>`（随 P1）
-- [ ] P3.2 thread-local buffer（P4 发现分配瓶颈后）
-- [ ] P3.4 ServerObj RwLock（P4 发现建连瓶颈后）
-- [ ] P3.3 VARIANT 池（仅强制时）
+### P3 — 优化（v1 压测：item/s 19833、RSS 18MB 稳定，无显著瓶颈）
+- [x] P3.1 `Arc<str>`（P1 并入）—— item_id `Arc<str>`，snapshot/推送避 String clone
+- [x] P3.2 thread-local buffer（`915d51f`）—— worker `PUSH_BUF` 复用 Vec（hc/v/q/ts）clear+reuse；v1 无显著收益（瓶颈 COM 编组非分配，VARIANT 大头），保留作 idiomatic + 为 v2/v3 预防
+- [ ] P3.3 VARIANT 池 —— v1 RSS 18MB 稳定（非瓶颈）+ 高风险（COM 所有权），scale-plan"仅强制时"不做
+- [ ] P3.4 ServerObj groups 锁 —— v1 建连非持续瓶颈（100 client 建连期短暂），按需不做
 
 ### P4 — e2e + 压测（P4.1 e2e `d0428cc`+`4ab83ad`；P4.2 stress `df4ce1f` v1 达标）
 - [x] P4.1 e2e 载体：server env 切数据源 + client-test 模块化 + 13 flat + hierarchical 探针（17 passed）
