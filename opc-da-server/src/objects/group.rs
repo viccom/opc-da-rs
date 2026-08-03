@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::Foundation::{
@@ -122,6 +123,18 @@ impl GroupInner {
             .collect();
         (self.h_client_group, frames)
     }
+
+    /// `Refresh2` 用：快照 active items 的 `(h_client_group, [(h_client, item_id)])`。
+    /// 与 `snapshot_for_publish` 区别：只含 `active` 的 item（OPC DA 规范：Refresh 只推 active）。
+    pub fn snapshot_active_for_publish(&self) -> (u32, Vec<(u32, String)>) {
+        let frames = self
+            .items
+            .values()
+            .filter(|e| e.active)
+            .map(|e| (e.h_client, e.item_id.clone()))
+            .collect();
+        (self.h_client_group, frames)
+    }
 }
 
 /// OPC DA Group COM 对象。
@@ -142,6 +155,8 @@ pub struct GroupObj {
     /// COM 对象，refcount 由 COM 自管）。`FindConnectionPoint(IOPCDataCallback)` 返回它的
     /// clone（AddRef）；publisher 引擎（§10）经 `EnumConnections` 遍历 sink 推送 `OnDataChange`。
     pub(crate) data_cp: IConnectionPoint,
+    /// `IOPCAsyncIO2` 事务 CancelID 分配器（从 1 起，0 = 无效）。
+    next_cancel_id: AtomicU32,
 }
 
 impl GroupObj {
@@ -186,6 +201,7 @@ impl GroupObj {
             inner,
             data_source,
             data_cp,
+            next_cancel_id: AtomicU32::new(1),
         }
     }
 }
@@ -719,8 +735,24 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
         nyi()
     }
 
-    fn Refresh2(&self, _dwsource: tagOPCDATASOURCE, _dwtransactionid: u32) -> Result<u32> {
-        nyi()
+    fn Refresh2(&self, _dwsource: tagOPCDATASOURCE, dwtransactionid: u32) -> Result<u32> {
+        // dwsource（CACHE/DEVICE）忽略：SimDataSource 无 cache/device 之分，统一 read-time
+        // 现算（同 IOPCSyncIO::Read）。CancelID 仅满足"唯一标识事务"契约——Refresh2 同步推送，
+        // 返回时已完成；client 对已完成事务调 Cancel2 为 no-op（Cancel2 暂 nyi）。
+        let cancel_id = self.next_cancel_id.fetch_add(1, Ordering::Relaxed);
+        // 锁内取 active items 快照（h_group + frames）；锁外读 + 推送（避免长持锁）。
+        let (h_group, frames) = locked(&self.inner).snapshot_active_for_publish();
+        let sinks = crate::objects::publisher::enumerate_sinks(&self.data_cp);
+        if !sinks.is_empty() && !frames.is_empty() {
+            crate::objects::publisher::push_data_change(
+                &sinks,
+                h_group,
+                &frames,
+                &*self.data_source,
+                dwtransactionid,
+            );
+        }
+        Ok(cancel_id)
     }
 
     fn Cancel2(&self, _dwcancelid: u32) -> Result<()> {
@@ -762,7 +794,11 @@ mod tests {
     use super::*;
     use crate::data_source::{OPC_QUALITY_GOOD, SimDataSource};
     use opc_da_client::bindings::comn::IOPCShutdown;
-    use opc_da_client::bindings::da::{IOPCItemMgt, IOPCSyncIO, OPC_DS_DEVICE};
+    use opc_da_client::bindings::da::{
+        IOPCAsyncIO2, IOPCDataCallback, IOPCDataCallback_Impl, IOPCItemMgt, IOPCSyncIO,
+        OPC_DS_DEVICE,
+    };
+    use windows::Win32::Foundation::FILETIME;
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::System::Variant::{VARIANT, VT_I4, VT_R8};
     use windows::core::{IUnknown, Interface};
@@ -843,7 +879,7 @@ mod tests {
     fn multi_interface_qi_succeeds() {
         let ds: Arc<dyn DataSource> = Arc::new(SimDataSource::new());
         let obj: IUnknown = GroupObj::new(ds, String::new(), true, 1000, 0, 0.0, 0, 0, 0).into();
-        use opc_da_client::bindings::da::{IOPCAsyncIO2, IOPCGroupStateMgt, IOPCSyncIO};
+        use opc_da_client::bindings::da::IOPCGroupStateMgt;
         use windows::Win32::System::Com::IConnectionPointContainer;
         assert!(obj.cast::<IOPCItemMgt>().is_ok());
         assert!(obj.cast::<IOPCGroupStateMgt>().is_ok());
@@ -1272,5 +1308,160 @@ mod tests {
             (100, "Random.Int4".to_string()),
             "h_client + item_id"
         );
+    }
+
+    /// 测试用 `IOPCDataCallback` sink：捕获 `OnDataChange` 的 `(trans_id, h_group, count)`，
+    /// 经共享 `Arc<Mutex>` 让测试同步读取（同进程 COM 调用直接进 OnDataChange）。
+    #[implement(IOPCDataCallback)]
+    struct CapturingSink {
+        last: Arc<Mutex<Option<(u32, u32, u32)>>>,
+    }
+
+    // IOPCDataCallback 4 方法：OnDataChange 记录；其余 no-op（Refresh2 只触发 OnDataChange）。
+    #[allow(clippy::too_many_arguments)] // COM vtable 签名固定（bindings 生成）
+    impl IOPCDataCallback_Impl for CapturingSink_Impl {
+        fn OnDataChange(
+            &self,
+            dwtransid: u32,
+            hgroup: u32,
+            _hrmasterquality: HRESULT,
+            _hrmastererror: HRESULT,
+            dwcount: u32,
+            _phclientitems: *const u32,
+            _pvvalues: *const VARIANT,
+            _pwqualities: *const u16,
+            _pfttimestamps: *const FILETIME,
+            _perrors: *const HRESULT,
+        ) -> Result<()> {
+            *locked(&self.last) = Some((dwtransid, hgroup, dwcount));
+            Ok(())
+        }
+
+        fn OnReadComplete(
+            &self,
+            _dwtransid: u32,
+            _hgroup: u32,
+            _hrmasterquality: HRESULT,
+            _hrmastererror: HRESULT,
+            _dwcount: u32,
+            _phclientitems: *const u32,
+            _pvvalues: *const VARIANT,
+            _pwqualities: *const u16,
+            _pfttimestamps: *const FILETIME,
+            _perrors: *const HRESULT,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn OnWriteComplete(
+            &self,
+            _dwtransid: u32,
+            _hgroup: u32,
+            _hrmastererr: HRESULT,
+            _dwcount: u32,
+            _pclienthandles: *const u32,
+            _perrors: *const HRESULT,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn OnCancelComplete(&self, _dwtransid: u32, _hgroup: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// `GroupInner::snapshot_active_for_publish`：只含 active items（inactive 过滤）。
+    #[test]
+    fn snapshot_active_for_publish_filters_inactive() {
+        let mut inner = GroupInner {
+            items: HashMap::new(),
+            next_handle: 1,
+            update_rate: 500,
+            active: true,
+            name: "test".into(),
+            time_bias: 0,
+            percent_deadband: 0.0,
+            locale: 0,
+            h_client_group: 42,
+            h_server_group: 7,
+        };
+        inner.items.insert(
+            1,
+            ItemEntry {
+                item_id: "Random.Int4".into(),
+                h_client: 100,
+                active: true,
+                data_type: VT_I4,
+            },
+        );
+        inner.items.insert(
+            2,
+            ItemEntry {
+                item_id: "Random.Real8".into(),
+                h_client: 200,
+                active: false,
+                data_type: VT_R8,
+            },
+        );
+        let (h_group, frames) = inner.snapshot_active_for_publish();
+        assert_eq!(h_group, 42, "h_client_group 回传");
+        assert_eq!(frames.len(), 1, "只 1 个 active item（inactive 过滤）");
+        assert_eq!(
+            frames[0],
+            (100, "Random.Int4".to_string()),
+            "active item 的 h_client + item_id"
+        );
+    }
+
+    /// `IOPCAsyncIO2::Refresh2` 核心：触发一次 `OnDataChange`，带 client 的 dwTransactionID，
+    /// 且只推 active items。验证 Refresh2 意图——client 主动刷新拿当前全量快照。
+    #[test]
+    fn refresh2_pushes_ondatachange_with_transaction_id() {
+        use windows::Win32::System::Com::{IConnectionPoint, IConnectionPointContainer};
+
+        let g = new_group();
+        // AddItems：1 active + 1 inactive（验证 Refresh 只推 active）。
+        let id_active = wide("Random.Int4");
+        let id_inactive = wide("Random.Real8");
+        let defs = [
+            make_def(&id_active, 100, true),
+            make_def(&id_inactive, 200, false),
+        ];
+        let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+        let mut errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: g 同进程 implement；defs/results/errs 指针有效。
+        unsafe {
+            g.AddItems(2, defs.as_ptr(), &raw mut results, &raw mut errs)
+                .expect("AddItems");
+            CoTaskMemFree(Some(results.cast()));
+            CoTaskMemFree(Some(errs.cast()));
+        }
+
+        // Advise 捕获 sink（共享 Arc 让测试读 OnDataChange 记录）。
+        let last: Arc<Mutex<Option<(u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+        let sink: IOPCDataCallback = CapturingSink {
+            last: Arc::clone(&last),
+        }
+        .into();
+        let cpc: IConnectionPointContainer = g.cast::<IConnectionPointContainer>().expect("QI CPC");
+        let iid_dc = IOPCDataCallback::IID;
+        // SAFETY: cpc 同进程；iid_dc 有效 GUID。
+        let cp: IConnectionPoint =
+            unsafe { cpc.FindConnectionPoint(&raw const iid_dc) }.expect("FindConnectionPoint");
+        let sink_unk: IUnknown = sink.cast::<IUnknown>().expect("cast IUnknown");
+        // SAFETY: cp 同进程；sink_unk 有效 IUnknown。返回 cookie（测试不验证，仅确认 Advise 成功）。
+        let _cookie = unsafe { cp.Advise(&sink_unk) }.expect("Advise");
+
+        // Refresh2(dwTransactionID=12345)——同步推送（返回前 OnDataChange 已调）。
+        let async2: IOPCAsyncIO2 = g.cast::<IOPCAsyncIO2>().expect("QI AsyncIO2");
+        // SAFETY: async2 同进程；Refresh2 内同步调 publisher::push_data_change → sink.OnDataChange。
+        let cancel_id = unsafe { async2.Refresh2(OPC_DS_DEVICE, 12345) }.expect("Refresh2");
+        assert!(cancel_id >= 1, "cancel id 应非 0（从 1 起）");
+
+        // 验证 sink 收到 OnDataChange(12345, count=1 active only)。
+        let captured = *locked(&last);
+        let (tid, _hgroup, count) = captured.expect("Refresh2 应触发 OnDataChange");
+        assert_eq!(tid, 12345, "dwTransactionID 应透传到 OnDataChange");
+        assert_eq!(count, 1, "只推 1 个 active item（inactive 过滤）");
     }
 }

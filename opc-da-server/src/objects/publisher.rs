@@ -75,12 +75,12 @@ fn publisher_loop(
         if frames.is_empty() {
             continue;
         }
-        push_data_change(&sinks, h_group, &frames, &*data_source);
+        push_data_change(&sinks, h_group, &frames, &*data_source, 0);
     }
 }
 
 /// 枚举 `data_cp` 当前所有 sink（`IOPCDataCallback`）：`EnumConnections` + `Next` → pUnk cast。
-fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
+pub fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
     let mut sinks = Vec::new();
     // SAFETY: cp 为 IConnectionPoint 接口；EnumConnections 返回快照枚举器。
     let Ok(en) = (unsafe { cp.EnumConnections() }) else {
@@ -107,11 +107,15 @@ fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
 }
 
 /// 打包 frames 为 `OnDataChange` 5 数组 + 遍历 sink 推送。
-fn push_data_change(
+///
+/// `trans_id`：周期推送传 `0`（非事务）；`Refresh2` 传 client 的 `dwTransactionID`（client
+/// 据此区分"主动刷新"回调与周期推送）。
+pub fn push_data_change(
     sinks: &[IOPCDataCallback],
     h_group: u32,
     frames: &[(u32, String)],
     data_source: &dyn DataSource,
+    trans_id: u32,
 ) {
     let n = frames.len();
     let mut hclients: Vec<u32> = Vec::with_capacity(n);
@@ -132,7 +136,7 @@ fn push_data_change(
         // 栈存活期间有效（OnDataChange 同步返回前不释放）。
         let _ = unsafe {
             sink.OnDataChange(
-                0, // dwTransID（subscription 推送，非 async 事务）
+                trans_id, // dwTransID：周期推送=0，Refresh2=client dwTransactionID
                 h_group,
                 S_OK, // hrMasterQuality
                 S_OK, // hrMasterError
