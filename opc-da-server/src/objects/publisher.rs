@@ -12,8 +12,6 @@ use windows::core::{HRESULT, Interface};
 
 use opc_da_client::bindings::da::IOPCDataCallback;
 
-use crate::data_source::DataSource;
-
 /// 枚举 `data_cp` 当前所有 sink（`IOPCDataCallback`）：`EnumConnections` + `Next` → pUnk cast。
 pub fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
     let mut sinks = Vec::new();
@@ -41,30 +39,21 @@ pub fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
     sinks
 }
 
-/// 打包 frames 为 `OnDataChange` 5 数组 + 遍历 sink 推送。
+/// 遍历 sink 调 `OnDataChange`（5 数组由 caller 打包；P1 起 push_data_change 不再 read）。
 ///
-/// `trans_id`：周期推送传 `0`（非事务）；`Refresh2` 传 client 的 `dwTransactionID`（client
-/// 据此区分"主动刷新"回调与周期推送）。
+/// `trans_id`：周期推送传 `0`（非事务）；`Refresh2` 传 client 的 `dwTransactionID`。
+/// caller 负责 read + deadband 过滤（[`crate::objects::scheduler::push_one`]）或全推（`Refresh2`）。
 pub fn push_data_change(
     sinks: &[IOPCDataCallback],
     h_group: u32,
-    frames: &[(u32, String)],
-    data_source: &dyn DataSource,
+    hclients: &[u32],
+    values: &[VARIANT],
+    qualities: &[u16],
+    timestamps: &[FILETIME],
     trans_id: u32,
 ) {
-    let n = frames.len();
-    let mut hclients: Vec<u32> = Vec::with_capacity(n);
-    let mut values: Vec<VARIANT> = Vec::with_capacity(n);
-    let mut qualities: Vec<u16> = Vec::with_capacity(n);
-    let mut timestamps: Vec<FILETIME> = Vec::with_capacity(n);
+    let n = hclients.len();
     let errors: Vec<HRESULT> = vec![S_OK; n];
-    for (hc, id) in frames {
-        let (v, q, ts) = data_source.read(id);
-        hclients.push(*hc);
-        values.push(v);
-        qualities.push(q);
-        timestamps.push(ts);
-    }
     let count = u32::try_from(n).unwrap_or(u32::MAX);
     for sink in sinks {
         // SAFETY: sink 是 IOPCDataCallback 接口（MTA 下跨线程/跨进程可调）；数组指针在本函数

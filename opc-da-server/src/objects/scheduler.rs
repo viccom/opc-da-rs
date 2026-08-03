@@ -244,18 +244,54 @@ fn worker_loop(s: &Scheduler) {
     }
 }
 
-/// 推送单个 job：取 sink 快照 → 取 active items 快照 → 打包 OnDataChange。
+/// 推送单个 job（worker 线程调）：取 sink 快照 → 锁内 read + deadband 过滤 + 更新
+/// `last_pushed` + 收集变化帧 → 锁外 push `OnDataChange`。
 ///
-/// 复用 `publisher::enumerate_sinks` + `publisher::push_data_change`（与旧 per-group
-/// `publisher_loop` 同逻辑，区别在由 worker 池并发执行而非每 group 独占线程）。
+/// deadband（P1）：只推值/quality 变化的 item（[`crate::data_source::should_push`]）。
+/// DataSource::read 在锁内（SimDataSource/GeneratedDataSource read-time 计算，快）；
+/// 慢数据源（协议网关）未来改两阶段（锁外 read）。
 fn push_one(job: &PublishJob) {
     let sinks = publisher::enumerate_sinks(&job.data_cp);
     if sinks.is_empty() {
         return;
     }
-    let (h_group, frames) = locked(&job.inner).snapshot_for_publish();
-    if frames.is_empty() {
-        return;
+    let (h_group, hclients, values, qualities, timestamps) = {
+        let mut g = locked(&job.inner);
+        let deadband = g.percent_deadband;
+        let h_group = g.h_client_group;
+        let mut hc = Vec::new();
+        let mut v = Vec::new();
+        let mut q = Vec::new();
+        let mut ts = Vec::new();
+        for entry in g.items.values_mut() {
+            if !entry.active {
+                continue;
+            }
+            let (val, qual, t) = job.data_source.read(&entry.item_id);
+            let nv = crate::data_source::normalize_variant(&val);
+            let range = job.data_source.item_range(&entry.item_id);
+            if crate::data_source::should_push(entry.last_pushed, nv, qual, deadband, range) {
+                entry.last_pushed = Some(crate::data_source::PushState {
+                    value: nv.unwrap_or(0.0),
+                    quality: qual,
+                });
+                hc.push(entry.h_client);
+                v.push(val);
+                q.push(qual);
+                ts.push(t);
+            }
+        }
+        (h_group, hc, v, q, ts)
+    };
+    if !hclients.is_empty() {
+        publisher::push_data_change(
+            &sinks,
+            h_group,
+            &hclients,
+            &values,
+            &qualities,
+            &timestamps,
+            0,
+        );
     }
-    publisher::push_data_change(&sinks, h_group, &frames, &*job.data_source, 0);
 }

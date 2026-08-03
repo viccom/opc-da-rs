@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Foundation::{E_ACCESSDENIED, E_INVALIDARG, FILETIME, S_OK};
-use windows::Win32::System::Variant::{VARENUM, VARIANT, VT_I2, VT_I4, VT_R8};
+use windows::Win32::System::Variant::{VARENUM, VARIANT, VT_BOOL, VT_I2, VT_I4, VT_R8};
 use windows::core::HRESULT;
 
 /// OPC 质量掩码（低 6 位为质量；高 2 位为 limit）。`GOOD`=0xC0，`BAD`=0x00。
@@ -54,6 +54,17 @@ pub struct ItemMeta {
     pub writable: bool,
 }
 
+/// 上次推送的 item 状态快照（deadband 变化检测用，P1）。
+///
+/// 仅比 `value`（规范化 f64）+ `quality`；timestamp 不参与 deadband（每周期必变）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PushState {
+    /// 规范化值（`VT_I4`/`VT_R8`/`VT_I2`/`VT_BOOL` → f64）。
+    pub value: f64,
+    /// 质量。
+    pub quality: u16,
+}
+
 /// server 的"虚拟工厂"——所有数据的来源（设计 §9）。
 ///
 /// 实现者：[`SimDataSource`]（内置）；未来可加协议网关实现（Modbus/S7/UA 桥接）。
@@ -69,6 +80,11 @@ pub trait DataSource: Send + Sync {
     fn write(&self, item_id: &str, value: &VARIANT) -> HRESULT;
     /// 该 item 的规范元数据；未知 item 返回 `None`（`AddItems` 据此拒收）。
     fn item_meta(&self, item_id: &str) -> Option<ItemMeta>;
+    /// 该 item 的 EU（工程单位）范围 `(min, max)`，deadband 百分比计算用。
+    /// 默认 `None`（无 EU → deadband 退化为"任意值变化即推"）。真实数据源应覆盖提供。
+    fn item_range(&self, _item_id: &str) -> Option<(f64, f64)> {
+        None
+    }
 }
 
 /// 内置仿真数据源——镜像 Matrikon.OPC.Simulation 标签集。
@@ -209,6 +225,72 @@ fn variant_as_i4(value: &VARIANT) -> Option<i32> {
         } else {
             None
         }
+    }
+}
+
+/// VARIANT → f64 规范化（deadband 比较用，P1）。
+///
+/// 支持数值类型 `VT_I4`/`VT_R8`/`VT_I2`/`VT_BOOL`（TRUE=1.0, FALSE=0.0）；
+/// 其它类型返 `None`（caller 走"值变化即推"简化语义——[`should_push`] 内 None 视为推）。
+#[must_use]
+pub fn normalize_variant(v: &VARIANT) -> Option<f64> {
+    // SAFETY: 只读 vt 判别 + 对应 union 字段；v 由调用方保证有效。
+    unsafe {
+        let a = &(*v.Anonymous.Anonymous);
+        match a.vt {
+            VT_I4 => Some(f64::from(a.Anonymous.lVal)),
+            VT_R8 => Some(a.Anonymous.dblVal),
+            VT_I2 => Some(f64::from(a.Anonymous.iVal)),
+            VT_BOOL => Some(if a.Anonymous.boolVal.as_bool() {
+                1.0
+            } else {
+                0.0
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// 是否应推送（OPC DA deadband 语义，P1）。
+///
+/// - `last=None`（首次）→ 推。
+/// - `quality` 变了 → 推。
+/// - `new_value=None`（非数值类型）→ 推（值不可量化比较，简化为推）。
+/// - `deadband_pct <= 0` → 全推（deadband 关闭）。
+/// - 有 EU `range` → `|new - last| >= deadband_pct × span` 推。
+/// - 无 EU（`None`）→ 任意值变化（`new != last`）推。
+#[must_use]
+#[allow(clippy::float_cmp)] // 无 EU 时"任意值变化即推"——f64 != 是 bit 比较（语义正确，非容差比较）
+pub fn should_push(
+    last: Option<PushState>,
+    new_value: Option<f64>,
+    new_quality: u16,
+    deadband_pct: f32,
+    range: Option<(f64, f64)>,
+) -> bool {
+    let Some(last) = last else {
+        return true; // 首次。
+    };
+    if last.quality != new_quality {
+        return true; // quality 变。
+    }
+    let Some(nv) = new_value else {
+        return true; // 非数值 → 推。
+    };
+    let lv = last.value;
+    if deadband_pct <= 0.0 {
+        return true; // deadband 关闭 = 全推。
+    }
+    match range {
+        Some((lo, hi)) => {
+            let span = hi - lo;
+            if span <= 0.0 {
+                nv != lv // 无效 span → 任意变化。
+            } else {
+                (nv - lv).abs() >= f64::from(deadband_pct) * span
+            }
+        }
+        None => nv != lv, // 无 EU → 任意值变化。
     }
 }
 
@@ -362,5 +444,46 @@ mod tests {
             (0..=100).contains(&i0),
             "Random.Int4 应在 0..=100，实际 {i0}"
         );
+    }
+
+    /// `normalize_variant`：数值类型 → f64；空/未知 → None。
+    #[test]
+    fn normalize_variant_numeric_types() {
+        let i = normalize_variant(&variant_i4(42)).expect("VT_I4 → f64");
+        assert!((i - 42.0).abs() < 1e-9, "VT_I4 42 → 42.0");
+        let r = normalize_variant(&variant_r8(3.5)).expect("VT_R8 → f64");
+        assert!((r - 3.5).abs() < 1e-9, "VT_R8 3.5 → 3.5");
+        assert_eq!(normalize_variant(&VARIANT::default()), None); // VT_EMPTY → None
+    }
+
+    /// `should_push`：首次必推；quality 变推；值超 deadband 推；无 EU 任意变化；关闭全推；非数值推。
+    #[test]
+    fn should_push_deadband_semantics() {
+        let good = OPC_QUALITY_GOOD;
+        let last = Some(PushState {
+            value: 50.0,
+            quality: good,
+        });
+        // 首次（last=None）。
+        assert!(should_push(None, Some(1.0), good, 0.1, Some((0.0, 100.0))));
+        // quality 变。
+        assert!(should_push(last, Some(50.0), OPC_QUALITY_BAD, 0.1, None));
+        // 值超 deadband（range 0..100, 10% → 阈值 ~10）：|70-50|=20 ≥ 10 推；|55-50|=5 < 10 不推。
+        // 注：deadband 0.1（f32）经 f64::from 后阈值略 >10，故用 70（远超）避开边界精度。
+        assert!(should_push(last, Some(70.0), good, 0.1, Some((0.0, 100.0))));
+        assert!(!should_push(
+            last,
+            Some(55.0),
+            good,
+            0.1,
+            Some((0.0, 100.0))
+        ));
+        // 无 EU → 任意值变化即推（值同则不推）。
+        assert!(should_push(last, Some(50.001), good, 0.1, None));
+        assert!(!should_push(last, Some(50.0), good, 0.1, None));
+        // deadband 关闭（≤0）→ 全推（即使值同、quality 同）。
+        assert!(should_push(last, Some(50.0), good, 0.0, Some((0.0, 100.0))));
+        // 非数值（normalize=None）→ 推。
+        assert!(should_push(last, None, good, 0.1, None));
     }
 }

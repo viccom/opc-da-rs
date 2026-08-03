@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, S_OK,
+    E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, FILETIME, S_OK,
 };
 use windows::Win32::System::Com::{
     CoTaskMemAlloc, CoTaskMemFree, IConnectionPoint, IConnectionPointContainer,
@@ -78,26 +78,29 @@ pub fn pwstr_to_string(p: PWSTR) -> String {
 }
 
 /// 已注册 item 的服务端记录。
-#[allow(dead_code)] // data_type 待 publisher/IOPCItemProperties 用（Read 经 DataSource 按 item_id 取值）
-struct ItemEntry {
-    item_id: String,
-    h_client: u32,
-    active: bool,
+pub struct ItemEntry {
+    /// item 全路径 id（`Arc<str>` clone 廉价——snapshot/推送路径避免 String clone，P3.1）。
+    pub item_id: Arc<str>,
+    pub h_client: u32,
+    pub active: bool,
+    #[allow(dead_code)] // 规范类型记录；当前 read 经 DataSource 按 item_id，未直接读此字段
     data_type: VARENUM,
+    /// 上次推送状态（deadband 用，P1）。`None` = 未推过（首次必推）。
+    pub last_pushed: Option<crate::data_source::PushState>,
 }
 
 /// Group 的可变状态（item 注册表 + handle 分配器 + group state）。`Mutex` 守护，跨 COM 调用线程。
 pub struct GroupInner {
-    items: HashMap<u32, ItemEntry>,
+    pub items: HashMap<u32, ItemEntry>,
     next_handle: u32,
     // —— IOPCGroupStateMgt 状态（GetState/SetState/SetName 读写）——
     update_rate: u32,
     active: bool,
     name: String,
     time_bias: i32,
-    percent_deadband: f32,
+    pub percent_deadband: f32,
     locale: u32,
-    h_client_group: u32,
+    pub h_client_group: u32,
     h_server_group: u32,
 }
 
@@ -113,25 +116,14 @@ impl GroupInner {
         }
     }
 
-    /// publisher 用：快照 `(h_client_group, [(h_client, item_id)])`，供推送引擎在锁外
-    /// 读取 + 打包 `OnDataChange`（避免长持锁）。
-    pub fn snapshot_for_publish(&self) -> (u32, Vec<(u32, String)>) {
-        let frames = self
-            .items
-            .values()
-            .map(|e| (e.h_client, e.item_id.clone()))
-            .collect();
-        (self.h_client_group, frames)
-    }
-
     /// `Refresh2` 用：快照 active items 的 `(h_client_group, [(h_client, item_id)])`。
     /// 与 `snapshot_for_publish` 区别：只含 `active` 的 item（OPC DA 规范：Refresh 只推 active）。
-    pub fn snapshot_active_for_publish(&self) -> (u32, Vec<(u32, String)>) {
+    pub fn snapshot_active_for_publish(&self) -> (u32, Vec<(u32, Arc<str>)>) {
         let frames = self
             .items
             .values()
             .filter(|e| e.active)
-            .map(|e| (e.h_client, e.item_id.clone()))
+            .map(|e| (e.h_client, Arc::clone(&e.item_id)))
             .collect();
         (self.h_client_group, frames)
     }
@@ -225,6 +217,25 @@ fn nyi<T>() -> Result<T> {
     Err(E_NOTIMPL.into())
 }
 
+/// 读 frames 的全部 item → 4 并行数组（`Refresh2` 全推用，绕过 deadband）。
+fn read_frames(
+    frames: &[(u32, Arc<str>)],
+    data_source: &dyn DataSource,
+) -> (Vec<u32>, Vec<VARIANT>, Vec<u16>, Vec<FILETIME>) {
+    let mut hclients = Vec::with_capacity(frames.len());
+    let mut values = Vec::with_capacity(frames.len());
+    let mut qualities = Vec::with_capacity(frames.len());
+    let mut timestamps = Vec::with_capacity(frames.len());
+    for (hc, id) in frames {
+        let (v, q, ts) = data_source.read(id);
+        hclients.push(*hc);
+        values.push(v);
+        qualities.push(q);
+        timestamps.push(ts);
+    }
+    (hclients, values, qualities, timestamps)
+}
+
 impl IOPCItemMgt_Impl for GroupObj_Impl {
     fn AddItems(
         &self,
@@ -245,10 +256,11 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
                     inner.items.insert(
                         h_server,
                         ItemEntry {
-                            item_id,
+                            item_id: Arc::from(item_id),
                             h_client: def.hClient,
                             active: def.bActive.as_bool(),
                             data_type: meta.data_type,
+                            last_pushed: None,
                         },
                     );
                     // SAFETY: results_ptr 含 n 个槽；i < n。
@@ -648,7 +660,7 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
         let n = prealloc_item_states(dwcount, phserver, ppitemvalues, pperrors)?;
         // 锁内取每个 handle 对应的 (hClient, item_id)；未知 handle 记 None。
         // 短持锁：仅查表 clone，DataSource::read 在锁外执行（避免长持锁期间做 IO）。
-        let lookups: Vec<(u32, Option<String>)> = {
+        let lookups: Vec<(u32, Option<Arc<str>>)> = {
             let inner = locked(&self.inner);
             (0..n)
                 .map(|i| {
@@ -697,7 +709,7 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
         pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
         let n = prealloc_errors(dwcount, phserver, pperrors)?;
-        let lookups: Vec<Option<String>> = {
+        let lookups: Vec<Option<Arc<str>>> = {
             let inner = locked(&self.inner);
             (0..n)
                 .map(|i| {
@@ -750,22 +762,28 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
     }
 
     fn Refresh2(&self, _dwsource: tagOPCDATASOURCE, dwtransactionid: u32) -> Result<u32> {
-        // dwsource（CACHE/DEVICE）忽略：SimDataSource 无 cache/device 之分，统一 read-time
-        // 现算（同 IOPCSyncIO::Read）。CancelID 仅满足"唯一标识事务"契约——Refresh2 同步推送，
-        // 返回时已完成；client 对已完成事务调 Cancel2 为 no-op（Cancel2 暂 nyi）。
+        // dwsource（CACHE/DEVICE）忽略：SimDataSource 无 cache/device 之分。CancelID 仅满足
+        // "唯一标识事务"契约——Refresh2 同步推送，返回时已完成；Cancel2 暂 nyi（无实际取消）。
         let cancel_id = self.next_cancel_id.fetch_add(1, Ordering::Relaxed);
-        // 锁内取 active items 快照（h_group + frames）；锁外读 + 推送（避免长持锁）。
+        // 全推（绕过 deadband）：snapshot active → 读全部 → push。client 主动刷新要当前全量。
         let (h_group, frames) = locked(&self.inner).snapshot_active_for_publish();
-        let sinks = crate::objects::publisher::enumerate_sinks(&self.data_cp);
-        if !sinks.is_empty() && !frames.is_empty() {
-            crate::objects::publisher::push_data_change(
-                &sinks,
-                h_group,
-                &frames,
-                &*self.data_source,
-                dwtransactionid,
-            );
+        if frames.is_empty() {
+            return Ok(cancel_id);
         }
+        let sinks = crate::objects::publisher::enumerate_sinks(&self.data_cp);
+        if sinks.is_empty() {
+            return Ok(cancel_id);
+        }
+        let (hclients, values, qualities, timestamps) = read_frames(&frames, &*self.data_source);
+        crate::objects::publisher::push_data_change(
+            &sinks,
+            h_group,
+            &hclients,
+            &values,
+            &qualities,
+            &timestamps,
+            dwtransactionid,
+        );
         Ok(cancel_id)
     }
 
@@ -1289,41 +1307,6 @@ mod tests {
         );
     }
 
-    /// `GroupInner::snapshot_for_publish`：返回 h_client_group + items 的 (h_client, item_id)，
-    /// 供 publisher 在锁外读取 + 打包 OnDataChange。
-    #[test]
-    fn snapshot_for_publish_returns_group_handle_and_items() {
-        let mut inner = GroupInner {
-            items: HashMap::new(),
-            next_handle: 1,
-            update_rate: 500,
-            active: true,
-            name: "test".into(),
-            time_bias: 0,
-            percent_deadband: 0.0,
-            locale: 0,
-            h_client_group: 42,
-            h_server_group: 7,
-        };
-        inner.items.insert(
-            1,
-            ItemEntry {
-                item_id: "Random.Int4".into(),
-                h_client: 100,
-                active: true,
-                data_type: VT_I4,
-            },
-        );
-        let (h_group, frames) = inner.snapshot_for_publish();
-        assert_eq!(h_group, 42, "h_client_group 回传");
-        assert_eq!(frames.len(), 1, "1 个 item");
-        assert_eq!(
-            frames[0],
-            (100, "Random.Int4".to_string()),
-            "h_client + item_id"
-        );
-    }
-
     /// 测试用 `IOPCDataCallback` sink：捕获 `OnDataChange` 的 `(trans_id, h_group, count)`，
     /// 经共享 `Arc<Mutex>` 让测试同步读取（同进程 COM 调用直接进 OnDataChange）。
     #[implement(IOPCDataCallback)]
@@ -1402,19 +1385,21 @@ mod tests {
         inner.items.insert(
             1,
             ItemEntry {
-                item_id: "Random.Int4".into(),
+                item_id: Arc::from("Random.Int4"),
                 h_client: 100,
                 active: true,
                 data_type: VT_I4,
+                last_pushed: None,
             },
         );
         inner.items.insert(
             2,
             ItemEntry {
-                item_id: "Random.Real8".into(),
+                item_id: Arc::from("Random.Real8"),
                 h_client: 200,
                 active: false,
                 data_type: VT_R8,
+                last_pushed: None,
             },
         );
         let (h_group, frames) = inner.snapshot_active_for_publish();
@@ -1422,7 +1407,7 @@ mod tests {
         assert_eq!(frames.len(), 1, "只 1 个 active item（inactive 过滤）");
         assert_eq!(
             frames[0],
-            (100, "Random.Int4".to_string()),
+            (100, Arc::from("Random.Int4")),
             "active item 的 h_client + item_id"
         );
     }
