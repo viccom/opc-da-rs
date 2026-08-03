@@ -51,7 +51,7 @@ use opc_da_client::bindings::da::{
 };
 
 use crate::data_source::{
-    DataSource, NsNode, NsOrganization, SimDataSource, now_filetime, variant_i2, variant_i4,
+    DataSource, NsNode, NsOrganization, now_filetime, variant_i2, variant_i4,
 };
 use crate::objects::{ConnectionPoint, GroupObj, StringEnum, pwstr_to_string};
 
@@ -75,9 +75,10 @@ pub struct ServerObj {
 }
 
 impl ServerObj {
-    /// 新建 Server（空 group 注册表 + `SimDataSource` + 空 shutdown cp）。
+    /// 新建 Server（空 group 注册表 + `SimDataSource` + 空 shutdown cp）。仅测试便捷用。
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
-        Self::with_data_source(Arc::new(SimDataSource::new()))
+        Self::with_data_source(Arc::new(crate::data_source::SimDataSource::new()))
     }
 
     /// 新建 Server 并注入指定数据源（测试注入 `GeneratedDataSource` 验 hierarchical browse；

@@ -482,6 +482,45 @@ pub fn should_push(
     }
 }
 
+// —— 运行时数据源选择（bin run_server 用，P4）——
+
+/// 从进程环境变量构造数据源。
+///
+/// - `OPC_DA_DATASOURCE=generated` → `GeneratedDataSource`（规模由
+///   `OPC_DA_GEN_PLANTS/LINES/SENSORS`，默认 10/10/1000 = 10w leaf）
+/// - 缺失 / `sim` / 非法值 → `SimDataSource`（向后兼容已注册常驻 server）
+///
+/// 读 env 与构造分离（[`build_data_source`] 是纯函数，可单测；本函数薄包装读 env）。
+#[must_use]
+pub fn data_source_from_env() -> Arc<dyn DataSource> {
+    let kind = std::env::var("OPC_DA_DATASOURCE").unwrap_or_default();
+    build_data_source(
+        &kind,
+        parse_env_usize("OPC_DA_GEN_PLANTS").unwrap_or(10),
+        parse_env_usize("OPC_DA_GEN_LINES").unwrap_or(10),
+        parse_env_usize("OPC_DA_GEN_SENSORS").unwrap_or(1000),
+    )
+}
+
+/// 按 kind + 规模构造数据源（纯函数，测试用）。
+fn build_data_source(
+    kind: &str,
+    plants: usize,
+    lines: usize,
+    sensors: usize,
+) -> Arc<dyn DataSource> {
+    match kind {
+        "generated" => Arc::new(GeneratedDataSource::new(plants, lines, sensors)),
+        // sim / 空 / 非法 → SimDataSource（向后兼容）。
+        _ => Arc::new(SimDataSource::new()),
+    }
+}
+
+/// 读 env var → `usize`（缺失/非法返 `None`）。
+fn parse_env_usize(key: &str) -> Option<usize> {
+    std::env::var(key).ok().and_then(|s| s.parse().ok())
+}
+
 // —— read-time 值产生器 —— 确定性，基于经过时间（镜像 Matrikon Simulation 行为）——
 
 /// `Random.Int4`：0..=100 伪随机 i32，每秒变（Knuth 乘法 hash + 模 101）。
@@ -710,5 +749,28 @@ mod tests {
         );
         // 不存在分支 → 空。
         assert!(ds.namespace().browse_children(&["plant9"]).is_empty());
+    }
+
+    /// `build_data_source`：sim/空/非法 → SimDataSource（flat）。
+    #[test]
+    fn build_data_source_sim_default_and_unknown() {
+        let sim = build_data_source("sim", 10, 10, 1000);
+        assert_eq!(sim.query_organization(), NsOrganization::Flat);
+        let empty = build_data_source("", 0, 0, 0);
+        assert_eq!(empty.query_organization(), NsOrganization::Flat);
+        let bogus = build_data_source("bogus", 0, 0, 0);
+        assert_eq!(
+            bogus.query_organization(),
+            NsOrganization::Flat,
+            "非法 kind 回退 sim"
+        );
+    }
+
+    /// `build_data_source("generated", 2,2,3)` → hierarchical + 12 leaf。
+    #[test]
+    fn build_data_source_generated_hierarchical() {
+        let ds = build_data_source("generated", 2, 2, 3);
+        assert_eq!(ds.query_organization(), NsOrganization::Hierarchical);
+        assert_eq!(ds.namespace().leaves().len(), 12, "2*2*3 = 12 leaf");
     }
 }

@@ -9,14 +9,37 @@
     clippy::not_unsafe_ptr_arg_deref
 )]
 
+use std::sync::Arc;
+
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
 use windows::core::{BOOL, GUID, IUnknown, Interface, Ref, Result, implement};
 
+use crate::data_source::DataSource;
 use crate::objects::ServerObj;
 
 /// COM 类工厂——为 `CoCreateInstance` 提供 `ServerObj` 实例。
+///
+/// 持 `data_source`（bin 启动时注入；`CreateInstance` 用它构造每个 `ServerObj`）。
+/// 默认 `SimDataSource`；env `OPC_DA_DATASOURCE=generated` 时为 `GeneratedDataSource`。
 #[implement(IClassFactory)]
-pub struct Factory;
+pub struct Factory {
+    data_source: Arc<dyn DataSource>,
+}
+
+impl Factory {
+    /// 新建 Factory（注入数据源）。bin `run_server` 调。
+    pub fn new(data_source: Arc<dyn DataSource>) -> Self {
+        Self { data_source }
+    }
+
+    /// 默认 Factory（SimDataSource）。单元测试用。
+    #[cfg(test)]
+    pub(crate) fn default_sim() -> Self {
+        Self {
+            data_source: Arc::new(crate::data_source::SimDataSource::new()),
+        }
+    }
+}
 
 impl IClassFactory_Impl for Factory_Impl {
     fn CreateInstance(
@@ -27,7 +50,7 @@ impl IClassFactory_Impl for Factory_Impl {
     ) -> Result<()> {
         // 不支持 aggregation。后续改返回 CLASS_E_NOAGGREGATION（不 panic）。
         assert!(outer.is_null(), "aggregation not supported");
-        let unknown: IUnknown = ServerObj::new().into();
+        let unknown: IUnknown = ServerObj::with_data_source(self.data_source.clone()).into();
         // SAFETY: `riid`（COM 运行时提供）为有效 GUID；`object` 为调用方提供的 out 指针。
         // query 成功则写入请求接口指针，失败则不改 `*object`（COM QueryInterface 语义）。
         unsafe { unknown.query(riid, object).ok() }
@@ -63,7 +86,7 @@ mod tests {
         unsafe {
             CoIncrementMTAUsage().expect("CoIncrementMTAUsage");
 
-            let factory: IClassFactory = Factory.into();
+            let factory: IClassFactory = Factory::default_sim().into();
             let cookie = CoRegisterClassObject(
                 &CLSID_OPC_DA_SERVER,
                 &factory,

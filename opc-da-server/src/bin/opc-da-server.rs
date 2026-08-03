@@ -108,7 +108,8 @@ fn run_server() -> Result<()> {
             EOAC_NONE,
             None,
         )?;
-        let factory: IClassFactory = Factory.into();
+        let ds = opc_da_server::data_source::data_source_from_env();
+        let factory: IClassFactory = Factory::new(ds).into();
         let _cookie = CoRegisterClassObject(
             &CLSID_OPC_DA_SERVER,
             &factory,
