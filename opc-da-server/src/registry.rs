@@ -31,6 +31,8 @@ pub struct ServerRegistration<'a> {
     pub catids: &'a [GUID],
     /// AppID（DCOM 聚合；远程激活所需）。
     pub app_id: GUID,
+    /// server 描述（ProgID/VersionIndependentProgID 顶层 default 值 + OPC\Vendor）。
+    pub description: &'a str,
 }
 
 /// `/RegServer`：写 HKCR 注册项（需管理员权限）。
@@ -67,16 +69,36 @@ pub fn register(reg: &ServerRegistration<'_>) -> Result<()> {
         )?;
     }
 
-    // ProgID 顶层
-    set_reg_sz(
-        HKEY_CLASSES_ROOT,
-        reg.prog_id,
-        reg.version_independent_prog_id,
-    )?;
+    // ProgID 顶层（default=描述 + CLSID + CurVer + OPC 标记）
+    set_reg_sz(HKEY_CLASSES_ROOT, reg.prog_id, reg.description)?;
     set_reg_sz(
         HKEY_CLASSES_ROOT,
         &format!("{}\\CLSID", reg.prog_id),
         &clsid,
+    )?;
+    set_reg_sz(
+        HKEY_CLASSES_ROOT,
+        &format!("{}\\CurVer", reg.prog_id),
+        reg.version_independent_prog_id,
+    )?;
+    // ProgID\OPC 子键（OPC server 标记，部分 client 检查）
+    set_reg_sz(HKEY_CLASSES_ROOT, &format!("{}\\OPC", reg.prog_id), "")?;
+
+    // VersionIndependentProgID 顶层（default=描述 + CLSID + CurVer）
+    set_reg_sz(
+        HKEY_CLASSES_ROOT,
+        reg.version_independent_prog_id,
+        reg.description,
+    )?;
+    set_reg_sz(
+        HKEY_CLASSES_ROOT,
+        &format!("{}\\CLSID", reg.version_independent_prog_id),
+        &clsid,
+    )?;
+    set_reg_sz(
+        HKEY_CLASSES_ROOT,
+        &format!("{}\\CurVer", reg.version_independent_prog_id),
+        reg.prog_id,
     )?;
 
     // AppID

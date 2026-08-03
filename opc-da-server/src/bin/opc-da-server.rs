@@ -44,6 +44,7 @@ fn run_register() -> Result<()> {
         catids: &catids,
         // 阶段 0 简化：AppID 复用 CLSID（阶段 3 DCOM 再独立分配）。
         app_id: CLSID_OPC_DA_SERVER,
+        description: "opc-da-rs OPC DA Server",
     };
     register(&reg)?;
     eprintln!(
@@ -68,6 +69,7 @@ fn run_unregister() -> Result<()> {
         exe_path: &exe_path,
         catids: &catids,
         app_id: CLSID_OPC_DA_SERVER,
+        description: "opc-da-rs OPC DA Server",
     };
     unregister(&reg)?;
     eprintln!(
