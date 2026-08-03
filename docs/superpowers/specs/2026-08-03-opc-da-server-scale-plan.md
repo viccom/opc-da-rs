@@ -515,16 +515,16 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 - [x] verify 全门
 - [x] commit + 勾选
 
-### P2 — hierarchical + 10w item
-- [ ] `NamespaceTree` 树化（NsNode + index + leaves_flat）
-- [ ] `DataSource` trait：`browse_branch` + `item_range`
-- [ ] `GeneratedDataSource`（10w item 树构造）
-- [ ] `SimDataSource` 适配（flat 保留）
-- [ ] `ServerObj` 加 `browse_pos` + 重写 browse 5 方法
-- [ ] 单测：树构造 + browse 状态机 + 10w item O(1) 查找
-- [ ] opc-da-client-test browse 探针扩展（hierarchical）
-- [ ] verify 全门
-- [ ] commit + 勾选
+### P2 — hierarchical + 10w item（P2.1 `e88c83e` + P2.2 `eba8f06` + P2.3 `0df5a2f`）
+- [x] `NamespaceTree` 树化（NsNode + index + leaves_flat）—— P2.1：`NsNode::Branch/Leaf` + `collect_leaves` 扁平化（无显式 HashMap index；read 经数据源内部 `HashSet` O(1)）
+- [x] `DataSource` trait：`browse_branch` + `item_range` —— P2.1 `browse_branch` + P1 `item_range`
+- [x] `GeneratedDataSource`（10w item 树构造）—— P2.2（`plant×line×sensor` 规则树，`new(10,10,1000)`=10w leaf）
+- [x] `SimDataSource` 适配（flat 保留）—— `query_organization` 默认 `Flat`，namespace 单层 leaves
+- [x] `ServerObj` 加 `browse_pos` + 重写 browse 5 方法 —— P2.3：`QueryOrganization` 取 ds 类型；`ChangeBrowsePosition` 维护 `browse_pos`（DOWN/UP/TO）；`BrowseOPCItemIDs` hierarchical 返相对名（client 经 `GetItemID` 转 full id）/ flat 返 full id / `OPC_FLAT` 跨分支全量；`GetItemID` 相对名拼 full path
+- [x] 单测：树构造 + browse 状态机 + 10w item O(1) 查找 —— `generated_data_source_tree_and_read`（树构造）+ `browse_hierarchical_*` 7 测（DOWN/UP/TO/BRANCH/LEAF/FLAT/GetItemID 状态机）+ `browse_flat_sim_namespace_unchanged` 回归；`HashSet` O(1) 查找
+- [ ] opc-da-client-test browse 探针扩展（hierarchical）—— **留 P4**：需 server 运行时切 `GeneratedDataSource`（factory 持 ds + bin env），与压测 stress 工具一并做；hierarchical browse 逻辑已由 server 单测确定性覆盖，跨进程 e2e 非本阶段阻塞
+- [x] verify 全门 —— 13 探针无回归（browse flat 探针仍过）
+- [x] commit + 勾选 —— P2.3 feat `0df5a2f` + 本 chore
 
 ### P3 — 优化（按压测）
 - [ ] P3.1 `Arc<str>`（随 P1）
