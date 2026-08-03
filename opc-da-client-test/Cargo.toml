@@ -15,3 +15,4 @@ workspace = true
 opc-da-client = { path = "../opc-da-client" }
 anyhow = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+windows = { workspace = true, features = ["Win32_System_Threading", "Win32_System_ProcessStatus"] }

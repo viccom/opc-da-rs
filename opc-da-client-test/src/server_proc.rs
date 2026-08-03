@@ -77,3 +77,37 @@ impl Drop for ServerChild {
 pub fn server_exe_path() -> String {
     std::env::var("OPC_DA_SERVER_EXE").unwrap_or_else(|_| "target/debug/opc-da-server.exe".into())
 }
+
+/// 读 server 子进程指标：`(handle 数, 工作集 RSS 字节)`。
+///
+/// handle 数近似线程/资源压力；RSS = 物理内存。Windows API 经 PID 打开进程读。
+#[cfg(windows)]
+#[allow(clippy::cast_possible_truncation)] // size_of usize→u32（cb 字段 API 契约）
+pub fn read_server_metrics(pid: u32) -> Result<(u32, usize)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{
+        GetProcessHandleCount, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    // SAFETY: OpenProcess/GetProcessHandleCount/GetProcessMemoryInfo/CloseHandle 为 Windows API；
+    // pid 来自 server.pid()（活进程）；pmc zeroed + cb 设 size（API 契约）；句柄 CloseHandle 释放。
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+            .map_err(|e| anyhow::anyhow!("OpenProcess({pid}): {e}"))?;
+        let mut handles = 0u32;
+        GetProcessHandleCount(h, &raw mut handles)
+            .map_err(|e| anyhow::anyhow!("GetProcessHandleCount: {e}"))?;
+        let mut pmc: PROCESS_MEMORY_COUNTERS = std::mem::zeroed();
+        pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+        GetProcessMemoryInfo(
+            h,
+            &raw mut pmc,
+            std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+        .map_err(|e| anyhow::anyhow!("GetProcessMemoryInfo: {e}"))?;
+        let rss = pmc.WorkingSetSize;
+        let _ = CloseHandle(h);
+        Ok((handles, rss))
+    }
+}
