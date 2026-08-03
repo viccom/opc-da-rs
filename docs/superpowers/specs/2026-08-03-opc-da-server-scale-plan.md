@@ -532,15 +532,15 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 - [ ] P3.4 ServerObj RwLock（P4 发现建连瓶颈后）
 - [ ] P3.3 VARIANT 池（仅强制时）
 
-### P4 — e2e + 压测（P4.1 e2e 全流程完成 `d0428cc`+`4ab83ad`；P4.2 stress 待做）
-- [x] P4.1 e2e 载体：server env 切数据源 + client-test 模块化（server_proc/e2e/report）+ 13 flat + hierarchical 探针（实测 17 passed，verify 全门过）
-- [ ] stress 工具骨架（起 server + M mock client + 指标采集）
-- [ ] mock client（复用 opc-da-client subscribe + 计数）
-- [ ] v1 矩阵（P0 后）：1w 组 / 100 client / 线程数
-- [ ] v2 矩阵（P1 后）：deadband 效果
-- [ ] v3 矩阵（P2 后）：10w item + 50w 订阅达标
+### P4 — e2e + 压测（P4.1 e2e `d0428cc`+`4ab83ad`；P4.2 stress `df4ce1f` v1 达标）
+- [x] P4.1 e2e 载体：server env 切数据源 + client-test 模块化 + 13 flat + hierarchical 探针（17 passed）
+- [x] stress 工具骨架（client-test stress 模式：spawn generated server + M 并发 client + 指标采集）—— `df4ce1f`
+- [x] mock client（复用 opc-da-client subscribe + 原子计数 item/帧）
+- [x] v1 矩阵（100 client × 100 item / 60s / 1w leaf）：item/s 19833、handles=394、RSS 18MB、推送稳定无 OOM（达标）
+- [ ] v2 矩阵（deadband 效果）—— 待 client subscribe 暴露 deadband 参数（v1 用默认 0）
+- [ ] v3 矩阵（10w item + 50w 订阅达标）—— 待跑（需 10w 规模 + 可选 deadband）
 - [ ] 余量测试 + 瓶颈报告
-- [ ] 压测结果记入 §10
+- [x] 压测结果记入 §10（v1 已填，v2/v3 待）
 
 ---
 
@@ -548,7 +548,7 @@ pub struct SimDataSource { /* 保留，flat 回归 */ }
 
 | 版本 | 日期 | commit | 场景 | item/s | OnDataChange/s | 延迟 p99 | 线程数 | 内存 | 结论 |
 |---|---|---|---|---|---|---|---|---|---|
-| v1 | — | — | — | — | — | — | — | — | 待 P0 |
+| v1 | 2026-08-03 | `df4ce1f` | 100 client × 100 item / 60s / 1w leaf | 19833 | 19833 | — | handles=394 | 18MB | 推送稳定 + 无 OOM（达标；handles 含 100 COM RPC 线程，server 调度 worker 固定核数 P0 已验） |
 | v2 | — | — | — | — | — | — | — | — | 待 P1 |
 | v3 | — | — | — | — | — | — | — | — | 待 P2 |
 
