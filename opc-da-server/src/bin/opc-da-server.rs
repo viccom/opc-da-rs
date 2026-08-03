@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use opc_da_client::bindings::da::CATID_OPCDAServer20;
+use opc_da_client::bindings::da::{CATID_OPCDAServer20, CATID_OPCDAServer30};
 use opc_da_server::class_factory::{CLSID_OPC_DA_SERVER, Factory};
 use opc_da_server::registry::{ServerRegistration, register, unregister};
 use windows::Win32::System::Com::{
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
 /// /RegServer：写注册表后退出。
 fn run_register() -> Result<()> {
     let exe_path = std::env::current_exe()?;
-    let catids = [CATID_OPCDAServer20::IID];
+    let catids = [CATID_OPCDAServer20::IID, CATID_OPCDAServer30::IID];
     let reg = ServerRegistration {
         clsid: CLSID_OPC_DA_SERVER,
         prog_id: "opc-da-rs.Server.1",
@@ -52,7 +52,7 @@ fn run_register() -> Result<()> {
 /// /UnregServer：清注册表（阶段 0 占位）。
 fn run_unregister() -> Result<()> {
     let exe_path = std::env::current_exe()?;
-    let catids = [CATID_OPCDAServer20::IID];
+    let catids = [CATID_OPCDAServer20::IID, CATID_OPCDAServer30::IID];
     let reg = ServerRegistration {
         clsid: CLSID_OPC_DA_SERVER,
         prog_id: "opc-da-rs.Server.1",
