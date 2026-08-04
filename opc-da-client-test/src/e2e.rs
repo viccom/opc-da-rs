@@ -1,6 +1,6 @@
-//! 全流程 e2e：13 flat 探针（SimDataSource server）+ hierarchical 探针（GeneratedDataSource）。
+//! 全流程 e2e：20 flat 探针（SimDataSource server，覆盖 [`OpcProvider`] 全方法）+ hierarchical 探针（GeneratedDataSource）。
 //!
-//! 流程：spawn sim → 13 flat → kill → spawn generated → hierarchical → kill → 汇总。
+//! 流程：spawn sim → 20 flat → kill → spawn generated → hierarchical → kill → 汇总。
 //! 详见 `docs/superpowers/specs/2026-08-03-opc-da-client-test-e2e-design.md` §7。
 
 use std::sync::Arc;
@@ -16,11 +16,12 @@ use crate::server_proc::{ServerChild, server_exe_path};
 const PROG_ID: &str = "opc-da-rs.Server.1";
 const HOST: &str = "localhost";
 
-/// 13 flat 探针（连 SimDataSource server）。`(passed, failed)`。
+/// 20 flat 探针（连 SimDataSource server，覆盖 [`OpcProvider`] 全部方法）。`(passed, failed)`。
 ///
-/// 探针迁移自原 main.rs（get_server_status / read / write / round-trip / subscribe /
-/// browse 4 tag / get_item_properties / get_error_string / list_servers / write_tag_values /
-/// set_locale_id / set_client_name / subscribe_shutdown）。
+/// 1-13 核心（status/read/write/round-trip/subscribe/browse/properties/error_string/
+/// list_servers/write_tag_values/locale/client_name/shutdown）；14-20 补全 OpcProvider
+/// 其余方法（unsubscribe/unsubscribe_shutdown/set_subscription_rate/list_servers_with_details
+/// + 预期失败的 max_age/vqt/keep_alive——server 未实装 IOPCSyncIO2/IOPCGroupStateMgt2）。
 #[allow(clippy::too_many_lines)]
 pub async fn run_flat() -> (u32, u32) {
     let client = OpcDaClient::new(ComConnector::new(HOST)).expect("OpcDaClient init");
@@ -290,6 +291,174 @@ pub async fn run_flat() -> (u32, u32) {
         ),
     }
 
+    // 14. unsubscribe（subscribe → unsubscribe round-trip，验证 IConnectionPoint::Unadvise）。
+    match client
+        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .await
+    {
+        Ok(h) => match client.unsubscribe(h.cookie).await {
+            Ok(()) => probe(&mut passed, &mut failed, "unsubscribe", true, "Ok"),
+            Err(e) => probe(
+                &mut passed,
+                &mut failed,
+                "unsubscribe",
+                false,
+                &e.to_string(),
+            ),
+        },
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "unsubscribe",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // 15. unsubscribe_shutdown（subscribe_shutdown → unsubscribe_shutdown）。
+    match client.subscribe_shutdown(PROG_ID).await {
+        Ok(h) => match client.unsubscribe_shutdown(h.cookie).await {
+            Ok(()) => probe(&mut passed, &mut failed, "unsubscribe_shutdown", true, "Ok"),
+            Err(e) => probe(
+                &mut passed,
+                &mut failed,
+                "unsubscribe_shutdown",
+                false,
+                &e.to_string(),
+            ),
+        },
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "unsubscribe_shutdown",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // 16. set_subscription_rate（IOPCGroupStateMgt::SetState round-trip，验证 server SetState）。
+    match client
+        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .await
+    {
+        Ok(h) => match client.set_subscription_rate(h.cookie, 1000).await {
+            Ok(revised) => probe(
+                &mut passed,
+                &mut failed,
+                "set_subscription_rate",
+                revised == 1000,
+                &format!("revised={revised}"),
+            ),
+            Err(e) => probe(
+                &mut passed,
+                &mut failed,
+                "set_subscription_rate",
+                false,
+                &e.to_string(),
+            ),
+        },
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "set_subscription_rate",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // 17. list_servers_with_details（GetClassDetails 填 CLSID/描述）。
+    match client.list_servers_with_details(HOST).await {
+        Ok(descs) => {
+            let found = descs.iter().find(|d| d.prog_id == PROG_ID);
+            probe(
+                &mut passed,
+                &mut failed,
+                "list_servers_with_details",
+                found.is_some(),
+                &format!("{found:?}"),
+            );
+        }
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "list_servers_with_details",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // 18. read_tag_values_max_age（预期 Err：server 未实装 IOPCSyncIO2）。
+    match client
+        .read_tag_values_max_age(PROG_ID, vec!["Random.Int4".to_string()], 0)
+        .await
+    {
+        Ok(_) => probe(
+            &mut passed,
+            &mut failed,
+            "read_tag_values_max_age",
+            false,
+            "应失败（server 无 IOPCSyncIO2）但成功了",
+        ),
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "read_tag_values_max_age",
+            true,
+            &format!("预期失败: {e}"),
+        ),
+    }
+
+    // 19. write_tag_value_vqt（预期 Err：server 未实装 IOPCSyncIO2）。
+    match client
+        .write_tag_value_vqt(PROG_ID, "Bucket Brigade.Int4", OpcValue::Int(1), None, None)
+        .await
+    {
+        Ok(_) => probe(
+            &mut passed,
+            &mut failed,
+            "write_tag_value_vqt",
+            false,
+            "应失败（server 无 IOPCSyncIO2）但成功了",
+        ),
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "write_tag_value_vqt",
+            true,
+            &format!("预期失败: {e}"),
+        ),
+    }
+
+    // 20. set_keep_alive（预期 Err：server 未实装 IOPCGroupStateMgt2）。
+    match client
+        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .await
+    {
+        Ok(h) => match client.set_keep_alive(h.cookie, 5000).await {
+            Ok(_) => probe(
+                &mut passed,
+                &mut failed,
+                "set_keep_alive",
+                false,
+                "应失败（server 无 IOPCGroupStateMgt2）但成功了",
+            ),
+            Err(e) => probe(
+                &mut passed,
+                &mut failed,
+                "set_keep_alive",
+                true,
+                &format!("预期失败: {e}"),
+            ),
+        },
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "set_keep_alive",
+            false,
+            &e.to_string(),
+        ),
+    }
+
     (passed, failed)
 }
 
@@ -432,7 +601,7 @@ pub async fn run_hier() -> (u32, u32) {
 
 /// e2e 入口：spawn sim → 13 flat → kill → spawn generated → hierarchical → kill → 汇总。
 pub async fn run_e2e() -> anyhow::Result<()> {
-    println!("=== e2e: 全流程（13 flat + hierarchical）===\n");
+    println!("=== e2e: 全流程（20 flat + hierarchical）===\n");
 
     // 阶段 1：SimDataSource server + 13 flat 探针。
     let sim = ServerChild::spawn(&server_exe_path(), "sim", 10, 10, 1000)?;
