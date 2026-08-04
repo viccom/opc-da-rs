@@ -256,34 +256,42 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
                             last_pushed: None,
                         },
                     );
-                    // SAFETY: results_ptr 含 n 个槽；i < n。
+                    // SAFETY: ppaddresults 由 prealloc 的 CoTaskMemAlloc 分配（未初始化裸内存）；i < n。
+                    // ptr::write 不读/不 drop 旧值——对未初始化内存安全（OPCITEMRESULT 当前无 Drop，
+                    // 但统一 ptr::write 防未来加字段引入 Drop 类 UB）。
                     unsafe {
-                        *(*ppaddresults).add(i) = tagOPCITEMRESULT {
-                            hServer: h_server,
-                            vtCanonicalDataType: meta.data_type.0,
-                            wReserved: 0,
-                            dwAccessRights: if meta.writable {
-                                OPC_READABLE | OPC_WRITEABLE
-                            } else {
-                                OPC_READABLE
+                        std::ptr::write(
+                            (*ppaddresults).add(i),
+                            tagOPCITEMRESULT {
+                                hServer: h_server,
+                                vtCanonicalDataType: meta.data_type.0,
+                                wReserved: 0,
+                                dwAccessRights: if meta.writable {
+                                    OPC_READABLE | OPC_WRITEABLE
+                                } else {
+                                    OPC_READABLE
+                                },
+                                dwBlobSize: 0,
+                                pBlob: core::ptr::null_mut(),
                             },
-                            dwBlobSize: 0,
-                            pBlob: core::ptr::null_mut(),
-                        };
+                        );
                         *(*pperrors).add(i) = S_OK;
                     }
                 }
                 None => {
-                    // SAFETY: 同上；零结果 + INVALIDITEMID。
+                    // SAFETY: 同上；ptr::write 写零结果到未初始化槽 + INVALIDITEMID。
                     unsafe {
-                        *(*ppaddresults).add(i) = tagOPCITEMRESULT {
-                            hServer: 0,
-                            vtCanonicalDataType: 0,
-                            wReserved: 0,
-                            dwAccessRights: 0,
-                            dwBlobSize: 0,
-                            pBlob: core::ptr::null_mut(),
-                        };
+                        std::ptr::write(
+                            (*ppaddresults).add(i),
+                            tagOPCITEMRESULT {
+                                hServer: 0,
+                                vtCanonicalDataType: 0,
+                                wReserved: 0,
+                                dwAccessRights: 0,
+                                dwBlobSize: 0,
+                                pBlob: core::ptr::null_mut(),
+                            },
+                        );
                         *(*pperrors).add(i) = OPC_E_INVALIDITEMID;
                     }
                 }
@@ -309,34 +317,42 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
             let item_id = pwstr_to_string(def.szItemID);
             match self.data_source.item_meta(&item_id) {
                 Some(meta) => {
-                    // SAFETY: ppvalidationresults 含 n 个槽；i < n。
+                    // SAFETY: ppvalidationresults 由 prealloc 的 CoTaskMemAlloc 分配（未初始化裸内存）；
+                    // i < n。ptr::write 不读/不 drop 旧值——对未初始化内存安全（OPCITEMRESULT 当前无
+                    // Drop，但统一 ptr::write 防未来加字段引入 Drop 类 UB）。
                     unsafe {
-                        *(*ppvalidationresults).add(i) = tagOPCITEMRESULT {
-                            hServer: 0,
-                            vtCanonicalDataType: meta.data_type.0,
-                            wReserved: 0,
-                            dwAccessRights: if meta.writable {
-                                OPC_READABLE | OPC_WRITEABLE
-                            } else {
-                                OPC_READABLE
+                        std::ptr::write(
+                            (*ppvalidationresults).add(i),
+                            tagOPCITEMRESULT {
+                                hServer: 0,
+                                vtCanonicalDataType: meta.data_type.0,
+                                wReserved: 0,
+                                dwAccessRights: if meta.writable {
+                                    OPC_READABLE | OPC_WRITEABLE
+                                } else {
+                                    OPC_READABLE
+                                },
+                                dwBlobSize: 0,
+                                pBlob: core::ptr::null_mut(),
                             },
-                            dwBlobSize: 0,
-                            pBlob: core::ptr::null_mut(),
-                        };
+                        );
                         *(*pperrors).add(i) = S_OK;
                     }
                 }
                 None => {
-                    // SAFETY: 同上。
+                    // SAFETY: 同上；ptr::write 写零结果到未初始化槽 + INVALIDITEMID。
                     unsafe {
-                        *(*ppvalidationresults).add(i) = tagOPCITEMRESULT {
-                            hServer: 0,
-                            vtCanonicalDataType: 0,
-                            wReserved: 0,
-                            dwAccessRights: 0,
-                            dwBlobSize: 0,
-                            pBlob: core::ptr::null_mut(),
-                        };
+                        std::ptr::write(
+                            (*ppvalidationresults).add(i),
+                            tagOPCITEMRESULT {
+                                hServer: 0,
+                                vtCanonicalDataType: 0,
+                                wReserved: 0,
+                                dwAccessRights: 0,
+                                dwBlobSize: 0,
+                                pBlob: core::ptr::null_mut(),
+                            },
+                        );
                         *(*pperrors).add(i) = OPC_E_INVALIDITEMID;
                     }
                 }
@@ -671,24 +687,29 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
                 .collect()
         };
         for (i, (h_client, maybe_id)) in lookups.into_iter().enumerate() {
-            // SAFETY: ppitemvalues / pperrors 各含 n 个槽（prealloc 分配）；i < n。
-            // 直接赋值覆盖未初始化槽（move VARIANT 进去，不 drop 旧值——裸内存）。
+            // SAFETY: ppitemvalues / pperrors 各含 n 个槽（prealloc 的 CoTaskMemAlloc 分配，未初始化
+            // 裸内存）；i < n。ptr::write 不读/不 drop 旧值——对未初始化内存安全。
+            // tagOPCITEMSTATE 含 VARIANT（有 Drop）：`*ptr=val` 会先隐式 drop 旧值（垃圾）→
+            // VariantClear 读垃圾 vt → 间歇 SEH access violation → COM 报 0x80010105。
             unsafe {
                 match maybe_id {
                     Some(item_id) => {
                         let (v, q, ts) = self.data_source.read(&item_id);
-                        *(*ppitemvalues).add(i) = tagOPCITEMSTATE {
-                            hClient: h_client,
-                            ftTimeStamp: ts,
-                            wQuality: q,
-                            wReserved: 0,
-                            vDataValue: v,
-                        };
+                        std::ptr::write(
+                            (*ppitemvalues).add(i),
+                            tagOPCITEMSTATE {
+                                hClient: h_client,
+                                ftTimeStamp: ts,
+                                wQuality: q,
+                                wReserved: 0,
+                                vDataValue: v,
+                            },
+                        );
                         *(*pperrors).add(i) = S_OK;
                     }
                     None => {
                         // 未知 handle：空 ITEMSTATE（vDataValue=VT_EMPTY）+ E_INVALIDARG。
-                        *(*ppitemvalues).add(i) = tagOPCITEMSTATE::default();
+                        std::ptr::write((*ppitemvalues).add(i), tagOPCITEMSTATE::default());
                         *(*pperrors).add(i) = E_INVALIDARG;
                     }
                 }

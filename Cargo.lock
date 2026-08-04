@@ -2331,6 +2331,8 @@ version = "0.1.0"
 dependencies = [
  "opc-da-client",
  "opc-da-server",
+ "tracing",
+ "tracing-subscriber",
  "windows",
 ]
 
