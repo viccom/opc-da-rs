@@ -317,13 +317,16 @@ impl IEnumConnections_Impl for EnumConnectionsObj_Impl {
         let avail = (self.entries.len().saturating_sub(*cur)).min(cconnections as usize);
         // SAFETY: 调用方承诺 rgcd 至少容纳 cconnections 个 CONNECTDATA；avail <= cconnections。
         // 每个 pUnk 用 sink.clone()（AddRef）；CONNECTDATA.pUnk 是 ManuallyDrop，所有权交调用方。
+        // ptr::write（非赋值）与 group.rs 写 [out] COM 缓冲的惯例一致——防未来 CONNECTDATA
+        // 加 Drop 字段时，`*p = val` 会 drop 目的地未初始化内存（UB）。当前 CONNECTDATA 无 Drop，
+        // 两者等价，统一 ptr::write 保持代码库一致。
         unsafe {
             for i in 0..avail {
                 let (cookie, sink) = &self.entries[*cur + i];
-                *rgcd.add(i) = CONNECTDATA {
+                rgcd.add(i).write(CONNECTDATA {
                     pUnk: std::mem::ManuallyDrop::new(Some(sink.clone())),
                     dwCookie: *cookie,
-                };
+                });
             }
         }
         *cur += avail;

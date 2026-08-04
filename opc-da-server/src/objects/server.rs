@@ -401,10 +401,33 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
             (OPC_PROPERTY_ACCESS_RIGHTS, VT_I4.0, "Access Rights"),
         ];
         let n = props.len();
-        // SAFETY: CoTaskMemAlloc 3 数组（ids/descs/vts），所有权交 client。
-        let ids_ptr = unsafe { CoTaskMemAlloc(size_of::<u32>() * n) }.cast::<u32>();
-        let descs_ptr = unsafe { CoTaskMemAlloc(size_of::<PWSTR>() * n) }.cast::<PWSTR>();
-        let vts_ptr = unsafe { CoTaskMemAlloc(size_of::<u16>() * n) }.cast::<u16>();
+        // SAFETY: CoTaskMemAlloc 3 数组（ids/descs/vts），所有权交 client。checked_mul 防
+        // 32 位 wrapping 溢出（dwcount 经 client 传入，32 位 usize 下 size_of*n 可能 wrap
+        // 成小值 → 后续 .add(i) 越界写堆破坏）。64 位 usize 不溢出（CoTaskMemAlloc 直接失败）。
+        let ids_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<u32>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<u32>();
+        let descs_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<PWSTR>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<PWSTR>();
+        let vts_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<u16>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<u16>();
         if ids_ptr.is_null() || descs_ptr.is_null() || vts_ptr.is_null() {
             // SAFETY: 已分配的释放（可能 null，CoTaskMemFree 容忍）。
             unsafe {
@@ -425,6 +448,16 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
             // SAFETY: 分配 w.len()*2 字节。
             let dptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
             if dptr.is_null() {
+                // 回滚：i>0 时本轮已写入 descs_ptr[0..i] 的 desc 串 + 3 个数组（client 未收到
+                // out 指针，无法自己释放）——必须由 server 释放，否则泄漏。
+                unsafe {
+                    for k in 0..i {
+                        CoTaskMemFree(Some((*descs_ptr.add(k)).0.cast()));
+                    }
+                    CoTaskMemFree(Some(ids_ptr.cast()));
+                    CoTaskMemFree(Some(descs_ptr.cast()));
+                    CoTaskMemFree(Some(vts_ptr.cast()));
+                }
                 return Err(E_OUTOFMEMORY.into());
             }
             // SAFETY: dptr 刚分配；拷贝 desc wide（含 null）。
@@ -461,9 +494,23 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
             .data_source
             .item_meta(&item_id)
             .ok_or_else(|| Error::from(E_INVALIDARG))?;
-        // SAFETY: CoTaskMemAlloc values[n] + errors[n]。
-        let values_ptr = unsafe { CoTaskMemAlloc(size_of::<VARIANT>() * n) }.cast::<VARIANT>();
-        let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+        // SAFETY: CoTaskMemAlloc values[n] + errors[n]。checked_mul 防 32 位溢出（见上）。
+        let values_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<VARIANT>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<VARIANT>();
+        let errors_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<HRESULT>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<HRESULT>();
         if values_ptr.is_null() || errors_ptr.is_null() {
             // SAFETY: 已分配的释放。
             unsafe {
@@ -484,10 +531,14 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
                 OPC_PROPERTY_ACCESS_RIGHTS => (variant_i4(rights), S_OK),
                 _ => (VARIANT::default(), E_INVALIDARG),
             };
-            // SAFETY: values_ptr / errors_ptr 各 n 槽；i < n。直接写（裸内存，move VARIANT）。
+            // SAFETY: values_ptr / errors_ptr 各 n 槽（CoTaskMemAlloc 未初始化裸内存）；i < n。
+            // VARIANT 有 Drop（VariantClear）——必须 ptr::write（纯 memcpy，不 drop 目的地）；
+            // 用 `*p = v` 会先对目的地跑 Drop → VariantClear(未初始化垃圾 vt) → 若垃圾 vt 是
+            // VT_BSTR/VT_UNKNOWN 则 SysFreeString/Release 野指针 → 堆破坏（长跑偶发崩溃根因）。
+            // HRESULT 是 Copy（无 Drop），write/赋值等价，统一 write 保持惯例。
             unsafe {
-                *values_ptr.add(i) = v;
-                *errors_ptr.add(i) = hr;
+                values_ptr.add(i).write(v);
+                errors_ptr.add(i).write(hr);
             }
         }
         // SAFETY: out 指针非空。
@@ -518,9 +569,23 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
         if self.data_source.item_meta(&item_id).is_none() {
             return Err(E_INVALIDARG.into());
         }
-        // SAFETY: CoTaskMemAlloc ids[n] + errors[n]。
-        let ids_ptr = unsafe { CoTaskMemAlloc(size_of::<PWSTR>() * n) }.cast::<PWSTR>();
-        let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+        // SAFETY: CoTaskMemAlloc ids[n] + errors[n]。checked_mul 防 32 位溢出（见上）。
+        let ids_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<PWSTR>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<PWSTR>();
+        let errors_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<HRESULT>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<HRESULT>();
         if ids_ptr.is_null() || errors_ptr.is_null() {
             // SAFETY: 已分配的释放。
             unsafe {
@@ -542,6 +607,15 @@ impl IOPCItemProperties_Impl for ServerObj_Impl {
             // SAFETY: 分配 w.len()*2（≥2，含 null）。
             let iptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
             if iptr.is_null() {
+                // 回滚：i>0 时本轮已写入 ids_ptr[0..i] 的 id 串 + ids/errors 数组（client 未
+                // 收到 out 指针）——必须由 server 释放，否则泄漏。
+                unsafe {
+                    for k in 0..i {
+                        CoTaskMemFree(Some((*ids_ptr.add(k)).0.cast()));
+                    }
+                    CoTaskMemFree(Some(ids_ptr.cast()));
+                    CoTaskMemFree(Some(errors_ptr.cast()));
+                }
                 return Err(E_OUTOFMEMORY.into());
             }
             // SAFETY: iptr 刚分配；拷贝 wide（含 null）。

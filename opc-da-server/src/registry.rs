@@ -199,8 +199,10 @@ fn set_reg_sz_view(parent: HKEY, subkey: &str, value: &str, view: REG_SAM_FLAGS)
         let bytes =
             std::slice::from_raw_parts(value_wide.as_ptr().cast::<u8>(), value_wide.len() * 2);
         let err = RegSetValueExW(hkey, None, None, REG_SZ, Some(bytes));
-        err.ok()?;
+        // 先 close 再 ?：RegSetValueExW 失败时也要关闭 hkey，否则句柄泄漏（虽进程退出 OS 回收，
+        // 但违反"无泄漏错误路径"）。CoTaskMemFree/RegCloseKey 容忍已关闭句柄（此处仅关一次）。
         let _ = RegCloseKey(hkey);
+        err.ok()?;
         Ok(())
     }
 }

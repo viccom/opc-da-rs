@@ -41,7 +41,13 @@ impl IClassFactory_Impl for Factory_Impl {
         object: *mut *mut core::ffi::c_void,
     ) -> Result<()> {
         // 不支持 aggregation——规范返回 CLASS_E_NOAGGREGATION（COM 约定，不 panic）。
+        // COM 规范：CreateInstance 任何失败须把 *ppvObject 置 NULL（防调用者读到陈旧 out 指针
+        // 后 Release 野指针崩溃）。query 路径 windows-rs 失败时已置空，此处聚合路径补齐。
         if !outer.is_null() {
+            if !object.is_null() {
+                // SAFETY: object 非空（上面校验）；调用方提供的 out 指针。
+                unsafe { *object = core::ptr::null_mut() };
+            }
             return Err(Error::from(CLASS_E_NOAGGREGATION));
         }
         let unknown: IUnknown = ServerObj::with_data_source(self.data_source.clone()).into();

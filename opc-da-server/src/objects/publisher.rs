@@ -34,8 +34,12 @@ pub fn typed_sinks(sinks: &Arc<Mutex<HashMap<u32, u32>>>) -> Vec<IOPCDataCallbac
     let Some(git) = global_git() else {
         return Vec::new();
     };
-    locked(sinks)
-        .values()
+    // 锁内仅 copy 出 git cookies（u32，廉价），立即释放锁——避免在 N 次 GIT 往返
+    //（GetInterfaceFromGlobal 是跨 apartment COM 调用）期间持 `sinks` 锁，阻塞并发
+    // Advise/Unadvise（规模化场景 10w sinks × 单次快照可能阻塞上百 ms → client RPC 超时）。
+    let cookies: Vec<u32> = locked(sinks).values().copied().collect();
+    cookies
+        .iter()
         .filter_map(|git_cookie| {
             // SAFETY: git 有效（进程级 GIT）；git_cookie 由 Advise 经同一 GIT 注册；riid 匹配。
             let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
@@ -105,6 +109,11 @@ pub fn push_read_complete(
     timestamps: &[FILETIME],
 ) {
     let n = hclients.len();
+    // 防御性断言：5 数组必须等长（COM OnReadComplete 按 count 读各数组）。caller（read_frames
+    // / PUSH_BUF）保证等长，debug 构建捕获调用方错误，release 零成本。
+    debug_assert_eq!(values.len(), n, "values 长度须 == hclients");
+    debug_assert_eq!(qualities.len(), n, "qualities 长度须 == hclients");
+    debug_assert_eq!(timestamps.len(), n, "timestamps 长度须 == hclients");
     let errors: Vec<HRESULT> = vec![S_OK; n];
     let count = u32::try_from(n).unwrap_or(u32::MAX);
     for sink in sinks {
@@ -150,6 +159,10 @@ pub fn push_data_change(
     trans_id: u32,
 ) {
     let n = hclients.len();
+    // 防御性断言：5 数组必须等长（COM OnDataChange 按 count 读各数组）。见 push_read_complete。
+    debug_assert_eq!(values.len(), n, "values 长度须 == hclients");
+    debug_assert_eq!(qualities.len(), n, "qualities 长度须 == hclients");
+    debug_assert_eq!(timestamps.len(), n, "timestamps 长度须 == hclients");
     let errors: Vec<HRESULT> = vec![S_OK; n];
     let count = u32::try_from(n).unwrap_or(u32::MAX);
     for sink in sinks {

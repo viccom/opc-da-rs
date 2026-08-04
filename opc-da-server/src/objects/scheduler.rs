@@ -24,7 +24,6 @@
 //! 计数保证 job 存活到推送完成（不会访问已释放内存）。
 
 #![allow(
-    clippy::non_send_fields_in_send_ty,    // PublishJob 含 IConnectionPoint raw ptr；MTA 下跨线程安全（见 unsafe impl SAFETY）
     clippy::significant_drop_tightening    // 锁作用域已用 block/显式 drop 限定；nursery lint 对 MutexGuard 持有期常误报
 )]
 
@@ -92,12 +91,10 @@ pub(crate) struct PublishJob {
     pub(crate) data_sinks: Arc<Mutex<HashMap<u32, u32>>>,
 }
 
-// SAFETY: server free-threaded（MTA）——sink 经 `Arc<Mutex<HashMap>>` 共享，worker 跨线程
-// `clone`（AddRef）不触发 apartment 检查（无 QI/方法调用）。其余字段（Arc/Mutex/u32/
-// Duration）皆 Send+Sync。
-unsafe impl Send for PublishJob {}
-// SAFETY: 同上；tick/worker 多线程经 `Arc<PublishJob>` 共享只读访问（字段构造后不变）。
-unsafe impl Sync for PublishJob {}
+// PublishJob 字段全 Send+Sync（`u32` / `Arc<Mutex<GroupInner>>` / `Arc<dyn DataSource + Send +
+// Sync>` / `Arc<Mutex<HashMap<u32, u32>>>`）——编译器自动推导 `Send + Sync`，无需 `unsafe impl`。
+// 早期 GIT 重构前曾含 `IConnectionPoint` raw ptr 需手动 impl，现已改存 GIT cookie（`u32`），
+// 残留的 unsafe impl + `non_send_fields_in_send_ty` allow 已删（避免误导后续审查）。
 
 /// 全局推送调度器。
 pub(crate) struct Scheduler {

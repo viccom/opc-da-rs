@@ -231,11 +231,23 @@ impl GroupObj {
     }
 }
 
-/// GroupObj 释放时从调度器注销推送任务（幂等；Scheduler 未 init 时跳过）。
+/// GroupObj 释放时：从调度器注销推送任务 + 兜底撤销残留 GIT cookie（幂等；Scheduler/GIT
+/// 未 init 时跳过）。
 impl Drop for GroupObj {
     fn drop(&mut self) {
         if let Some(sched) = crate::objects::scheduler::global() {
             sched.unregister(self.sched_key);
+        }
+        // 兜底撤销残留 GIT cookie：正常 Unadvise 已撤销并从 sinks 移除；但 client 崩溃/网络
+        // 断开未 Unadvise 时，sinks 里的 git cookie 不会被撤销 → 进程生命周期内 GIT 插槽 +
+        // sink/marshaling-stub 引用累积泄漏。drop 时遍历撤销剩余 cookie（worker 若正用它，
+        // GetInterfaceFromGlobal 失败 → 不推送，安全降级）。
+        if let Some(git) = crate::objects::connection_point::global_git() {
+            let cookies: Vec<u32> = locked(&self.data_sinks).values().copied().collect();
+            for c in cookies {
+                // SAFETY: git 是进程级 GIT（free-threaded）；c 是经同一 GIT 注册的有效 cookie。
+                let _ = unsafe { git.RevokeInterfaceFromGlobal(c) };
+            }
         }
     }
 }
@@ -264,12 +276,17 @@ fn read_frames(
     (hclients, values, qualities, timestamps)
 }
 
-/// `AsyncIO2::Read` 的后台 worker：读全部 → GIT 取 sink → `OnReadComplete` → 清事务。
+/// `AsyncIO2::Read` 的后台 worker：抢事务所有权 → 读 → GIT 取 sink → `OnReadComplete`。
 ///
-/// 独立线程（`DataFrame` 纯计算无 IO，读很快；client 不会高频调 AsyncRead）。线程入 MTA
-/// 以便调 GIT / sink proxy（free-threaded）。事务完成清理幂等：`Cancel2` 先删（或 client
-/// 复用 txn_id 覆盖）则本 worker 不再回调、不误删新事务。
-#[allow(clippy::too_many_arguments)] // 闭包捕获集合过大，显式传参更清晰
+/// 独立线程（`DataSource::read` 纯计算无 IO，读很快；client 不会高频调 AsyncRead）。线程入
+/// MTA 以便调 GIT / sink proxy（free-threaded）。
+///
+/// **所有权竞争**（修事务竞态）：单次锁内原子 `remove(dwtransactionid)` + `cancel_id` 校验
+/// 抢所有权。抢到 = 此事务归本 worker 完成（回调 `OnReadComplete`）；抢不到（`Cancel2` 已
+/// 删 / client 复用 `txn_id` 被新 `Read` 覆盖）则不回调。`HashMap::remove` 对同一 key 只有
+/// 一个调用返回 `Some`，与 `Cancel2` 的 remove 天然互斥——消除旧实现两个竞态：(1) 旧 check
+/// -then-remove 两步，client 复用 `txn_id` 时误删新事务致其永远收不到回调；(2) alive 检查
+/// 后 `Cancel2` 删除，worker 与 Cancel2 都回调的双重通知。
 fn async_read_worker(
     data_source: Arc<dyn DataSource>,
     data_sinks: Arc<Mutex<HashMap<u32, u32>>>,
@@ -277,16 +294,15 @@ fn async_read_worker(
     h_group: u32,
     dwtransactionid: u32,
     cancel_id: u32,
-    frames: Vec<(u32, Arc<str>)>,
 ) {
     thread::spawn(move || {
         // SAFETY: 线程入 MTA（GIT / sink proxy 调用需 COM 线程上下文）；失败忽略（GIT 仍可调用）。
         let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
-        // 事务有效性（Cancel2 已删则不再回调）。
-        let alive = locked(&txns)
-            .get(&dwtransactionid)
-            .is_some_and(|(cid, _)| *cid == cancel_id);
-        if alive {
+        // 单次锁内 remove 抢所有权（校验 cancel_id）。owned 含 frames（txn 表存的快照）。
+        let owned = locked(&txns)
+            .remove(&dwtransactionid)
+            .filter(|(cid, _)| *cid == cancel_id);
+        if let Some((_, frames)) = owned {
             let (hclients, values, qualities, timestamps) = read_frames(&frames, &*data_source);
             let sinks = crate::objects::publisher::typed_sinks(&data_sinks);
             if !sinks.is_empty() {
@@ -299,13 +315,6 @@ fn async_read_worker(
                     &qualities,
                     &timestamps,
                 );
-            }
-            // 只删自己的事务（防 client 复用 txn_id 覆盖后误删新事务）。
-            if locked(&txns)
-                .get(&dwtransactionid)
-                .is_some_and(|(cid, _)| *cid == cancel_id)
-            {
-                locked(&txns).remove(&dwtransactionid);
             }
         }
         // SAFETY: 匹配 CoInitializeEx。
@@ -583,10 +592,24 @@ fn prealloc_item_results(
         return Err(Error::from(E_POINTER));
     }
     let n = dwcount as usize;
-    // SAFETY: CoTaskMemAlloc 分配 size_of* n 字节；失败返回 null。
-    let results_ptr =
-        unsafe { CoTaskMemAlloc(size_of::<tagOPCITEMRESULT>() * n) }.cast::<tagOPCITEMRESULT>();
-    let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+    // SAFETY: CoTaskMemAlloc 分配 size_of* n 字节；失败返回 null。checked_mul 防 32 位 wrapping
+    // 溢出（client 可控 dwcount → size_of*n 在 u32 域可能 wrap 成小值 → 越界写堆破坏）。
+    let results_ptr = unsafe {
+        CoTaskMemAlloc(
+            size_of::<tagOPCITEMRESULT>()
+                .checked_mul(n)
+                .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+        )
+    }
+    .cast::<tagOPCITEMRESULT>();
+    let errors_ptr = unsafe {
+        CoTaskMemAlloc(
+            size_of::<HRESULT>()
+                .checked_mul(n)
+                .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+        )
+    }
+    .cast::<HRESULT>();
     if results_ptr.is_null() || errors_ptr.is_null() {
         // SAFETY: 已分配的那个释放（可能 null，CoTaskMemFree 容忍 null）。
         unsafe {
@@ -625,8 +648,15 @@ fn prealloc_errors(
         return Err(Error::from(E_POINTER));
     }
     let n = dwcount as usize;
-    // SAFETY: CoTaskMemAlloc 分配 size_of*n 字节。
-    let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+    // SAFETY: CoTaskMemAlloc 分配 size_of*n 字节。checked_mul 防 32 位溢出。
+    let errors_ptr = unsafe {
+        CoTaskMemAlloc(
+            size_of::<HRESULT>()
+                .checked_mul(n)
+                .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+        )
+    }
+    .cast::<HRESULT>();
     if errors_ptr.is_null() {
         return Err(Error::from(E_OUTOFMEMORY));
     }
@@ -670,10 +700,23 @@ fn prealloc_item_states(
         return Err(Error::from(E_POINTER));
     }
     let n = dwcount as usize;
-    // SAFETY: CoTaskMemAlloc 分配 size_of*n 字节；失败返回 null。
-    let values_ptr =
-        unsafe { CoTaskMemAlloc(size_of::<tagOPCITEMSTATE>() * n) }.cast::<tagOPCITEMSTATE>();
-    let errors_ptr = unsafe { CoTaskMemAlloc(size_of::<HRESULT>() * n) }.cast::<HRESULT>();
+    // SAFETY: CoTaskMemAlloc 分配 size_of*n 字节；失败返回 null。checked_mul 防 32 位溢出。
+    let values_ptr = unsafe {
+        CoTaskMemAlloc(
+            size_of::<tagOPCITEMSTATE>()
+                .checked_mul(n)
+                .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+        )
+    }
+    .cast::<tagOPCITEMSTATE>();
+    let errors_ptr = unsafe {
+        CoTaskMemAlloc(
+            size_of::<HRESULT>()
+                .checked_mul(n)
+                .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+        )
+    }
+    .cast::<HRESULT>();
     if values_ptr.is_null() || errors_ptr.is_null() {
         // SAFETY: 已分配的释放（可能 null，CoTaskMemFree 容忍 null）。
         unsafe {
@@ -914,47 +957,73 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
         pdwcancelid: *mut u32,
         pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
-        let n = prealloc_errors(dwcount, phserver, pperrors)?;
-        if n == 0 {
-            return Ok(()); // 0-item 空操作成功。
+        // 入参校验在分配 pperrors 前——prealloc 后再失败会泄漏已分配数组（client 拿到失败
+        // HRESULT 不读 out、不释放）。0-item 写 null out（client 握手探测）。
+        if dwcount == 0 {
+            if !pperrors.is_null() {
+                // SAFETY: 调用方 out 指针；写 null（空操作）。
+                unsafe { *pperrors = core::ptr::null_mut() };
+            }
+            return Ok(());
         }
-        if pdwcancelid.is_null() {
+        if phserver.is_null() || pperrors.is_null() || pdwcancelid.is_null() {
             return Err(Error::from(E_POINTER));
         }
-        // 快照 items（锁内取 h_client + item_id；未知 handle 跳过）。
-        let frames: Vec<(u32, Arc<str>)> = {
+        let n = dwcount as usize;
+        // checked_mul 防 32 位 wrapping 溢出（client 可控 dwcount）。
+        let errors_ptr = unsafe {
+            CoTaskMemAlloc(
+                size_of::<HRESULT>()
+                    .checked_mul(n)
+                    .ok_or_else(|| Error::from(E_OUTOFMEMORY))?,
+            )
+        }
+        .cast::<HRESULT>();
+        if errors_ptr.is_null() {
+            return Err(Error::from(E_OUTOFMEMORY));
+        }
+        // SAFETY: pperrors 非空（上面校验）；写分配的数组基址（所有权交 client）。
+        unsafe { *pperrors = errors_ptr };
+        // 快照已知 handle 的 frames + 填 per-item pperrors：已知 handle = E_PENDING（异步进行
+        // 中），未知 = E_INVALIDARG（OPC DA v2 §4.13：server 不为该项发起读取）。frames 只含
+        // 已知（OnReadComplete 回调只含已知项）。
+        let mut frames: Vec<(u32, Arc<str>)> = Vec::with_capacity(n);
+        {
             let inner = locked(&self.inner);
-            (0..n)
-                .filter_map(|i| {
-                    // SAFETY: phserver 含 dwcount 个 u32（调用方保证）；i < n。
-                    let h = unsafe { *phserver.add(i) };
-                    inner
-                        .items
-                        .get(&h)
-                        .map(|e| (e.h_client, Arc::clone(&e.item_id)))
-                })
-                .collect()
-        };
-        if frames.is_empty() {
-            // 全部未知 handle：无可读内容，返回 E_INVALIDARG（client 处理 per-item 错误）。
-            return Err(Error::from(E_INVALIDARG));
-        }
-        let cancel_id = self.next_cancel_id.fetch_add(1, Ordering::Relaxed);
-        locked(&self.txns).insert(dwtransactionid, (cancel_id, frames.clone()));
-        // SAFETY: pdwcancelid 非空（已校验）。
-        unsafe {
-            *pdwcancelid = cancel_id;
-        }
-        // SAFETY: pperrors 含 n 个槽（prealloc 已分配）；全填 E_PENDING（异步进行中）。
-        unsafe {
             for i in 0..n {
-                *(*pperrors).add(i) = E_PENDING;
+                // SAFETY: phserver 含 dwcount 个 u32（调用方保证）；i < n。
+                let h = unsafe { *phserver.add(i) };
+                // SAFETY: errors_ptr 含 n 槽（上面分配）；i < n。
+                match inner.items.get(&h) {
+                    Some(e) => {
+                        unsafe { *errors_ptr.add(i) = E_PENDING };
+                        frames.push((e.h_client, Arc::clone(&e.item_id)));
+                    }
+                    None => {
+                        unsafe { *errors_ptr.add(i) = E_INVALIDARG };
+                    }
+                }
             }
         }
+        if frames.is_empty() {
+            // 全未知 handle：per-item E_INVALIDARG 已填，返回 S_OK（per-item 错误告知 client，
+            // client 不等回调）。pdwcancelid=0（无有效事务）。pperrors 已交 client，不泄漏。
+            // SAFETY: pdwcancelid 非空（上面校验）。
+            unsafe { *pdwcancelid = 0 };
+            tracing::debug!(method = "AsyncIO2::Read", count = 0usize, "全未知 handle");
+            return Ok(());
+        }
+        let cancel_id = self.next_cancel_id.fetch_add(1, Ordering::Relaxed);
+        let valid_count = frames.len();
+        // frames move 进 txn 表（worker 经 remove 取 owned，不再需要 clone/传参）。
+        locked(&self.txns).insert(dwtransactionid, (cancel_id, frames));
+        // SAFETY: pdwcancelid 非空（上面校验）。
+        unsafe { *pdwcancelid = cancel_id };
         let h_group = locked(&self.inner).h_client_group;
         tracing::debug!(
             method = "AsyncIO2::Read",
-            count = frames.len(),
+            count = n,
+            valid = valid_count,
             trans_id = dwtransactionid,
             cancel_id
         );
@@ -965,7 +1034,6 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
             h_group,
             dwtransactionid,
             cancel_id,
-            frames,
         );
         Ok(())
     }
@@ -1014,17 +1082,23 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
     /// 删除事务（worker 完成时不再回调）+ 调 `OnCancelComplete(dwcancelid, hGroup)`。
     /// 无匹配事务返 `E_INVALIDARG`（规范：未知 cancel id）。
     fn Cancel2(&self, dwcancelid: u32) -> Result<()> {
-        // 找匹配 cancel_id 的事务（txn_id 由 client 提供，不能直接当 key 查）。
-        let txn_tid: Option<u32> = {
-            let t = locked(&self.txns);
-            t.iter()
+        // 单次锁内按 cancel_id 找并 remove（抢所有权）。remove 成功 = 抢到此事务（worker 不再
+        // 回调 OnReadComplete，由我回调 OnCancelComplete）；未找到 = 已完成/不存在 → E_INVALIDARG。
+        // 与 async_read_worker 的 remove 互斥（HashMap::remove 同 key 一个 Some），消除双重通知。
+        let cancelled_tid: Option<u32> = {
+            let mut t = locked(&self.txns);
+            let tid_opt = t
+                .iter()
                 .find(|(_, (cid, _))| *cid == dwcancelid)
-                .map(|(tid, _)| *tid)
+                .map(|(tid, _)| *tid);
+            if let Some(tid) = tid_opt {
+                t.remove(&tid);
+            }
+            tid_opt
         };
-        let Some(tid) = txn_tid else {
+        let Some(tid) = cancelled_tid else {
             return Err(Error::from(E_INVALIDARG));
         };
-        locked(&self.txns).remove(&tid);
         // 调 OnCancelComplete（GIT 取 sink；本线程可调）。
         let sinks = crate::objects::publisher::typed_sinks(&self.data_sinks);
         let h_group = locked(&self.inner).h_client_group;
@@ -1844,6 +1918,87 @@ mod tests {
             let captured = captured.expect("OnReadComplete");
             assert_eq!(captured.0, 8888, "dwTransactionID 应透传到 OnReadComplete");
             assert_eq!(captured.2, 1, "回调 count=1（1 个 item）");
+        }
+    }
+
+    /// `AsyncIO2::Read` per-item 错误契约（回归）：已知 handle → `E_PENDING`（异步进行中），
+    /// 未知 handle → `E_INVALIDARG`（OPC DA v2 §4.13：server 不为该项发起读取）。修复前未知
+    /// handle 也填 `E_PENDING`（client 误以为该项会被读、空等 `OnReadComplete`）。
+    #[test]
+    fn async_read_per_item_errors_pending_and_invalidarg() {
+        init_mta();
+        let g = new_group();
+        let id = wide("Random.Int4");
+        let defs = [make_def(&id, 7, true)];
+        let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+        let mut errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: g 同进程；指针有效。
+        unsafe {
+            g.AddItems(1, defs.as_ptr(), &raw mut results, &raw mut errs)
+                .expect("AddItems");
+            let h_valid = (*results).hServer;
+            assert_ne!(h_valid, 0, "valid item 应得非 0 handle");
+            CoTaskMemFree(Some(results.cast()));
+            CoTaskMemFree(Some(errs.cast()));
+
+            let async2: IOPCAsyncIO2 = g.cast::<IOPCAsyncIO2>().expect("QI AsyncIO2");
+            // [valid, 0xDEAD（未知 handle）]。
+            let handles = [h_valid, 0xDEAD_u32];
+            let mut cancel_id = 0u32;
+            let mut perrors: *mut HRESULT = core::ptr::null_mut();
+            async2
+                .Read(
+                    2,
+                    handles.as_ptr(),
+                    42,
+                    &raw mut cancel_id,
+                    &raw mut perrors,
+                )
+                .expect("Read 应 S_OK");
+            assert!(cancel_id >= 1, "有有效 item → cancel_id 非 0（分配事务）");
+            // SAFETY: perrors 含 2 槽（Read 分配）。
+            assert_eq!(*perrors, E_PENDING, "ppErrors[0]（valid）应 E_PENDING");
+            assert_eq!(
+                *perrors.add(1),
+                E_INVALIDARG,
+                "ppErrors[1]（未知 handle）应 E_INVALIDARG"
+            );
+            CoTaskMemFree(Some(perrors.cast()));
+        }
+    }
+
+    /// `AsyncIO2::Read` 全未知 handle → `S_OK` + per-item `E_INVALIDARG` + `cancel_id=0`（无有效
+    /// 事务，不 spawn worker）。修复前返 `E_INVALIDARG` 整体失败且泄漏已分配 `pperrors`。
+    #[test]
+    fn async_read_all_unknown_handles_returns_s_ok() {
+        init_mta();
+        let g = new_group();
+        let async2: IOPCAsyncIO2 = g.cast::<IOPCAsyncIO2>().expect("QI AsyncIO2");
+        let handles = [0xDEAD_u32, 0xBEEF_u32];
+        let mut cancel_id = 999u32; // 预置非 0，验证被置 0
+        let mut perrors: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: g 同进程；handles/out 指针有效。
+        unsafe {
+            async2
+                .Read(
+                    2,
+                    handles.as_ptr(),
+                    99,
+                    &raw mut cancel_id,
+                    &raw mut perrors,
+                )
+                .expect("全未知应 S_OK（per-item E_INVALIDARG，非整体失败）");
+            assert_eq!(
+                cancel_id, 0,
+                "全未知 → cancel_id=0（无事务，不 spawn worker）"
+            );
+            assert_eq!(*perrors, E_INVALIDARG, "ppErrors[0]（未知）应 E_INVALIDARG");
+            assert_eq!(
+                *perrors.add(1),
+                E_INVALIDARG,
+                "ppErrors[1]（未知）应 E_INVALIDARG"
+            );
+            CoTaskMemFree(Some(perrors.cast()));
         }
     }
 
