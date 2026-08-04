@@ -12,6 +12,9 @@ mod tags;
 #[cfg(windows)]
 mod data_source;
 
+#[cfg(windows)]
+mod runtime;
+
 fn main() {
     eprintln!("opc-da-server-sim: skeleton (Task 1) — 后续 task 填充 COM 编排");
 }
