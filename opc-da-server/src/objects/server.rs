@@ -189,6 +189,15 @@ impl IOPCServer_Impl for ServerObj_Impl {
                 ppercentdeadband.as_ref().copied().unwrap_or(0.0),
             )
         };
+        tracing::debug!(
+            method = "AddGroup",
+            name = %name,
+            active,
+            requested_rate_ms = dwrequestedupdaterate,
+            deadband_pct = percent_deadband,
+            locale = dwlcid,
+            h_client_group = hclientgroup,
+        );
         let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
         {
             let mut inner = locked(&self.inner);
@@ -211,6 +220,9 @@ impl IOPCServer_Impl for ServerObj_Impl {
             let hr = unsafe { group_unk.query(riid, &raw mut raw) };
             if hr != S_OK || raw.is_null() {
                 // QI 失败：group_unk drop（未 insert），不占注册表槽。
+                // SAFETY: riid 已在上方校验非 null。
+                let riid_copy = unsafe { *riid };
+                tracing::error!(method = "AddGroup", riid = ?riid_copy, error = "QI failed");
                 return Err(E_NOINTERFACE.into());
             }
             // 注册 group：server 持 group_unk（client 释放后仍存活到 RemoveGroup）。
@@ -218,6 +230,7 @@ impl IOPCServer_Impl for ServerObj_Impl {
             drop(inner);
             // SAFETY: phservergroup 非空（上面校验）；h 为 u32 副本，锁已释放仍有效。
             unsafe { *phservergroup = h };
+            tracing::debug!(method = "AddGroup", result = "ok", h_server_group = h);
         }
         // SAFETY: raw 非 null（上面校验）；from_raw 包成 IUnknown，ABI 指向 riid vtable。
         let requested = unsafe { IUnknown::from_raw(raw) };
@@ -597,7 +610,13 @@ impl IOPCBrowseServerAddressSpace_Impl for ServerObj_Impl {
         _vtdatatypefilter: u16,
         _dwaccessrightsfilter: u32,
     ) -> Result<IEnumString> {
-        Ok(StringEnum::new(self.browse_items(dwbrowsefiltertype)).into())
+        let items = self.browse_items(dwbrowsefiltertype);
+        tracing::debug!(
+            method = "BrowseOPCItemIDs",
+            filter_type = dwbrowsefiltertype.0,
+            count = items.len(),
+        );
+        Ok(StringEnum::new(items).into())
     }
 
     fn GetItemID(&self, szitemdataid: &PCWSTR) -> Result<PWSTR> {
@@ -607,13 +626,14 @@ impl IOPCBrowseServerAddressSpace_Impl for ServerObj_Impl {
         let full = if self.data_source.query_organization() == NsOrganization::Hierarchical {
             let pos = locked(&self.inner).browse_pos.clone();
             if pos.is_empty() {
-                rel
+                rel.clone()
             } else {
                 format!("{}.{}", pos.join("."), rel)
             }
         } else {
-            rel
+            rel.clone()
         };
+        tracing::debug!(method = "GetItemID", relative = %rel, full = %full);
         let w: Vec<u16> = full.encode_utf16().chain(std::iter::once(0)).collect();
         // SAFETY: CoTaskMemAlloc 分配 w.len()*2 字节；失败 null。
         let ptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();

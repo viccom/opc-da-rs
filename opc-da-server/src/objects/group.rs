@@ -238,6 +238,7 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
         pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
         let n = prealloc_item_results(dwcount, pitemarray, ppaddresults, pperrors)?;
+        tracing::debug!(method = "AddItems", count = n);
         let mut inner = locked(&self.inner);
         for i in 0..n {
             // SAFETY: pitemarray 含 dwcount 个 OPCITEMDEF（调用方保证）；i < n = dwcount。
@@ -245,6 +246,7 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
             let item_id = pwstr_to_string(def.szItemID);
             match self.data_source.item_meta(&item_id) {
                 Some(meta) => {
+                    tracing::debug!(method = "AddItems", item = %item_id, result = "ok");
                     let h_server = inner.alloc_handle();
                     inner.items.insert(
                         h_server,
@@ -279,6 +281,7 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
                     }
                 }
                 None => {
+                    tracing::debug!(method = "AddItems", item = %item_id, result = "invalid");
                     // SAFETY: 同上；ptr::write 写零结果到未初始化槽 + INVALIDITEMID。
                     unsafe {
                         std::ptr::write(
@@ -468,7 +471,31 @@ fn prealloc_item_results(
     poutresults: *mut *mut tagOPCITEMRESULT,
     pperrors: *mut *mut HRESULT,
 ) -> Result<usize> {
-    if dwcount == 0 || pitemarray.is_null() || poutresults.is_null() || pperrors.is_null() {
+    // dwcount==0：空操作成功——写 out=null 再返回 S_OK。部分 client（Prosys 等）会发
+    // 0-item 请求做连接握手，且失败时仍读 out；若此处不写 out 返回 E_POINTER，client 读
+    // 到未初始化垃圾指针 → 进程内 access violation。
+    if dwcount == 0 {
+        if !poutresults.is_null() {
+            // SAFETY: 调用方提供的 out 指针；写 null 表示无结果数组（空操作）。
+            unsafe { *poutresults = core::ptr::null_mut() };
+        }
+        if !pperrors.is_null() {
+            // SAFETY: 同上。
+            unsafe { *pperrors = core::ptr::null_mut() };
+        }
+        return Ok(0);
+    }
+    if pitemarray.is_null() || poutresults.is_null() || pperrors.is_null() {
+        // E_POINTER 路径也把 out 置 null：client 若不查 HRESULT 直接读 out，至少拿到 null
+        // 而非栈垃圾（避免访问非法地址）。
+        if !poutresults.is_null() {
+            // SAFETY: 同上。
+            unsafe { *poutresults = core::ptr::null_mut() };
+        }
+        if !pperrors.is_null() {
+            // SAFETY: 同上。
+            unsafe { *pperrors = core::ptr::null_mut() };
+        }
         return Err(Error::from(E_POINTER));
     }
     let n = dwcount as usize;
@@ -498,7 +525,19 @@ fn prealloc_errors(
     phserver: *const u32,
     pperrors: *mut *mut HRESULT,
 ) -> Result<usize> {
-    if dwcount == 0 || phserver.is_null() || pperrors.is_null() {
+    // dwcount==0：空操作成功（同 `prealloc_item_results`——写 null + S_OK，防 client 读垃圾 out）。
+    if dwcount == 0 {
+        if !pperrors.is_null() {
+            // SAFETY: 调用方提供的 out 指针；写 null 表示无错误数组（空操作）。
+            unsafe { *pperrors = core::ptr::null_mut() };
+        }
+        return Ok(0);
+    }
+    if phserver.is_null() || pperrors.is_null() {
+        if !pperrors.is_null() {
+            // SAFETY: 同上；失败路径也置 null，防 client 读未初始化 out。
+            unsafe { *pperrors = core::ptr::null_mut() };
+        }
         return Err(Error::from(E_POINTER));
     }
     let n = dwcount as usize;
@@ -522,7 +561,28 @@ fn prealloc_item_states(
     ppitemvalues: *mut *mut tagOPCITEMSTATE,
     pperrors: *mut *mut HRESULT,
 ) -> Result<usize> {
-    if dwcount == 0 || phserver.is_null() || ppitemvalues.is_null() || pperrors.is_null() {
+    // dwcount==0：空操作成功（同 `prealloc_item_results`——写 null + S_OK，防 client 读垃圾 out）。
+    if dwcount == 0 {
+        if !ppitemvalues.is_null() {
+            // SAFETY: 调用方提供的 out 指针；写 null 表示无值数组（空操作）。
+            unsafe { *ppitemvalues = core::ptr::null_mut() };
+        }
+        if !pperrors.is_null() {
+            // SAFETY: 同上。
+            unsafe { *pperrors = core::ptr::null_mut() };
+        }
+        return Ok(0);
+    }
+    if phserver.is_null() || ppitemvalues.is_null() || pperrors.is_null() {
+        // E_POINTER 路径也把 out 置 null（同 `prealloc_item_results`）。
+        if !ppitemvalues.is_null() {
+            // SAFETY: 同上。
+            unsafe { *ppitemvalues = core::ptr::null_mut() };
+        }
+        if !pperrors.is_null() {
+            // SAFETY: 同上。
+            unsafe { *pperrors = core::ptr::null_mut() };
+        }
         return Err(Error::from(E_POINTER));
     }
     let n = dwcount as usize;
@@ -661,7 +721,7 @@ impl IOPCGroupStateMgt_Impl for GroupObj_Impl {
 impl IOPCSyncIO_Impl for GroupObj_Impl {
     fn Read(
         &self,
-        _dwsource: tagOPCDATASOURCE,
+        dwsource: tagOPCDATASOURCE,
         dwcount: u32,
         phserver: *const u32,
         ppitemvalues: *mut *mut tagOPCITEMSTATE,
@@ -670,6 +730,7 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
         // dwsource 忽略：SimDataSource 无 cache/device 之分，统一 read-time 现算
         //（等价 device 读）。真 cache 语义待 publisher 引擎（§10）维护缓存后区分。
         let n = prealloc_item_states(dwcount, phserver, ppitemvalues, pperrors)?;
+        tracing::debug!(method = "SyncIO::Read", source = dwsource.0, count = n);
         // 锁内取每个 handle 对应的 (hClient, item_id)；未知 handle 记 None。
         // 短持锁：仅查表 clone，DataSource::read 在锁外执行（避免长持锁期间做 IO）。
         let lookups: Vec<(u32, Option<Arc<str>>)> = {
@@ -726,6 +787,7 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
         pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
         let n = prealloc_errors(dwcount, phserver, pperrors)?;
+        tracing::debug!(method = "SyncIO::Write", count = n);
         let lookups: Vec<Option<Arc<str>>> = {
             let inner = locked(&self.inner);
             (0..n)
@@ -927,6 +989,54 @@ mod tests {
             CoTaskMemFree(Some(results.cast()));
             CoTaskMemFree(Some(errors.cast()));
         }
+    }
+
+    /// 0-item 请求（client 握手/测试常见）：必须返回 Ok 且 out=null——绝不能留垃圾指针让
+    /// client 读（Prosys 实测：0-item Read 若返回 E_POINTER 且不写 out，client 读未初始化
+    /// out → 进程内 access violation）。Read / AddItems / RemoveItems 三路径全覆盖。
+    #[test]
+    fn zero_count_requests_succeed_with_null_out() {
+        let g = new_group();
+
+        // Read(0) → S_OK + ppitemvalues=null + pperrors=null。
+        // 先把 out 预置为垃圾指针（模拟 client 未初始化栈变量），验证 server 一定覆盖为 null。
+        // SAFETY: 同进程 implement 对象同 CLSID 内 QI 必然成功；cast 失败 expect 不 panic（测试）。
+        let sync: IOPCSyncIO = g.cast().expect("QI IOPCSyncIO");
+        let mut values: *mut tagOPCITEMSTATE = 0x1000usize as *mut tagOPCITEMSTATE;
+        let mut errors: *mut HRESULT = 0x1000usize as *mut HRESULT;
+        // SAFETY: sync 是同进程 implement 对象；out 指针有效。
+        unsafe {
+            sync.Read(
+                OPC_DS_DEVICE,
+                0,
+                core::ptr::null_mut(),
+                &raw mut values,
+                &raw mut errors,
+            )
+            .expect("0-item Read 应成功");
+        }
+        assert!(values.is_null(), "0-item Read ppitemvalues 必须 null");
+        assert!(errors.is_null(), "0-item Read pperrors 必须 null");
+
+        // AddItems(0) → S_OK + out null。
+        let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+        let mut errors2: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: 同上。
+        unsafe {
+            g.AddItems(0, core::ptr::null_mut(), &raw mut results, &raw mut errors2)
+                .expect("0-item AddItems 应成功");
+        }
+        assert!(results.is_null(), "0-item AddItems 结果必须 null");
+        assert!(errors2.is_null(), "0-item AddItems errors 必须 null");
+
+        // RemoveItems(0) → S_OK + out null。
+        let mut errors3: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: 同上。
+        unsafe {
+            g.RemoveItems(0, core::ptr::null_mut(), &raw mut errors3)
+                .expect("0-item RemoveItems 应成功");
+        }
+        assert!(errors3.is_null(), "0-item RemoveItems errors 必须 null");
     }
 
     /// 5 接口 QI 共存仍成立（重构后不破坏）。

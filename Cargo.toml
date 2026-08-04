@@ -26,7 +26,9 @@ rust-version = "1.93.1"
 thiserror = "2.0"
 anyhow = "1.0.95"
 tokio = { version = "1.43.0", features = ["rt", "rt-multi-thread", "sync", "macros"] }
-tracing = "0.1.41"
+# max_level_debug：tracing 静态级别默认 INFO——`debug!` 宏会被编译期裁剪，运行时过滤
+# 救不回来。opc-cli 日志约定 / sim SCM 诊断日志都依赖 DEBUG 级事件，显式开启。
+tracing = { version = "0.1.41", features = ["max_level_debug"] }
 chrono = { version = "0.4.43", default-features = false, features = ["std", "clock", "serde"] }
 futures = "0.3"
 windows = { version = "0.61.3", features = [

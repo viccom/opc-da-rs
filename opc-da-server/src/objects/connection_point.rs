@@ -136,11 +136,13 @@ where
             .map_err(|_| Error::from(CONNECT_E_CANNOTCONNECT))?;
         let cookie = self.alloc_cookie();
         locked(&self.sinks).insert(cookie, sink);
+        tracing::debug!(method = "Advise", sink_type = ?<T as Interface>::IID, cookie);
         Ok(cookie)
     }
 
     fn Unadvise(&self, dwcookie: u32) -> Result<()> {
         if locked(&self.sinks).remove(&dwcookie).is_some() {
+            tracing::debug!(method = "Unadvise", cookie = dwcookie);
             Ok(())
         } else {
             // cookie 不存在：规范返回 CONNECT_E_NOCONNECTION。

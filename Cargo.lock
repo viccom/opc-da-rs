@@ -2332,6 +2332,7 @@ dependencies = [
  "opc-da-client",
  "opc-da-server",
  "tracing",
+ "tracing-appender-localtime",
  "tracing-subscriber",
  "windows",
 ]
