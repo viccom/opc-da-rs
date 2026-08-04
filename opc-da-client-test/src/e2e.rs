@@ -12,7 +12,7 @@ use std::time::Duration;
 use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, OpcValue};
 
 use crate::report::probe;
-use crate::server_proc::{ServerChild, server_exe_path};
+use crate::server_proc::{ServerChild, server_exe_path, sim_exe_path};
 
 static PROG_ID: LazyLock<String> = LazyLock::new(|| {
     std::env::var("OPC_DA_SERVER_PROGID").unwrap_or_else(|_| "opc-da-rs.Server.1".into())
@@ -611,9 +611,161 @@ pub async fn run_hier() -> (u32, u32) {
     (passed, failed)
 }
 
-/// e2e 入口：spawn sim → 13 flat → kill → spawn generated → hierarchical → kill → 汇总。
+/// sim 探针（连 `opc-da-server-sim`，hierarchical 命名空间 + Matrikon 风格 tag 集）。
+/// `(passed, failed)`。
+///
+/// 覆盖 sim 的核心路径：status / read（叶 id `Random.Int4.0`）/ write 往返 /
+/// **subscribe 推送（回归：STA client sink 跨线程 QI 的 RPC_E_WRONG_THREAD 修复）** /
+/// browse（`Random→Int4` 分支叶数）。sim 默认 count=100 → 801 tag。
+#[allow(clippy::too_many_lines)]
+pub async fn run_sim() -> (u32, u32) {
+    const SIM_PROG_ID: &str = "opc-da-rs.Sim.1";
+    let client = OpcDaClient::new(ComConnector::new(HOST)).expect("OpcDaClient init");
+    let (mut passed, mut failed) = (0u32, 0u32);
+
+    // S1. get_server_status。
+    match client.get_server_status(SIM_PROG_ID).await {
+        Ok(s) => probe(
+            &mut passed,
+            &mut failed,
+            "sim get_server_status",
+            true,
+            &format!("{s:?}"),
+        ),
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "sim get_server_status",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // S2. read Random.Int4.0（hierarchical 叶，quality Good + 值域 0..=100）。
+    match client
+        .read_tag_values(SIM_PROG_ID, vec!["Random.Int4.0".to_string()])
+        .await
+    {
+        Ok(vals) => {
+            let ok = vals.first().is_some_and(|tv| {
+                let v: i32 = tv.value.parse().unwrap_or(-1);
+                tv.quality == "Good" && (0..=100).contains(&v)
+            });
+            probe(
+                &mut passed,
+                &mut failed,
+                "sim read Random.Int4.0",
+                ok,
+                &format!("{:?}", vals.first()),
+            );
+        }
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "sim read Random.Int4.0",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // S3. write BucketBrigade.Int4.0 = 42 → read 回 42（可写 tag 往返）。
+    match client
+        .write_tag_value(SIM_PROG_ID, "BucketBrigade.Int4.0", OpcValue::Int(42))
+        .await
+    {
+        Ok(_) => match client
+            .read_tag_values(SIM_PROG_ID, vec!["BucketBrigade.Int4.0".to_string()])
+            .await
+        {
+            Ok(vals) => {
+                let ok = vals
+                    .first()
+                    .is_some_and(|tv| tv.value.parse::<i32>().unwrap_or(-1) == 42);
+                probe(
+                    &mut passed,
+                    &mut failed,
+                    "sim write/read BucketBrigade.Int4.0=42",
+                    ok,
+                    &format!("{:?}", vals.first()),
+                );
+            }
+            Err(e) => probe(
+                &mut passed,
+                &mut failed,
+                "sim write/read BucketBrigade.Int4.0=42",
+                false,
+                &e.to_string(),
+            ),
+        },
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "sim write BucketBrigade.Int4.0",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // S4. subscribe Random.Int4.0（3s 内收 OnDataChange）——**核心**：验证订阅推送
+    //（typed_sinks 免 QI 路径）对 sim 生效（回归 RPC_E_WRONG_THREAD → sinks=0 不推送）。
+    match client
+        .subscribe(SIM_PROG_ID, vec!["Random.Int4.0".to_string()], 500)
+        .await
+    {
+        Ok(mut handle) => {
+            let r = tokio::time::timeout(Duration::from_secs(3), handle.rx.recv()).await;
+            let ok = matches!(r, Ok(Some(_)));
+            probe(
+                &mut passed,
+                &mut failed,
+                "sim subscribe OnDataChange",
+                ok,
+                if ok { "收到帧" } else { "3s 未收" },
+            );
+        }
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "sim subscribe OnDataChange",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    // S5. browse Random→Int4 分支叶数 ≥ 100（默认 count=100 → 801 tag；越界 id 拒收已由
+    // read 探针覆盖）。browse_tags 全量应含 hierarchical full id。
+    let progress = Arc::new(AtomicUsize::new(0));
+    let sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    match client
+        .browse_tags(SIM_PROG_ID, 5000, progress, sink, 0, 0)
+        .await
+    {
+        Ok(tags) => {
+            let ok = tags.len() > 8 * 100 && tags.contains(&"Random.Int4.0".to_string());
+            probe(
+                &mut passed,
+                &mut failed,
+                "sim browse_tags 全量",
+                ok,
+                &format!("{} full id", tags.len()),
+            );
+        }
+        Err(e) => probe(
+            &mut passed,
+            &mut failed,
+            "sim browse_tags 全量",
+            false,
+            &e.to_string(),
+        ),
+    }
+
+    (passed, failed)
+}
+
+/// e2e 入口：spawn sim → flat → kill → spawn generated → hierarchical → kill →
+/// spawn sim-sim → sim 探针 → kill → 汇总。
 pub async fn run_e2e() -> anyhow::Result<()> {
-    println!("=== e2e: 全流程（20 flat + hierarchical）===\n");
+    println!("=== e2e: 全流程（flat + hierarchical + sim）===\n");
 
     // 阶段 1：SimDataSource server + 13 flat 探针。
     let sim = ServerChild::spawn(&server_exe_path(), "sim", 10, 10, 1000)?;
@@ -630,7 +782,13 @@ pub async fn run_e2e() -> anyhow::Result<()> {
     let (p2, f2) = run_hier().await;
     drop(gen_server);
 
-    let (passed, failed) = (p1 + p2, f1 + f2);
+    // 阶段 3：opc-da-server-sim + sim 命名空间探针（read/write/subscribe/browse 全 tag）。
+    let sim2 = ServerChild::spawn(&sim_exe_path(), "sim", 0, 0, 0)?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let (p3, f3) = run_sim().await;
+    drop(sim2);
+
+    let (passed, failed) = (p1 + p2 + p3, f1 + f2 + f3);
     println!("\n=== 汇总: {passed} passed, {failed} failed ===");
     if failed > 0 {
         anyhow::bail!("{failed} 个探针失败");

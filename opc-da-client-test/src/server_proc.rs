@@ -78,6 +78,12 @@ pub fn server_exe_path() -> String {
     std::env::var("OPC_DA_SERVER_EXE").unwrap_or_else(|_| "target/debug/opc-da-server.exe".into())
 }
 
+/// 解析 sim server.exe 路径：env `OPC_DA_SIM_EXE` > 默认 `target/debug/opc-da-server-sim.exe`。
+/// （sim 独立 crate，与库 bin 不同 exe。）
+pub fn sim_exe_path() -> String {
+    std::env::var("OPC_DA_SIM_EXE").unwrap_or_else(|_| "target/debug/opc-da-server-sim.exe".into())
+}
+
 /// 读 server 子进程指标：`(handle 数, 工作集 RSS 字节)`。
 ///
 /// handle 数近似线程/资源压力；RSS = 物理内存。Windows API 经 PID 打开进程读。
