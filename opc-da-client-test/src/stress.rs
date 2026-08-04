@@ -122,7 +122,23 @@ pub async fn run_stress(opts: &StressOpts) -> anyhow::Result<()> {
         }));
     }
 
-    tokio::time::sleep(opts.duration).await;
+    // 周期采样（每 30s）输出 server RSS/handles/items 时间序列——判长时泄漏（RSS 持续涨 = 泄漏）。
+    let pid = server.pid();
+    let mut elapsed = Duration::ZERO;
+    while elapsed < opts.duration {
+        let chunk = Duration::from_secs(30).min(opts.duration.saturating_sub(elapsed));
+        tokio::time::sleep(chunk).await;
+        elapsed += chunk;
+        let (handles, rss) = read_server_metrics(pid).unwrap_or((0, 0));
+        println!(
+            "[{:>4}s] clients={} | handles={} RSS={:.1} MB | total items={}",
+            elapsed.as_secs(),
+            opts.clients,
+            handles,
+            rss as f64 / 1_048_576.0,
+            total_items.load(Ordering::Relaxed),
+        );
+    }
     stop.store(true, Ordering::Relaxed);
 
     let mut per_client = Vec::new();
