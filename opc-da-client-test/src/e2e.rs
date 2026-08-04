@@ -4,6 +4,7 @@
 //! 详见 `docs/superpowers/specs/2026-08-03-opc-da-client-test-e2e-design.md` §7。
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -13,7 +14,9 @@ use opc_da_client::{ComConnector, OpcDaClient, OpcProvider, OpcValue};
 use crate::report::probe;
 use crate::server_proc::{ServerChild, server_exe_path};
 
-const PROG_ID: &str = "opc-da-rs.Server.1";
+static PROG_ID: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("OPC_DA_SERVER_PROGID").unwrap_or_else(|_| "opc-da-rs.Server.1".into())
+});
 const HOST: &str = "localhost";
 
 /// 20 flat 探针（连 SimDataSource server，覆盖 [`OpcProvider`] 全部方法）。`(passed, failed)`。
@@ -28,7 +31,7 @@ pub async fn run_flat() -> (u32, u32) {
     let (mut passed, mut failed) = (0u32, 0u32);
 
     // 1. get_server_status（IOPCServer::GetStatus）。
-    match client.get_server_status(PROG_ID).await {
+    match client.get_server_status(&PROG_ID).await {
         Ok(s) => probe(
             &mut passed,
             &mut failed,
@@ -47,7 +50,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 2. read Random.Int4（quality Good + 0..=100）。
     match client
-        .read_tag_values(PROG_ID, vec!["Random.Int4".to_string()])
+        .read_tag_values(&PROG_ID, vec!["Random.Int4".to_string()])
         .await
     {
         Ok(vals) => {
@@ -74,7 +77,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 3. write Bucket Brigade.Int4 = 42。
     match client
-        .write_tag_value(PROG_ID, "Bucket Brigade.Int4", OpcValue::Int(42))
+        .write_tag_value(&PROG_ID, "Bucket Brigade.Int4", OpcValue::Int(42))
         .await
     {
         Ok(_) => probe(
@@ -95,7 +98,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 4. read round-trip Bucket Brigade.Int4 = 42。
     match client
-        .read_tag_values(PROG_ID, vec!["Bucket Brigade.Int4".to_string()])
+        .read_tag_values(&PROG_ID, vec!["Bucket Brigade.Int4".to_string()])
         .await
     {
         Ok(vals) => {
@@ -119,7 +122,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 5. subscribe（3s 内收 OnDataChange）。
     match client
-        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .subscribe(&PROG_ID, vec!["Random.Int4".to_string()], 500)
         .await
     {
         Ok(mut handle) => {
@@ -145,7 +148,10 @@ pub async fn run_flat() -> (u32, u32) {
     // 6. browse 4 tag（SimDataSource 全 4 leaf）。
     let progress = Arc::new(AtomicUsize::new(0));
     let sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    match client.browse_tags(PROG_ID, 100, progress, sink, 0, 0).await {
+    match client
+        .browse_tags(&PROG_ID, 100, progress, sink, 0, 0)
+        .await
+    {
         Ok(tags) => {
             let expected = [
                 "Random.Int4",
@@ -172,7 +178,7 @@ pub async fn run_flat() -> (u32, u32) {
     }
 
     // 7. get_item_properties（Random.Int4）。
-    match client.get_item_properties(PROG_ID, "Random.Int4").await {
+    match client.get_item_properties(&PROG_ID, "Random.Int4").await {
         Ok(props) => probe(
             &mut passed,
             &mut failed,
@@ -190,7 +196,7 @@ pub async fn run_flat() -> (u32, u32) {
     }
 
     // 8. get_error_string（S_OK）。
-    match client.get_error_string(PROG_ID, 0).await {
+    match client.get_error_string(&PROG_ID, 0).await {
         Ok(s) => probe(
             &mut passed,
             &mut failed,
@@ -228,7 +234,7 @@ pub async fn run_flat() -> (u32, u32) {
     // 10. write_tag_values（多 tag write）。
     match client
         .write_tag_values(
-            PROG_ID,
+            &PROG_ID,
             vec![("Bucket Brigade.Int4".to_string(), OpcValue::Int(99))],
         )
         .await
@@ -250,7 +256,7 @@ pub async fn run_flat() -> (u32, u32) {
     }
 
     // 11. set_locale_id。
-    match client.set_locale_id(PROG_ID, 0).await {
+    match client.set_locale_id(&PROG_ID, 0).await {
         Ok(()) => probe(&mut passed, &mut failed, "set_locale_id", true, "Ok"),
         Err(e) => probe(
             &mut passed,
@@ -262,7 +268,7 @@ pub async fn run_flat() -> (u32, u32) {
     }
 
     // 12. set_client_name。
-    match client.set_client_name(PROG_ID, "opc-da-client-test").await {
+    match client.set_client_name(&PROG_ID, "opc-da-client-test").await {
         Ok(()) => probe(&mut passed, &mut failed, "set_client_name", true, "Ok"),
         Err(e) => probe(
             &mut passed,
@@ -274,7 +280,7 @@ pub async fn run_flat() -> (u32, u32) {
     }
 
     // 13. subscribe_shutdown。
-    match client.subscribe_shutdown(PROG_ID).await {
+    match client.subscribe_shutdown(&PROG_ID).await {
         Ok(h) => probe(
             &mut passed,
             &mut failed,
@@ -293,7 +299,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 14. unsubscribe（subscribe → unsubscribe round-trip，验证 IConnectionPoint::Unadvise）。
     match client
-        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .subscribe(&PROG_ID, vec!["Random.Int4".to_string()], 500)
         .await
     {
         Ok(h) => match client.unsubscribe(h.cookie).await {
@@ -316,7 +322,7 @@ pub async fn run_flat() -> (u32, u32) {
     }
 
     // 15. unsubscribe_shutdown（subscribe_shutdown → unsubscribe_shutdown）。
-    match client.subscribe_shutdown(PROG_ID).await {
+    match client.subscribe_shutdown(&PROG_ID).await {
         Ok(h) => match client.unsubscribe_shutdown(h.cookie).await {
             Ok(()) => probe(&mut passed, &mut failed, "unsubscribe_shutdown", true, "Ok"),
             Err(e) => probe(
@@ -338,7 +344,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 16. set_subscription_rate（IOPCGroupStateMgt::SetState round-trip，验证 server SetState）。
     match client
-        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .subscribe(&PROG_ID, vec!["Random.Int4".to_string()], 500)
         .await
     {
         Ok(h) => match client.set_subscription_rate(h.cookie, 1000).await {
@@ -369,7 +375,7 @@ pub async fn run_flat() -> (u32, u32) {
     // 17. list_servers_with_details（GetClassDetails 填 CLSID/描述）。
     match client.list_servers_with_details(HOST).await {
         Ok(descs) => {
-            let found = descs.iter().find(|d| d.prog_id == PROG_ID);
+            let found = descs.iter().find(|d| d.prog_id == PROG_ID.as_str());
             probe(
                 &mut passed,
                 &mut failed,
@@ -389,7 +395,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 18. read_tag_values_max_age（预期 Err：server 未实装 IOPCSyncIO2）。
     match client
-        .read_tag_values_max_age(PROG_ID, vec!["Random.Int4".to_string()], 0)
+        .read_tag_values_max_age(&PROG_ID, vec!["Random.Int4".to_string()], 0)
         .await
     {
         Ok(_) => probe(
@@ -410,7 +416,13 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 19. write_tag_value_vqt（预期 Err：server 未实装 IOPCSyncIO2）。
     match client
-        .write_tag_value_vqt(PROG_ID, "Bucket Brigade.Int4", OpcValue::Int(1), None, None)
+        .write_tag_value_vqt(
+            &PROG_ID,
+            "Bucket Brigade.Int4",
+            OpcValue::Int(1),
+            None,
+            None,
+        )
         .await
     {
         Ok(_) => probe(
@@ -431,7 +443,7 @@ pub async fn run_flat() -> (u32, u32) {
 
     // 20. set_keep_alive（预期 Err：server 未实装 IOPCGroupStateMgt2）。
     match client
-        .subscribe(PROG_ID, vec!["Random.Int4".to_string()], 500)
+        .subscribe(&PROG_ID, vec!["Random.Int4".to_string()], 500)
         .await
     {
         Ok(h) => match client.set_keep_alive(h.cookie, 5000).await {
@@ -469,7 +481,7 @@ pub async fn run_hier() -> (u32, u32) {
     let (mut passed, mut failed) = (0u32, 0u32);
 
     // H1. browse_children(root) → branches（证 QueryOrganization=HIERARCHIAL）。
-    let root_branches = match client.browse_children(PROG_ID, None, 0, 0).await {
+    let root_branches = match client.browse_children(&PROG_ID, None, 0, 0).await {
         Ok(r) => {
             let ok = !r.branches.is_empty();
             probe(
@@ -496,7 +508,7 @@ pub async fn run_hier() -> (u32, u32) {
     // H2. 下钻 plant0 → 应有子节点（line branches，证多层 hierarchical）。
     let plant0_kids = if let Some(b) = root_branches.first() {
         match client
-            .browse_children(PROG_ID, Some(b.id.clone()), 0, 0)
+            .browse_children(&PROG_ID, Some(b.id.clone()), 0, 0)
             .await
         {
             Ok(kids) => {
@@ -540,7 +552,7 @@ pub async fn run_hier() -> (u32, u32) {
     // H3. 下钻 plant0.line0 → leaves 是 full id（client 经 GetItemID 把相对名拼 full path）。
     if let Some(line) = plant0_kids.branches.first() {
         match client
-            .browse_children(PROG_ID, Some(line.id.clone()), 0, 0)
+            .browse_children(&PROG_ID, Some(line.id.clone()), 0, 0)
             .await
         {
             Ok(leaves_kids) => {
@@ -574,7 +586,7 @@ pub async fn run_hier() -> (u32, u32) {
     let progress = Arc::new(AtomicUsize::new(0));
     let sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     match client
-        .browse_tags(PROG_ID, 1000, progress, sink, 0, 0)
+        .browse_tags(&PROG_ID, 1000, progress, sink, 0, 0)
         .await
     {
         Ok(tags) => {

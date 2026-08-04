@@ -9,6 +9,7 @@
 )]
 
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,7 +18,9 @@ use opc_da_client::{ComConnector, OpcDaClient, OpcProvider};
 
 use crate::server_proc::{ServerChild, read_server_metrics, server_exe_path};
 
-const PROG_ID: &str = "opc-da-rs.Server.1";
+static PROG_ID: LazyLock<String> = LazyLock::new(|| {
+    std::env::var("OPC_DA_SERVER_PROGID").unwrap_or_else(|_| "opc-da-rs.Server.1".into())
+});
 
 /// stress CLI 参数。
 pub struct StressOpts {
@@ -173,7 +176,7 @@ async fn client_worker(
     let progress = Arc::new(AtomicUsize::new(0));
     let sink: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let all = client
-        .browse_tags(PROG_ID, 100_000, progress, sink, 0, 0)
+        .browse_tags(&PROG_ID, 100_000, progress, sink, 0, 0)
         .await?;
     let start = (idx * items_per_group) % all.len().max(1);
     let items: Vec<String> = all
@@ -184,7 +187,7 @@ async fn client_worker(
         .cloned()
         .collect();
 
-    let mut handle = client.subscribe(PROG_ID, items, rate).await?;
+    let mut handle = client.subscribe(&PROG_ID, items, rate).await?;
     let mut mine = 0u64;
     while !stop.load(Ordering::Relaxed) {
         if let Ok(Some(_)) =
