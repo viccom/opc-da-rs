@@ -264,6 +264,12 @@ mod tests {
         let (v, q, _ts) = ds.read("Random.Int4.0");
         assert_eq!(q, OPC_QUALITY_GOOD);
         assert_eq!(vt_of(&v), VT_I4);
+        // 值域断言（规则 7：验证意图）——Random.Int4 声明 range 0..=100。
+        let iv = variant_as_i4(&v).unwrap_or(-1);
+        assert!(
+            (0..=100).contains(&iv),
+            "Random.Int4 值域 [0,100]，实际 {iv}"
+        );
     }
 
     #[test]
@@ -280,6 +286,49 @@ mod tests {
         let (v, q, _) = ds.read("_System.Time");
         assert_eq!(q, OPC_QUALITY_GOOD);
         assert_eq!(vt_of(&v), VT_R8);
+    }
+
+    /// Square 波形：VT_R8 + 值只能是 0.0 或 100.0（方波两态）。
+    #[test]
+    #[allow(clippy::float_cmp)] // Square 输出 0.0/100.0 为 bit 级精确（无浮点运算误差），== 比较 OK
+    fn read_square_real8_is_vt_r8() {
+        let ds = SimDataSource::new(5);
+        let (v, q, _) = ds.read("Square.Real8.0");
+        assert_eq!(q, OPC_QUALITY_GOOD);
+        assert_eq!(vt_of(&v), VT_R8);
+        let val = variant_as_r8(&v).expect("Square.Real8 应 VT_R8");
+        assert!(
+            val == 0.0 || val == 100.0,
+            "Square 应 ∈ {{0.0, 100.0}}，实际 {val}"
+        );
+    }
+
+    /// Sawtooth 波形：VT_R8 + 值 ∈ [0, 100)（锯齿不到达上界）。
+    #[test]
+    fn read_sawtooth_real8_in_range() {
+        let ds = SimDataSource::new(5);
+        let (v, q, _) = ds.read("Sawtooth.Real8.0");
+        assert_eq!(q, OPC_QUALITY_GOOD);
+        assert_eq!(vt_of(&v), VT_R8);
+        let val = variant_as_r8(&v).expect("Sawtooth.Real8 应 VT_R8");
+        assert!(
+            (0.0..100.0).contains(&val),
+            "Sawtooth 值域 [0,100)，实际 {val}"
+        );
+    }
+
+    /// Triangle 波形：VT_R8 + 值 ∈ [0, 100]（三角可达上下界）。
+    #[test]
+    fn read_triangle_real8_in_range() {
+        let ds = SimDataSource::new(5);
+        let (v, q, _) = ds.read("Triangle.Real8.0");
+        assert_eq!(q, OPC_QUALITY_GOOD);
+        assert_eq!(vt_of(&v), VT_R8);
+        let val = variant_as_r8(&v).expect("Triangle.Real8 应 VT_R8");
+        assert!(
+            (0.0..=100.0).contains(&val),
+            "Triangle 值域 [0,100]，实际 {val}"
+        );
     }
 
     #[test]
@@ -378,5 +427,14 @@ mod tests {
     fn vt_of(v: &VARIANT) -> VARENUM {
         // SAFETY: 只读 vt 判别字段；v 是自构造有效 VARIANT。
         unsafe { (*v.Anonymous.Anonymous).vt }
+    }
+
+    /// 解析 `VT_R8` VARIANT → f64；类型不符返回 `None`（测试辅助，集中 unsafe）。
+    fn variant_as_r8(v: &VARIANT) -> Option<f64> {
+        // SAFETY: 只读 vt 判别 + dblVal；v 是自构造有效 VARIANT。
+        unsafe {
+            ((*v.Anonymous.Anonymous).vt == VT_R8)
+                .then_some((*v.Anonymous.Anonymous).Anonymous.dblVal)
+        }
     }
 }
