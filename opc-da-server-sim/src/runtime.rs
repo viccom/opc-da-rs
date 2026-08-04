@@ -89,6 +89,15 @@ pub fn run_unregister() -> Result<()> {
     Ok(())
 }
 
+/// exe 同目录（SCM 启动时 cwd 不可靠——system32；配置 ini / 日志目录均以 exe 相对）。
+// 模块 `runtime` 在 main.rs 中私有声明 → `pub` 仅 crate 内可见（clippy redundant_pub_crate）。
+pub fn exe_dir() -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+}
+
 pub fn run_server() -> Result<()> {
     let count = read_count();
     // SAFETY: 标准 EXE server 启动序列（复制 opc-da-server/src/bin/opc-da-server.rs:83-119）。
@@ -117,10 +126,15 @@ pub fn run_server() -> Result<()> {
             REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
         )?;
         CoResumeClassObjects()?;
-        eprintln!(
-            "opc-da-server-sim: serving (ProgID={}, {} tags, Ctrl+C 退出)",
+        tracing::info!(
+            "opc-da-server-sim: serving (ProgID={}, {} tags, count={}, Ctrl+C 退出)",
             PROG_ID,
-            8 * count + 1
+            8 * count + 1,
+            count
+        );
+        tracing::info!(
+            "详细日志: {}\\logs\\opc-da-server-sim.log（debug 级，每日滚动）",
+            exe_dir().display()
         );
         loop {
             std::thread::sleep(Duration::from_secs(1));

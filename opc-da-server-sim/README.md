@@ -16,7 +16,7 @@
 | tag 集 | 8 类型模板 × `count` + `_System.Time` 单例；默认 `count=100` → 801 tag |
 | 命名空间 | hierarchical，按 `.` 自动建树（如 `Random.Int4.7`）|
 | 值生成 | read-time 纯计算：random / square / sawtooth / triangle / altbool / systime；`BucketBrigade`/`WriteTag` 可写（write-store / read-load）|
-| 规模化 | env `OPC_DA_SIM_COUNT`（默认 100，上限 100 000）→ 最高 ≈ 80 万 tag，支撑大规模订阅 |
+| 规模化 | 配置文件 `opc-da-server-sim.ini` 的 `count = N`（默认 100，上限 100 000）→ 最高 ≈ 80 万 tag，支撑大规模订阅 |
 | 数据质量 | 已知 item `OPC_QUALITY_GOOD`（0xC0）；未知 / 越界 index `OPC_QUALITY_BAD`（0x00）|
 
 ## 架构
@@ -65,13 +65,41 @@ target\debug\opc-da-server-sim.exe /UnregServer    # 清注册项（幂等）
 # 默认 count=100（801 tag）
 target\debug\opc-da-server-sim.exe
 
-# 大规模（80001 tag，用于压测订阅规模化）
-$env:OPC_DA_SIM_COUNT = "10000"
-target\debug\opc-da-server-sim.exe
+# 大规模（80001 tag，用于压测订阅规模化）——写 exe 同目录配置文件
+# opc-da-server-sim.ini 内容：count = 10000
 ```
 
 启动后输出 `opc-da-server-sim: serving (ProgID=opc-da-rs.Sim.1, N tags, Ctrl+C 退出)` 并阻塞。
 **Ctrl+C 终止**（库 `LockServer` 暂为 no-op，无优雅退出路径，见下「已知限制」）。
+
+### tag 数量配置（`opc-da-server-sim.ini`）
+
+**不要用环境变量**——OPC client 经 SCM 按 `LocalServer32` 启动 server 时**不继承 shell 环境变量**
+（之前版本实测 `$env:OPC_DA_SIM_COUNT = "10000"` 无效，count 落回 100）。改为读取
+**exe 同目录**下的 `opc-da-server-sim.ini`：
+
+```ini
+# opc-da-server-sim.ini（与 exe 同目录，如 target\release\）
+count = 10000
+```
+
+- 解析规则：逐行找 `count` 开头 + `=` + 数字的行；`1..=100000` 之外 clamp 回默认 100。
+- 文件缺失 → fallback 环境变量 `OPC_DA_SIM_COUNT` → 再 fallback 默认 100。
+- **手动启动和 SCM 自动启动都会读 ini**——client 直接拽起的实例同样带 count。
+
+### 日志（`<exe 同目录>\logs\`）
+
+SCM 拽起的 server 无控制台，日志写**文件**（`tracing`，`DEBUG` 级，每日滚动）：
+
+```
+target\release\logs\opc-da-server-sim.log.YYYY-MM-DD
+```
+
+- 内容：库 `opc-da-server` 的 COM 方法日志（`AddGroup` / `AddItems`（含 item_id 与成败）/
+  `SyncIO::Read` / `Write` / `Advise` / `Unadvise` / `BrowseOPCItemIDs`（含返回数））+ sim 启动信息。
+- 手动启动时 stderr 同步输出同一份日志（`RUST_LOG` 可覆盖级别，但默认固定 `DEBUG`）。
+- 排查 client 互操作问题：看 `AddItems` 行的 `item=` / `result=` 是否 `invalid`（item_id 不在
+  命名空间），`BrowseOPCItemIDs` 的 `count=` 是否符合预期。
 
 ## tag 类型表
 
@@ -89,11 +117,13 @@ target\debug\opc-da-server-sim.exe
 
 `{i}` = 0..count-1。browse 树形：`Random → Int4 → {0,1,...}`（数字索引叶）。
 
-## 环境变量
+## 配置优先级
 
-| 变量 | 默认 | 范围 | 说明 |
-|---|---|---|---|
-| `OPC_DA_SIM_COUNT` | 100 | 1..=100 000 | 每类型实例数（上限防 OOM）|
+| 来源 | 说明 |
+|---|---|
+| `opc-da-server-sim.ini`（exe 同目录）| **首选**。`count = N` 行；SCM 自动启动也生效 |
+| `OPC_DA_SIM_COUNT`（环境变量）| fallback；仅手动启动（终端继承 env）时可靠 |
+| 默认 | 100（801 tag）|
 
 ## 测试
 
@@ -108,11 +138,12 @@ OPC client 手测（browse / read / write / subscribe）。
 
 - **Ctrl+C 退出**：库 `IClassFactory::LockServer` 暂为 no-op，`CoReleaseServerProcess()==0` 优雅退出未接线
   （库后续阶段实装）；目前靠控制台默认 Ctrl+C 终止。
-- **SCM 自动启动不带 env**：若 client 触发 SCM 按 `LocalServer32` 自动启动（用户未手动开 server），
-  `OPC_DA_SIM_COUNT` 不被继承 → count 落回默认 100。主场景（手动启动 + client 连）不受影响。
 - **远程 DCOM 激活**：跨机连接需 `OPCproxy.dll` + server 以 Windows Service / RunAs 方式运行
   （console EXE 仅本机激活）。本机 e2e 不涉及。
 - **`/RegServer` 需管理员**：写 `HKLM` / `HKCR`。
+- **0-item 请求**：库对 `AddItems(0)` / `Read(0)` / `RemoveItems(0)` 返回 `S_OK` + out=null（空操作
+  成功）。部分 client（如 Prosys）发 0-item 请求做连接握手；旧实现返 `E_POINTER` 且不写 out，
+  client 读未初始化 out 会进程内崩溃（`Read of address xxx`）。
 
 ## 与 `opc-da-server` 库的关系
 
