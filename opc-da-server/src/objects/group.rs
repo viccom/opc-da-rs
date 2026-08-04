@@ -1,8 +1,9 @@
-//! Group 对象——阶段 1。
+//! Group 对象。
 //!
 //! [`GroupObj`] 实现 `IOPCItemMgt` + `IOPCSyncIO` + `IOPCGroupStateMgt` + `IConnectionPointContainer`
-//! （`FindConnectionPoint` 已实装；`EnumConnectionPoints` 暂 `E_NOTIMPL`）+ `IOPCAsyncIO2`（骨架）。
-//! 订阅推送由 `publisher` 模块（§10）周期调 `OnDataChange`（`GroupObj::new` 启动后台线程）。
+//! （`FindConnectionPoint` 已实装；`EnumConnectionPoints` 暂 `E_NOTIMPL`）+ `IOPCAsyncIO2`（Refresh2
+//! 已实装；Read/Write/Cancel2/SetEnable/GetEnable 暂 `E_NOTIMPL`）。订阅推送由全局 `scheduler`
+//! 周期调 `publisher::push_data_change` → `OnDataChange`（`GroupObj::new` 注册 job 到调度器）。
 //! `IOPCItemMgt`：`AddItems` / `ValidateItems` / `RemoveItems` / `SetActiveState` /
 //! `SetClientHandles`——item 注册表（[`GroupInner`]）+ DataSource 元数据 + COM 内存。
 //! `IOPCSyncIO`：`Read`（DataSource::read → OPCITEMSTATE[]{hClient,ft,quality,vDataValue}）
@@ -11,15 +12,6 @@
 //! / `SetName`；`CloneGroup` 暂 `E_NOTIMPL`。
 //!
 //! `SetDatatypes` / `CreateEnumerator` 暂 `E_NOTIMPL`（后续阶段）。
-
-// `#[implement]` 展开的 COM 胶水（`_Impl`/`_Vtbl`）触发若干 pedantic lints；与
-// `class_factory.rs` / `server.rs` 同模式 allow。
-#![allow(
-    clippy::ref_as_ptr,
-    clippy::inline_always,
-    clippy::undocumented_unsafe_blocks,
-    clippy::not_unsafe_ptr_arg_deref
-)]
 
 use std::collections::HashMap;
 use std::mem::size_of;
@@ -181,6 +173,7 @@ impl GroupObj {
             h_client_group,
             h_server_group,
         }));
+        // data_cp 未 attach container（见 ConnectionPoint::GetConnectionPointContainer 注释）。
         let data_cp: IConnectionPoint = ConnectionPoint::<IOPCDataCallback>::new().into();
         // 注册全局推送调度器（替代旧 per-group spawn；Scheduler 未 init 时 global() 返
         // None 跳过——兼容单测。h_server_group 作 GroupKey，update_rate 作周期）。
@@ -434,6 +427,7 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
         Ok(())
     }
 
+    // TODO(后续阶段): SetDatatypes（强制 item 请求类型，覆盖 canonical）。
     fn SetDatatypes(
         &self,
         _dwcount: u32,
@@ -444,6 +438,7 @@ impl IOPCItemMgt_Impl for GroupObj_Impl {
         nyi()
     }
 
+    // TODO(后续阶段): CreateEnumerator（返 group items 枚举器）。
     fn CreateEnumerator(&self, _riid: *const GUID) -> Result<IUnknown> {
         nyi()
     }
@@ -641,6 +636,7 @@ impl IOPCGroupStateMgt_Impl for GroupObj_Impl {
         Ok(())
     }
 
+    // TODO(后续阶段): CloneGroup（深拷贝 group state + items 到新 group）。
     fn CloneGroup(&self, _szname: &PCWSTR, _riid: *const GUID) -> Result<IUnknown> {
         nyi()
     }
@@ -738,6 +734,7 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
 }
 
 impl IOPCAsyncIO2_Impl for GroupObj_Impl {
+    // TODO(后续阶段): AsyncIO2::Read（异步读 + OnReadComplete 回调，需事务表）。
     fn Read(
         &self,
         _dwcount: u32,
@@ -749,6 +746,7 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
         nyi()
     }
 
+    // TODO(后续阶段): AsyncIO2::Write（异步写 + OnWriteComplete 回调，需事务表）。
     fn Write(
         &self,
         _dwcount: u32,
@@ -787,20 +785,24 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
         Ok(cancel_id)
     }
 
+    // TODO(后续阶段): Cancel2（取消未完成 async 事务，需事务表）。
     fn Cancel2(&self, _dwcancelid: u32) -> Result<()> {
         nyi()
     }
 
+    // TODO(后续阶段): SetEnable（group 回调总开关）。
     fn SetEnable(&self, _benable: BOOL) -> Result<()> {
         nyi()
     }
 
+    // TODO(后续阶段): GetEnable（读 group enable 状态）。
     fn GetEnable(&self) -> Result<BOOL> {
         nyi()
     }
 }
 
 impl IConnectionPointContainer_Impl for GroupObj_Impl {
+    // TODO(后续阶段): EnumConnectionPoints（枚举 Group 的 cp：IOPCDataCallback）。
     fn EnumConnectionPoints(&self) -> Result<IEnumConnectionPoints> {
         nyi()
     }

@@ -1,10 +1,13 @@
-//! OPC DA server COM 对象（Server / Group / ConnectionPoint）。
+//! OPC DA server COM 对象（Server / Group / ConnectionPoint / 调度器）。
 //!
-//! 阶段 0：`ServerObj` 空壳 spike（2 接口共存验证）。
-//! 阶段 1（进行中）：
-//! - `ConnectionPoint<T>` 通用连接点（Group/Server 订阅推送的 sink 表）。
-//! - `GroupObj` 5 接口骨架（IOPCItemMgt/IOPCGroupStateMgt/IOPCSyncIO/IOPCAsyncIO2/
-//!   IConnectionPointContainer）。
+//! - `ConnectionPoint<T>`：通用连接点（Group/Server 订阅推送的 sink 表）。
+//! - `GroupObj`：`IOPCItemMgt` / `IOPCGroupStateMgt` / `IOPCSyncIO` / `IOPCAsyncIO2`（Refresh2）
+//!   / `IConnectionPointContainer`。
+//! - `ServerObj`：`IOPCServer` / `IOPCCommon` / `IConnectionPointContainer` / `IOPCItemProperties`
+//!   / `IOPCBrowseServerAddressSpace`（flat + hierarchical）。
+//! - `scheduler`：统一推送调度（时间轮 + worker 池，替 per-group 线程）。
+//! - `publisher`：推送纯数据函数（`enumerate_sinks` + `push_data_change`）。
+//! - `browse`：`IEnumString`（browse item id 枚举器）。
 
 mod browse;
 mod connection_point;

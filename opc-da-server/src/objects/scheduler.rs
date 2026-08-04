@@ -29,7 +29,6 @@
 )]
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -117,8 +116,6 @@ struct Bucket {
 struct JobQueue {
     inner: Mutex<VecDeque<Arc<PublishJob>>>,
     notify: Condvar,
-    /// 仅供 [`JobQueue::pop`] 在 poison/调试时观察；当前未用于停机（进程退出强杀线程）。
-    _shutdown: AtomicBool,
 }
 
 impl JobQueue {
@@ -126,7 +123,6 @@ impl JobQueue {
         Self {
             inner: Mutex::new(VecDeque::new()),
             notify: Condvar::new(),
-            _shutdown: AtomicBool::new(false),
         }
     }
 
@@ -225,7 +221,9 @@ fn tick_once(s: &Scheduler) {
             if now < bucket.next_tick {
                 continue;
             }
-            bucket.next_tick += *rate;
+            // 对齐 now+rate（非 +=rate）：系统卡顿积累后 += 会让桶持续到期触发 catch-up 风暴；
+            // 对齐丢弃历史滞后，无滞后时与 += 等价。
+            bucket.next_tick = now + *rate;
             for job in &bucket.jobs {
                 due.push(Arc::clone(job));
             }
@@ -272,6 +270,10 @@ fn push_one(job: &PublishJob) {
         buf.v.clear();
         buf.q.clear();
         buf.ts.clear();
+        // 注：read 在持 job.inner 锁内执行（与 group.rs::Read 的「锁外 read」模式不同）。当前
+        // GeneratedDataSource::read 是纯计算无 IO，可接受；若未来接入协议网关 DataSource（Modbus/
+        // S7/UA，含网络 IO），需改为锁内取 (item_id, deadband, last_pushed) 快照、锁外 read +
+        // should_push、再锁内更新 last_pushed，避免长持锁阻塞同 group 的 sync Read / Refresh2。
         let h_group = {
             let mut g = locked(&job.inner);
             let deadband = g.percent_deadband;

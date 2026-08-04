@@ -15,21 +15,13 @@
 //! `IOPCCommon`（M7b）：`GetErrorString` 已实装（HRESULT→描述串）；
 //! `SetLocaleID` / `GetLocaleID` / `QueryAvailableLocaleIDs` / `SetClientName` 简化实装。
 
-// `#[implement]` 展开的 COM 胶水触发若干 pedantic lints；与 `subscription.rs` 同模式 allow。
-#![allow(
-    clippy::ref_as_ptr,
-    clippy::inline_always,
-    clippy::undocumented_unsafe_blocks,
-    clippy::not_unsafe_ptr_arg_deref
-)]
-
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::ptr::copy_nonoverlapping;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::Foundation::{
-    E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, S_OK,
+    E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, FILETIME, S_OK,
 };
 use windows::Win32::System::Com::{
     CoTaskMemAlloc, CoTaskMemFree, IConnectionPoint, IConnectionPointContainer,
@@ -69,6 +61,8 @@ use crate::objects::{ConnectionPoint, GroupObj, StringEnum, pwstr_to_string};
 pub struct ServerObj {
     inner: Mutex<ServerInner>,
     data_source: Arc<dyn DataSource>,
+    /// 进程启动时刻（构造时记录一次；`GetStatus::ftStartTime` 固定填此，client 据此算 uptime）。
+    start_time: FILETIME,
     /// shutdown sink 连接点（`IConnectionPoint` 接口，指向 `ConnectionPoint<IOPCShutdown>`
     /// COM 对象，refcount 由 COM 自管）。`FindConnectionPoint(IOPCShutdown)` 返回它的 clone。
     shutdown_cp: IConnectionPoint,
@@ -87,6 +81,8 @@ impl ServerObj {
         Self {
             inner: Mutex::new(ServerInner::new()),
             data_source,
+            start_time: now_filetime(),
+            // shutdown_cp 未 attach container（见 ConnectionPoint::GetConnectionPointContainer 注释）。
             shutdown_cp: ConnectionPoint::<IOPCShutdown>::new().into(),
         }
     }
@@ -146,6 +142,23 @@ fn error_string(hr: HRESULT) -> String {
         _ => return format!("HRESULT 0x{:08X}", hr.0 as u32),
     };
     core.to_string()
+}
+
+/// `HRESULT` → `CoTaskMemAlloc` wide `PWSTR`（`IOPCServer::GetErrorString` 与
+/// `IOPCCommon::GetErrorString` 共用；所有权交 client，client `CoTaskMemFree`）。
+fn error_string_pwstr(hr: HRESULT) -> Result<PWSTR> {
+    let msg = error_string(hr);
+    let w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
+    // SAFETY: CoTaskMemAlloc w.len()*2 字节；失败 null。
+    let ptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
+    if ptr.is_null() {
+        return Err(E_OUTOFMEMORY.into());
+    }
+    // SAFETY: ptr 刚分配足够空间；拷贝描述串 wide（含 null）。
+    unsafe {
+        copy_nonoverlapping(w.as_ptr(), ptr, w.len());
+    }
+    Ok(PWSTR(ptr))
 }
 
 impl IOPCServer_Impl for ServerObj_Impl {
@@ -218,10 +231,12 @@ impl IOPCServer_Impl for ServerObj_Impl {
         Ok(())
     }
 
-    fn GetErrorString(&self, _dwerror: HRESULT, _dwlocale: u32) -> Result<PWSTR> {
-        nyi()
+    fn GetErrorString(&self, dwerror: HRESULT, _dwlocale: u32) -> Result<PWSTR> {
+        // 与 IOPCCommon::GetErrorString 一致；dwlocale 忽略（错误串固定英文）。
+        error_string_pwstr(dwerror)
     }
 
+    // TODO(后续阶段): GetGroupByName（按 name 查 group，需 name→handle 索引）。
     fn GetGroupByName(&self, _szname: &PCWSTR, _riid: *const GUID) -> Result<IUnknown> {
         nyi()
     }
@@ -248,7 +263,7 @@ impl IOPCServer_Impl for ServerObj_Impl {
             // 当前时间（client 解析 FILETIME 需 >= UNIX_EPOCH；零值会被判 before-epoch）。
             let now = now_filetime();
             *status = tagOPCSERVERSTATUS {
-                ftStartTime: now,
+                ftStartTime: self.start_time,
                 ftCurrentTime: now,
                 ftLastUpdateTime: now,
                 dwServerState: OPC_STATUS_RUNNING,
@@ -272,6 +287,7 @@ impl IOPCServer_Impl for ServerObj_Impl {
         }
     }
 
+    // TODO(后续阶段): CreateGroupEnumerator（按 scope 枚举 server 的 group）。
     fn CreateGroupEnumerator(
         &self,
         _dwscope: tagOPCENUMSCOPE,
@@ -312,18 +328,7 @@ impl IOPCCommon_Impl for ServerObj_Impl {
     }
 
     fn GetErrorString(&self, dwerror: HRESULT) -> Result<PWSTR> {
-        let msg = error_string(dwerror);
-        let w: Vec<u16> = msg.encode_utf16().chain(std::iter::once(0)).collect();
-        // SAFETY: CoTaskMemAlloc w.len()*2 字节；失败 null。
-        let ptr = unsafe { CoTaskMemAlloc(w.len() * 2) }.cast::<u16>();
-        if ptr.is_null() {
-            return Err(E_OUTOFMEMORY.into());
-        }
-        // SAFETY: ptr 刚分配足够空间；拷贝描述串 wide（含 null）。
-        unsafe {
-            copy_nonoverlapping(w.as_ptr(), ptr, w.len());
-        }
-        Ok(PWSTR(ptr))
+        error_string_pwstr(dwerror)
     }
 
     fn SetClientName(&self, _szname: &PCWSTR) -> Result<()> {
@@ -333,6 +338,7 @@ impl IOPCCommon_Impl for ServerObj_Impl {
 }
 
 impl IConnectionPointContainer_Impl for ServerObj_Impl {
+    // TODO(后续阶段): EnumConnectionPoints（枚举 Server 暴露的 cp：IOPCShutdown）。
     fn EnumConnectionPoints(&self) -> Result<IEnumConnectionPoints> {
         nyi()
     }

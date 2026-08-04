@@ -2,9 +2,10 @@
 //!
 //! 命令行：
 //! - `/RegServer`   写 HKCR 注册项（CLSID/ProgID/CATID/AppID），需管理员，注册后退出。
-//! - `/UnregServer` 清注册项（阶段 0 占位）。
+//! - `/UnregServer` 清注册项（递归删 CLSID/ProgID/AppID 子树，64+32 位视图，幂等）。
 //! - 无参          启动服务循环：注册类对象 + 阻塞（被 SCM 经 `-Embedding` 拉起时）。
 
+use std::path::Path;
 use std::time::Duration;
 
 use opc_da_client::bindings::da::{CATID_OPCDAServer10, CATID_OPCDAServer20, CATID_OPCDAServer30};
@@ -16,7 +17,28 @@ use windows::Win32::System::Com::{
     CoResumeClassObjects, EOAC_NONE, IClassFactory, REGCLS_MULTIPLEUSE, REGCLS_SUSPENDED,
     RPC_C_AUTHN_LEVEL_CONNECT, RPC_C_IMP_LEVEL_IDENTIFY,
 };
-use windows::core::{Interface, Result};
+use windows::core::{GUID, Interface, Result};
+
+/// server 实现的 OPC DA 规范版本 CATID（注册 Implemented Categories 用）。
+const CATIDS: [GUID; 3] = [
+    CATID_OPCDAServer10::IID,
+    CATID_OPCDAServer20::IID,
+    CATID_OPCDAServer30::IID,
+];
+
+/// 构造 server 注册参数（`/RegServer` 与 `/UnregServer` 共用）。
+fn build_registration(exe_path: &Path) -> ServerRegistration<'_> {
+    ServerRegistration {
+        clsid: CLSID_OPC_DA_SERVER,
+        prog_id: "opc-da-rs.Server.1",
+        version_independent_prog_id: "opc-da-rs.Server",
+        exe_path,
+        catids: &CATIDS,
+        // AppID 复用 CLSID（DCOM 远程激活所需；独立 AppID 待 DCOM 多实例部署再分）。
+        app_id: CLSID_OPC_DA_SERVER,
+        description: "opc-da-rs OPC DA Server",
+    }
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -32,21 +54,7 @@ fn main() -> Result<()> {
 /// /RegServer：写注册表后退出。
 fn run_register() -> Result<()> {
     let exe_path = std::env::current_exe()?;
-    let catids = [
-        CATID_OPCDAServer10::IID,
-        CATID_OPCDAServer20::IID,
-        CATID_OPCDAServer30::IID,
-    ];
-    let reg = ServerRegistration {
-        clsid: CLSID_OPC_DA_SERVER,
-        prog_id: "opc-da-rs.Server.1",
-        version_independent_prog_id: "opc-da-rs.Server",
-        exe_path: &exe_path,
-        catids: &catids,
-        // 阶段 0 简化：AppID 复用 CLSID（阶段 3 DCOM 再独立分配）。
-        app_id: CLSID_OPC_DA_SERVER,
-        description: "opc-da-rs OPC DA Server",
-    };
+    let reg = build_registration(&exe_path);
     register(&reg)?;
     eprintln!(
         "opc-da-server: registered (ProgID={}, CLSID={{...}})",
@@ -55,23 +63,10 @@ fn run_register() -> Result<()> {
     Ok(())
 }
 
-/// /UnregServer：清注册表（阶段 0 占位）。
+/// /UnregServer：递归清 HKCR 注册项（64+32 位视图，幂等）。
 fn run_unregister() -> Result<()> {
     let exe_path = std::env::current_exe()?;
-    let catids = [
-        CATID_OPCDAServer10::IID,
-        CATID_OPCDAServer20::IID,
-        CATID_OPCDAServer30::IID,
-    ];
-    let reg = ServerRegistration {
-        clsid: CLSID_OPC_DA_SERVER,
-        prog_id: "opc-da-rs.Server.1",
-        version_independent_prog_id: "opc-da-rs.Server",
-        exe_path: &exe_path,
-        catids: &catids,
-        app_id: CLSID_OPC_DA_SERVER,
-        description: "opc-da-rs OPC DA Server",
-    };
+    let reg = build_registration(&exe_path);
     unregister(&reg)?;
     eprintln!(
         "opc-da-server: unregistered (ProgID={}, CLSID={{...}})",
@@ -82,9 +77,9 @@ fn run_unregister() -> Result<()> {
 
 /// 服务循环：注册类对象 + 阻塞。
 ///
-/// 阶段 0 占位——主循环仅 `sleep` 保持进程存活（让 worker 线程服务 `CoCreateInstance`
-/// 激活）。后续阶段按 `CoReleaseServerProcess()==0` 或 `IOPCShutdown` 优雅
-/// `CoRevokeClassObject` 退出。
+/// 主循环 `sleep` 保持进程存活（让 worker 线程服务 `CoCreateInstance` 激活）。Ctrl+C 强退；
+/// 优雅退出（`CoReleaseServerProcess()==0` / `IOPCShutdown` → `CoRevokeClassObject`）待
+/// `LockServer` 接线后启用（见 `class_factory::LockServer` TODO）。
 fn run_server() -> Result<()> {
     // SAFETY: COM 注册/恢复为标准 EXE server 启动序列。
     unsafe {

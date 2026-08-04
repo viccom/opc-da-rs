@@ -9,15 +9,6 @@
 //! `ConnectionPoint<IOPCShutdown>`、Group 上的 `ConnectionPoint<IOPCDataCallback>`）
 //! 及其 `IEnumConnections` 实现 [`EnumConnectionsObj`]。
 
-// `#[implement]` 展开的 COM 胶水（`_Impl`/`_Vtbl`）触发若干 pedantic lints；与
-// `class_factory.rs` / `subscription.rs` 同模式 allow。
-#![allow(
-    clippy::ref_as_ptr,
-    clippy::inline_always,
-    clippy::undocumented_unsafe_blocks,
-    clippy::not_unsafe_ptr_arg_deref
-)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -48,7 +39,7 @@ fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 ///   `Mutex` 守护订阅表，`AtomicU32` 分配 cookie（0 永不返回——COM 约定 0 无效）。
 ///
 /// 用法：[`ConnectionPoint::new`]，构造 container 后调 [`ConnectionPoint::attach_container`]
-/// 注入弱引用；推送时用 [`ConnectionPoint::sinks_snapshot`] 取全部 sink。
+/// 注入弱引用；推送遍历 sink 经 `IConnectionPoint::EnumConnections`（见 `publisher::enumerate_sinks`）。
 #[implement(IConnectionPoint)]
 pub struct ConnectionPoint<T>
 where
@@ -86,17 +77,6 @@ where
         }
     }
 
-    /// 当前订阅快照（`(cookie, sink)` 列表）。供订阅推送引擎（§10）遍历所有订阅者；
-    /// 每个 sink 克隆（COM `AddRef`）。
-    ///
-    /// 快照语义：返回调用瞬间的一份拷贝，之后对表的增删不影响已返回的迭代。
-    pub fn sinks_snapshot(&self) -> Vec<(u32, T)> {
-        locked(&self.sinks)
-            .iter()
-            .map(|(cookie, sink)| (*cookie, sink.clone()))
-            .collect()
-    }
-
     /// 当前订阅数（用于测试与状态上报）。
     pub fn advise_count(&self) -> usize {
         locked(&self.sinks).len()
@@ -132,6 +112,10 @@ where
         Ok(<T as Interface>::IID)
     }
 
+    // 注：container 弱引用经 `attach_container` 注入；当前 ServerObj/GroupObj 构造 cp 后未调
+    // attach_container（字段已是 `IConnectionPoint` 接口类型，取不回 `ConnectionPoint<T>` 具体
+    // 类型），故本方法恒返 `E_POINTER`。本 workspace client 走 forward 方向（container→cp），
+    // 不反向调此方法，影响为零；需 strictness 时改两阶段构造接线。
     fn GetConnectionPointContainer(&self) -> Result<IConnectionPointContainer> {
         let guard = locked(&self.container);
         match guard.as_ref().and_then(Weak::upgrade) {

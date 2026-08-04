@@ -1,4 +1,4 @@
-//! 数据源抽象 + 默认 `SimDataSource`——阶段 1。
+//! 数据源抽象 + 默认 `SimDataSource`。
 //!
 //! server 的所有数据来自 [`DataSource`]（设计 §9）。`SimDataSource` 镜像
 //! Matrikon.OPC.Simulation 的标签集（`Random.Int4` / `Random.Real8` /
@@ -7,8 +7,8 @@
 //!
 //! 设计 §9 描述的"后台 tokio task 周期刷新缓存"在此用 **read-time 计算**实现：
 //! 随机/方波/计数器的值都是时间的函数，`read` 取当前时刻值等价于读取一个被周期
-//! 刷新的缓存。`IOPCSyncIO::Read` 完全正确；publisher 引擎（§10）若需推送缓存
-//! 再加独立 task。这是未来"协议网关 DataSource"（Modbus/S7/UA 桥接）的扩展点。
+//! 刷新的缓存。`IOPCSyncIO::Read` 完全正确；订阅推送经 `scheduler` 周期调 `read`（无独立
+//! 缓存 task）。这是未来"协议网关 DataSource"（Modbus/S7/UA 桥接）的扩展点。
 
 use std::collections::HashSet;
 use std::sync::Arc;

@@ -17,10 +17,19 @@
 //!
 //! ## 状态
 //!
-//! 阶段 0（COM 地基）实现中。参见
+//! COM 地基 + Server/Group 多接口 + flat/hierarchical 浏览 + 订阅推送（统一调度）+ 注册
+//! 已实装；部分 client 用的接口方法仍为 `E_NOTIMPL`（见各处 `TODO(后续阶段)`）。设计参见
 //! `docs/superpowers/specs/2026-08-02-opc-da-server-design.md`。
 
 #![allow(unsafe_code)]
+// `#[implement]` 宏展开的 COM 胶水（`_Impl`/`_Vtbl`）触发若干 pedantic lints——crate 级统一
+// allow（原散布于 class_factory / browse / connection_point / server / group 各模块级，去重上提）。
+#![allow(
+    clippy::ref_as_ptr,
+    clippy::inline_always,
+    clippy::undocumented_unsafe_blocks,
+    clippy::not_unsafe_ptr_arg_deref
+)]
 
 // 非 Windows 目标：单条友好错误，而非一串 unresolved-import。
 #[cfg(not(target_os = "windows"))]

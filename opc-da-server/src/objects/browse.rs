@@ -4,14 +4,6 @@
 //!（client `CoTaskMemFree` 每个）。游标只前进；`Reset` 归零；`Clone` 复制快照+游标。
 //! 参考 `opc-da-client` 的 `MockEnumString`（`iterator.rs`）模式，server 侧自实现。
 
-// `#[implement]` 展开的 COM 胶水触发若干 pedantic lints；同 group.rs 模式 allow。
-#![allow(
-    clippy::ref_as_ptr,
-    clippy::inline_always,
-    clippy::undocumented_unsafe_blocks,
-    clippy::not_unsafe_ptr_arg_deref
-)]
-
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::Foundation::{E_OUTOFMEMORY, E_POINTER, S_FALSE, S_OK};

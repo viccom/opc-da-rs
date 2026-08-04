@@ -1,18 +1,10 @@
 //! `IClassFactory` —— COM 类工厂，让 SCM / `CoCreateInstance` 能实例化 Server 对象。
 
-// `#[implement]` 展开的 COM 胶水（`_Impl`/`_Vtbl`）触发若干 pedantic lints；与
-// `opc-da-client` 的 `subscription.rs` 同模式 allow。
-#![allow(
-    clippy::ref_as_ptr,
-    clippy::inline_always,
-    clippy::undocumented_unsafe_blocks,
-    clippy::not_unsafe_ptr_arg_deref
-)]
-
 use std::sync::Arc;
 
+use windows::Win32::Foundation::CLASS_E_NOAGGREGATION;
 use windows::Win32::System::Com::{IClassFactory, IClassFactory_Impl};
-use windows::core::{BOOL, GUID, IUnknown, Interface, Ref, Result, implement};
+use windows::core::{BOOL, Error, GUID, IUnknown, Interface, Ref, Result, implement};
 
 use crate::data_source::DataSource;
 use crate::objects::ServerObj;
@@ -48,8 +40,10 @@ impl IClassFactory_Impl for Factory_Impl {
         riid: *const GUID,
         object: *mut *mut core::ffi::c_void,
     ) -> Result<()> {
-        // 不支持 aggregation。后续改返回 CLASS_E_NOAGGREGATION（不 panic）。
-        assert!(outer.is_null(), "aggregation not supported");
+        // 不支持 aggregation——规范返回 CLASS_E_NOAGGREGATION（COM 约定，不 panic）。
+        if !outer.is_null() {
+            return Err(Error::from(CLASS_E_NOAGGREGATION));
+        }
         let unknown: IUnknown = ServerObj::with_data_source(self.data_source.clone()).into();
         // SAFETY: `riid`（COM 运行时提供）为有效 GUID；`object` 为调用方提供的 out 指针。
         // query 成功则写入请求接口指针，失败则不改 `*object`（COM QueryInterface 语义）。
@@ -57,15 +51,15 @@ impl IClassFactory_Impl for Factory_Impl {
     }
 
     fn LockServer(&self, lock: BOOL) -> Result<()> {
-        // stub：自激活测试不依赖 LockServer。后续实装调
-        // CoAddRefServerProcess / CoReleaseServerProcess 维持进程存活。
+        // TODO(后续阶段): 实装 LockServer——调 CoAddRefServerProcess/CoReleaseServerProcess
+        // 维持进程存活（配合 run_server 的 CoReleaseServerProcess()==0 优雅退出）。当前 no-op。
         let _ = lock;
         Ok(())
     }
 }
 
-/// 阶段 0 测试用 CLSID（占位，待正式分配）。
-#[allow(dead_code)]
+/// server COM CLSID（`/RegServer` 写 HKCR 用；e2e/压测经此 CLSID 的 ProgID 连接）。
+#[allow(dead_code)] // 生产路径经 bin（不同 crate）按 ProgID 连接；本 crate 内仅测试直接用。
 pub const CLSID_OPC_DA_SERVER: GUID = GUID::from_u128(0x9a7b_3c2d_4e5f_6789_abcd_ef01_2345_6789);
 
 #[cfg(test)]
@@ -79,7 +73,7 @@ mod tests {
         REGCLS_SUSPENDED,
     };
 
-    /// 阶段 0 自激活：同进程 `CoRegisterClassObject` + `CoCreateInstance` 命中，
+    /// 自激活测试：同进程 `CoRegisterClassObject` + `CoCreateInstance` 命中，
     /// 验证 IClassFactory + ServerObj + COM 激活整条链。QI 到 IOPCServer / IOPCCommon。
     #[test]
     fn self_activate_via_coregister() {
@@ -102,7 +96,7 @@ mod tests {
                     .expect("CoCreateInstance");
             assert!(server.cast::<IOPCCommon>().is_ok(), "QI IOPCCommon 失败");
 
-            // 阶段 0 退出验证：GetStatus 返回有效结构（state / group_count / vendor）。
+            // 退出验证：GetStatus 返回有效结构（state / group_count / vendor）。
             // SAFETY: GetStatus（unsafe）+ 解引用返回结构 + CoTaskMemFree 均在 self_activate
             // 外层 unsafe 内。返回的 CoTaskMem 结构由调用方（client）释放。
             let status_ptr = server.GetStatus().expect("GetStatus");
@@ -113,6 +107,25 @@ mod tests {
             CoTaskMemFree(Some(status_ptr as *const _));
 
             CoRevokeClassObject(cookie).expect("CoRevokeClassObject");
+        }
+    }
+
+    /// aggregation 请求（outer 非 null）返回 CLASS_E_NOAGGREGATION（不 panic）。
+    #[test]
+    fn create_instance_rejects_aggregation() {
+        unsafe {
+            CoIncrementMTAUsage().expect("CoIncrementMTAUsage");
+            let factory: IClassFactory = Factory::default_sim().into();
+            // 任意 COM 对象作 outer（聚合控制 unknown）；outer 非 null 即拒。
+            let outer: IUnknown = Factory::default_sim().into();
+            // SAFETY: factory 同进程 implement；outer 有效。windows-rs 的 CreateInstance 是泛型
+            // 便利封装（内部 CreateInstance(outer, &T::IID, out)），outer 非 null 时返
+            // CLASS_E_NOAGGREGATION（不 panic、不写出指针）。
+            let err: windows::core::Result<IUnknown> = factory.CreateInstance(&outer);
+            assert_eq!(
+                err.expect_err("aggregation 应返错误").code(),
+                CLASS_E_NOAGGREGATION
+            );
         }
     }
 }

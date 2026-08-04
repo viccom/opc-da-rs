@@ -19,21 +19,33 @@ pub fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
     let Ok(en) = (unsafe { cp.EnumConnections() }) else {
         return sinks;
     };
+    // COM 枚举器一次 Next 最多返回 buf.len() 个；循环到取不满（到尾）或错误，避免单次 Next
+    // 截断（旧实现固定 64 单次 Next，sink > 64 会静默丢失后续订阅者的推送）。
     let mut buf: Vec<CONNECTDATA> = vec![CONNECTDATA::default(); 64];
-    let mut fetched = 0u32;
-    // SAFETY: en 枚举器接口；Next 写入 buf（容量 64）。
-    let _ = unsafe { en.Next(&mut buf, &raw mut fetched) };
-    for mut cd in buf.into_iter().take(fetched as usize) {
-        // pUnk: ManuallyDrop<Option<IUnknown>>。take 取出 owned Option<IUnknown>，
-        // cd drop 时 pUnk 已空（ManuallyDrop no-op），不 double-free。
-        // SAFETY: take 后 cd.pUnk 空；cd owned（into_iter 消费）。
-        let unk_opt: Option<windows::core::IUnknown> =
-            unsafe { std::mem::ManuallyDrop::take(&mut cd.pUnk) };
-        if let Some(unk) = unk_opt {
-            // cast = QI + AddRef，新 IOPCDataCallback ref；unk drop Release EnumConnections 给的 ref。
-            if let Ok(cb) = unk.cast::<IOPCDataCallback>() {
-                sinks.push(cb);
+    loop {
+        let mut fetched = 0u32;
+        // SAFETY: en 枚举器接口；Next 写入 buf（容量 64）。
+        let hr = unsafe { en.Next(&mut buf, &raw mut fetched) };
+        // 真正的错误码（非 S_OK/S_FALSE）→ 停（防错误枚举器死循环）。S_FALSE=1 是成功码，不停。
+        if hr.is_err() {
+            break;
+        }
+        for cd in buf.iter_mut().take(fetched as usize) {
+            // SAFETY: Next 写入 fetched 个有效 CONNECTDATA。pUnk 是 ManuallyDrop<Option<IUnknown>>
+            // ——take 取出 owned Option<IUnknown>；buf 复用前已 take 空，下轮 Next 覆盖时不
+            // double-free（ManuallyDrop drop 为 no-op）。
+            let unk_opt: Option<windows::core::IUnknown> =
+                unsafe { std::mem::ManuallyDrop::take(&mut cd.pUnk) };
+            if let Some(unk) = unk_opt {
+                // cast = QI + AddRef，新 IOPCDataCallback ref；unk drop Release 枚举器给的 ref。
+                if let Ok(cb) = unk.cast::<IOPCDataCallback>() {
+                    sinks.push(cb);
+                }
             }
+        }
+        // 取不满（到尾，Next 返 S_FALSE）→ 停。
+        if (fetched as usize) < buf.len() {
+            break;
         }
     }
     sinks
@@ -72,5 +84,85 @@ pub fn push_data_change(
                 errors.as_ptr(),
             )
         };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::objects::ConnectionPoint;
+    use opc_da_client::bindings::da::IOPCDataCallback_Impl;
+    use windows::Win32::System::Com::CoIncrementMTAUsage;
+    use windows::core::{IUnknown, implement};
+
+    /// 空 sink（仅作 Advise 目标，验证 `enumerate_sinks` 取尽 >buf 容量的 sink 不截断）。
+    #[implement(IOPCDataCallback)]
+    struct NopSink;
+
+    #[allow(clippy::too_many_arguments)] // COM vtable 签名固定（bindings 生成）
+    impl IOPCDataCallback_Impl for NopSink_Impl {
+        fn OnDataChange(
+            &self,
+            _dwtransid: u32,
+            _hgroup: u32,
+            _hrmasterquality: HRESULT,
+            _hrmastererror: HRESULT,
+            _dwcount: u32,
+            _phclientitems: *const u32,
+            _pvvalues: *const VARIANT,
+            _pwqualities: *const u16,
+            _pfttimestamps: *const FILETIME,
+            _perrors: *const HRESULT,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn OnReadComplete(
+            &self,
+            _dwtransid: u32,
+            _hgroup: u32,
+            _hrmasterquality: HRESULT,
+            _hrmastererror: HRESULT,
+            _dwcount: u32,
+            _phclientitems: *const u32,
+            _pvvalues: *const VARIANT,
+            _pwqualities: *const u16,
+            _pfttimestamps: *const FILETIME,
+            _perrors: *const HRESULT,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn OnWriteComplete(
+            &self,
+            _dwtransid: u32,
+            _hgroup: u32,
+            _hrmastererr: HRESULT,
+            _dwcount: u32,
+            _pclienthandles: *const u32,
+            _perrors: *const HRESULT,
+        ) -> windows::core::Result<()> {
+            Ok(())
+        }
+
+        fn OnCancelComplete(&self, _dwtransid: u32, _hgroup: u32) -> windows::core::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// 验证 `enumerate_sinks` 取尽 >buf(64) 个 sink——多轮 `Next` 迭代路径（首次返 64 + S_OK，
+    /// 二次返剩余 + S_FALSE），防 A2 回归（旧单次 Next 固定 64 会静默截断第 65+ 个订阅者）。
+    #[test]
+    fn enumerate_sinks_returns_all_above_buf_size() {
+        unsafe { CoIncrementMTAUsage() }.expect("CoIncrementMTAUsage");
+        const N: usize = 70; // > buf.len()(64)，触发第二次 Next
+        let cp: IConnectionPoint = ConnectionPoint::<IOPCDataCallback>::new().into();
+        for _ in 0..N {
+            let sink: IUnknown = NopSink.into();
+            // SAFETY: 同进程 implement 对象 Advise（直接走 vtable，不经 SCM）。
+            unsafe { cp.Advise(&sink) }.expect("Advise");
+        }
+        let sinks = enumerate_sinks(&cp);
+        assert_eq!(sinks.len(), N, ">64 sink 应全部返回（不截断）");
     }
 }
