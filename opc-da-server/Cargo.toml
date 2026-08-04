@@ -1,0 +1,32 @@
+[package]
+name = "opc-da-server"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "Native OPC DA Custom Server library for Rust — implement OPC DA servers as out-of-process COM servers"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["opc", "opc-da", "windows", "automation", "scada"]
+categories = ["api-bindings", "os::windows-apis"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+
+[lints]
+workspace = true
+
+[dependencies]
+# 复用 opc-da-client 的冻结 bindings / com_utils / typedefs（可见性暴露路径）。
+# path 优先（本地含可见性暴露）；version 仅作未来发布约束。
+opc-da-client = { path = "../opc-da-client", version = "0.3" }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = ["Win32_System_Registry"] }
+windows-core = { workspace = true }

@@ -1,0 +1,29 @@
+[package]
+name = "opc-da-server-sim"
+authors.workspace = true
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+description = "OPC DA Simulation Server example built on opc-da-server (mirrors Matrikon.OPC.Simulation.1)"
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["opc", "opc-da", "simulation", "windows", "scada"]
+categories = ["api-bindings", "os::windows-apis"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
+targets = ["x86_64-pc-windows-msvc"]
+
+[lints]
+workspace = true
+
+[dependencies]
+opc-da-server = { path = "../opc-da-server" }
+opc-da-client = { path = "../opc-da-client" }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-appender-localtime = "0.2.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true }

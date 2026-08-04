@@ -54,7 +54,7 @@ mod provider;
 
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
 #[allow(warnings)]
-mod bindings;
+pub mod bindings;
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
 pub mod com_worker;
 
@@ -85,6 +85,11 @@ pub use opc_da::{
     errors::{OpcError, OpcResult},
     typedefs::{AuthCredentials, GroupHandle, ItemHandle, ServerState, ServerStatus},
 };
+
+// COM 基础设施层：供 opc-da-server（及未来下游）复用。仅可见性暴露，零逻辑改动。
+// bindings 为 windows-bindgen 冻结产物（接口定义）；com_utils/typedefs 为内存工具与类型。
+#[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
+pub use opc_da::{com_utils, typedefs};
 
 #[cfg(all(target_os = "windows", feature = "opc-da-backend"))]
 pub use backend::{connector::ComConnector, opc_da::OpcDaClient};

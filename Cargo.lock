@@ -2281,6 +2281,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "opc-da-client-test"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "opc-da-client",
+ "tokio",
+ "windows",
+]
+
+[[package]]
 name = "opc-da-desktop"
 version = "0.1.0"
 dependencies = [
@@ -2296,6 +2306,31 @@ dependencies = [
  "tauri-plugin-dialog",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
+ "tracing-appender-localtime",
+ "tracing-subscriber",
+ "windows",
+]
+
+[[package]]
+name = "opc-da-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "opc-da-client",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "windows",
+ "windows-core",
+]
+
+[[package]]
+name = "opc-da-server-sim"
+version = "0.1.0"
+dependencies = [
+ "opc-da-client",
+ "opc-da-server",
  "tracing",
  "tracing-appender-localtime",
  "tracing-subscriber",
