@@ -6,6 +6,7 @@
 //! `Counter`/`Register` 放行（`S_OK`），未知/只读返 `E_ACCESSDENIED`，类型不符
 //! 返 `E_INVALIDARG`。
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -90,6 +91,8 @@ fn now_filetime() -> FILETIME {
 pub struct SimDataSource {
     ns: NamespaceTree,
     start: Instant,
+    /// 所有合法 item_id（O(1) 存在性判断；越界 index / 未知 id 在此拦截）。
+    leaves: HashSet<String>,
     counter_regs: Vec<AtomicI32>,
     write_regs: Vec<AtomicI32>,
 }
@@ -102,9 +105,11 @@ impl SimDataSource {
         let ids = expand_ids(count);
         let root = build_namespace_tree(&ids);
         let ns = NamespaceTree::from_tree(root);
+        let leaves: HashSet<String> = ids.iter().cloned().collect();
         Self {
             ns,
             start: Instant::now(),
+            leaves,
             counter_regs: vec_with_atomic(count),
             write_regs: vec_with_atomic(count),
         }
@@ -145,6 +150,10 @@ impl DataSource for SimDataSource {
     #[allow(clippy::cast_possible_truncation)] // VT_I4 分支：waveform::value 返回 f64 但 Random/ Square/ Saw/ Triangle 均有界 0..=100，截断安全。
     fn read(&self, item_id: &str) -> (VARIANT, u16, FILETIME) {
         let ts = now_filetime();
+        // 越界 index / 未知 id → 不存在 → BAD（OPC DA 语义：不存在的 item 读返 BAD）。
+        if !self.leaves.contains(item_id) {
+            return (VARIANT::default(), OPC_QUALITY_BAD, ts);
+        }
         let Some((ti, idx)) = parse_item(item_id) else {
             return (VARIANT::default(), OPC_QUALITY_BAD, ts);
         };
@@ -180,6 +189,11 @@ impl DataSource for SimDataSource {
     }
 
     fn write(&self, item_id: &str, value: &VARIANT) -> HRESULT {
+        // 越界 index / 未知 id → E_ACCESSDENIED（与"未知 item 拒写"一致；越界不再落到
+        // regs.get(None)→E_INVALIDARG，前置 leaves 检查统一拒收）。
+        if !self.leaves.contains(item_id) {
+            return E_ACCESSDENIED;
+        }
         let Some((ti, idx)) = parse_item(item_id) else {
             return E_ACCESSDENIED;
         };
@@ -204,6 +218,10 @@ impl DataSource for SimDataSource {
     }
 
     fn item_meta(&self, item_id: &str) -> Option<ItemMeta> {
+        // 越界 index / 未知 id → None（AddItems 据此拒收不存在的 item）。
+        if !self.leaves.contains(item_id) {
+            return None;
+        }
         let (ti, _) = parse_item(item_id)?;
         let t = &TYPES[ti];
         Some(ItemMeta {
@@ -213,6 +231,10 @@ impl DataSource for SimDataSource {
     }
 
     fn item_range(&self, item_id: &str) -> Option<(f64, f64)> {
+        // 越界 index / 未知 id → None（无 EU 范围，与 item_meta 存在性语义一致）。
+        if !self.leaves.contains(item_id) {
+            return None;
+        }
         let (ti, _) = parse_item(item_id)?;
         TYPES[ti].range
     }
@@ -321,6 +343,35 @@ mod tests {
         let ds = SimDataSource::new(5);
         assert_eq!(ds.item_range("Random.Int4.0"), Some((0.0, 100.0)));
         assert_eq!(ds.item_range("WriteTag.Int4.0"), None);
+    }
+
+    /// 越界 index（count=5，请求 .99）= 不存在 item → read 必须 BAD quality。
+    #[test]
+    fn read_out_of_range_index_is_bad() {
+        let ds = SimDataSource::new(5);
+        let (_v, q, _ts) = ds.read("Random.Int4.99");
+        assert_eq!(q, OPC_QUALITY_BAD, "越界 index 应 BAD");
+    }
+
+    /// 越界 index → item_meta 必须 None（AddItems 拒收不存在的 item）。
+    #[test]
+    fn item_meta_out_of_range_is_none() {
+        let ds = SimDataSource::new(5);
+        assert!(
+            ds.item_meta("Random.Int4.99").is_none(),
+            "越界 index 应无 meta"
+        );
+    }
+
+    /// 越界 index → write 必须 E_ACCESSDENIED（与未知 item 拒写一致）。
+    #[test]
+    fn write_out_of_range_denied() {
+        let ds = SimDataSource::new(5);
+        assert_eq!(
+            ds.write("BucketBrigade.Int4.99", &variant_i4(1)),
+            E_ACCESSDENIED,
+            "越界 index 应 E_ACCESSDENIED"
+        );
     }
 
     /// 读 VARIANT 的 vt 判别（测试辅助，集中 unsafe）。
