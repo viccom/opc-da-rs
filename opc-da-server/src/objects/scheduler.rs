@@ -81,7 +81,8 @@ fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
 /// `data_cp` 含 COM raw ptr，默认非 `Send`；server free-threaded（MTA），跨线程安全
 ///（见下 `unsafe impl`）。
 pub(crate) struct PublishJob {
-    /// GroupKey = `h_server_group`（`GroupInner` 已有，全局唯一）。
+    /// GroupKey（`GroupObj` 构造时经全局自增分配器取的唯一 id——不能用 `h_server_group`，
+    /// 它跨 ServerObj 重复：各 client 从 1 起分配，多 client 时 unregister 会误删他人 job）。
     pub(crate) key: u32,
     pub(crate) inner: Arc<Mutex<GroupInner>>,
     pub(crate) data_source: Arc<dyn DataSource>,
@@ -156,7 +157,8 @@ impl Scheduler {
         }
     }
 
-    /// 注册一个组的推送任务（`GroupObj::new` 调）。
+    /// 注册一个组的推送任务（`GroupObj::new` 调）。`key` 必须进程内唯一（`GroupObj` 经
+    /// 全局自增分配——`h_server_group` 跨 ServerObj 重复，不可作 key）。
     pub(crate) fn register(
         &self,
         key: u32,

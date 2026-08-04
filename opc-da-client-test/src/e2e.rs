@@ -759,6 +759,79 @@ pub async fn run_sim() -> (u32, u32) {
         ),
     }
 
+    // S6. 双 client 隔离（回归：scheduler GroupKey 曾用 h_server_group——跨 ServerObj 重复，
+    // client A 断开时 unregister 误删 client B 的 job → B 周期推送停但手动刷新正常）。
+    // A/B 各建独立 OpcDaClient（server 端两个 ServerObj，h_server_group 都从 1 起）→
+    // 都收到首帧 → drop A（模拟 PsOPCClient 断开）→ B 仍收到下一帧。
+    {
+        let client_a = OpcDaClient::new(ComConnector::new(HOST)).expect("client A init");
+        let client_b = OpcDaClient::new(ComConnector::new(HOST)).expect("client B init");
+        let mut sub_a = match client_a
+            .subscribe(SIM_PROG_ID, vec!["Random.Int4.0".to_string()], 500)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                probe(
+                    &mut passed,
+                    &mut failed,
+                    "sim 双client A subscribe",
+                    false,
+                    &e.to_string(),
+                );
+                return (passed, failed);
+            }
+        };
+        let mut sub_b = match client_b
+            .subscribe(SIM_PROG_ID, vec!["Random.Int4.1".to_string()], 500)
+            .await
+        {
+            Ok(h) => h,
+            Err(e) => {
+                probe(
+                    &mut passed,
+                    &mut failed,
+                    "sim 双client B subscribe",
+                    false,
+                    &e.to_string(),
+                );
+                return (passed, failed);
+            }
+        };
+        // A/B 首帧都到 → 两个订阅都建立。
+        let a_first = tokio::time::timeout(Duration::from_secs(3), sub_a.rx.recv()).await;
+        let b_first = tokio::time::timeout(Duration::from_secs(3), sub_b.rx.recv()).await;
+        let both = matches!(a_first, Ok(Some(_))) && matches!(b_first, Ok(Some(_)));
+        probe(
+            &mut passed,
+            &mut failed,
+            "sim 双client 首帧",
+            both,
+            if both {
+                "A+B 都收到"
+            } else {
+                "首帧缺失"
+            },
+        );
+        // drop client A（模拟 PsOPCClient 断开：ServerObj A 释放 → GroupObj Drop → unregister）。
+        drop(client_a);
+        // 留一个推送周期让 A 的注销在 server 端落定，再验 B。
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let b_next = tokio::time::timeout(Duration::from_secs(3), sub_b.rx.recv()).await;
+        let ok = matches!(b_next, Ok(Some(_)));
+        probe(
+            &mut passed,
+            &mut failed,
+            "sim 双client A断开后B仍推送",
+            ok,
+            if ok {
+                "B 持续收到"
+            } else {
+                "B 推送停止（GroupKey 冲突回归）"
+            },
+        );
+    }
+
     (passed, failed)
 }
 

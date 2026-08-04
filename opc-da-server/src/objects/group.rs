@@ -132,6 +132,12 @@ impl GroupInner {
     }
 }
 
+/// scheduler GroupKey 分配器（进程内全局自增）。`h_server_group` 是 client 分配的句柄，
+/// 跨 ServerObj 必然重复（每个 client 的 ServerObj 都从 1 起分配）——直接作 GroupKey 会
+/// 让多 client 时 `unregister` 误删他人 job（现场：PsOPCClient 断开后另一 client 周期
+/// 推送停止、手动刷新正常）。GroupKey 只需进程内唯一标识 job，故用自增计数。
+static NEXT_SCHED_KEY: AtomicU32 = AtomicU32::new(1);
+
 /// OPC DA Group COM 对象。
 ///
 /// 持有 item 注册表（`inner`）+ 数据源引用（`data_source`，`AddItems` 查 meta / 后续
@@ -160,6 +166,9 @@ pub struct GroupObj {
     txns: AsyncTxnTable,
     /// `IOPCAsyncIO2` 事务 CancelID 分配器（从 1 起，0 = 无效）。
     next_cancel_id: AtomicU32,
+    /// scheduler GroupKey（[`NEXT_SCHED_KEY`] 分配，进程内唯一）。不能复用 client 的
+    /// `h_server_group`——跨 ServerObj 重复，注销时误删他人 job。
+    sched_key: u32,
 }
 
 impl GroupObj {
@@ -198,10 +207,12 @@ impl GroupObj {
         let data_sinks = cp.sinks_arc();
         let data_cp: IConnectionPoint = cp.into();
         // 注册全局推送调度器（替代旧 per-group spawn；Scheduler 未 init 时 global() 返
-        // None 跳过——兼容单测。h_server_group 作 GroupKey，update_rate 作周期）。
+        // None 跳过——兼容单测）。GroupKey 用全局唯一 sched_key——h_server_group 跨
+        // ServerObj 重复（各 client 从 1 起分配），直接作 key 会 unregister 误删他人 job。
+        let sched_key = NEXT_SCHED_KEY.fetch_add(1, Ordering::Relaxed);
         if let Some(sched) = crate::objects::scheduler::global() {
             sched.register(
-                h_server_group,
+                sched_key,
                 Arc::clone(&inner),
                 data_source.clone(),
                 data_sinks.clone(),
@@ -215,6 +226,7 @@ impl GroupObj {
             data_sinks,
             txns: Arc::new(Mutex::new(HashMap::new())),
             next_cancel_id: AtomicU32::new(1),
+            sched_key,
         }
     }
 }
@@ -223,8 +235,7 @@ impl GroupObj {
 impl Drop for GroupObj {
     fn drop(&mut self) {
         if let Some(sched) = crate::objects::scheduler::global() {
-            let key = locked(&self.inner).h_server_group;
-            sched.unregister(key);
+            sched.unregister(self.sched_key);
         }
     }
 }
@@ -1790,8 +1801,9 @@ mod tests {
             let cpc: IConnectionPointContainer =
                 g.cast::<IConnectionPointContainer>().expect("QI CPC");
             let iid_dc = IOPCDataCallback::IID;
-            let cp: IConnectionPoint =
-                cpc.FindConnectionPoint(&raw const iid_dc).expect("FindConnectionPoint");
+            let cp: IConnectionPoint = cpc
+                .FindConnectionPoint(&raw const iid_dc)
+                .expect("FindConnectionPoint");
             let sink_unk: IUnknown = sink.cast::<IUnknown>().expect("cast");
             let _cookie = cp.Advise(&sink_unk).expect("Advise");
 
@@ -1801,7 +1813,13 @@ mod tests {
             let mut cancel_id = 0u32;
             let mut perrors: *mut HRESULT = core::ptr::null_mut();
             async2
-                .Read(1, handles.as_ptr(), 8888, &raw mut cancel_id, &raw mut perrors)
+                .Read(
+                    1,
+                    handles.as_ptr(),
+                    8888,
+                    &raw mut cancel_id,
+                    &raw mut perrors,
+                )
                 .expect("AsyncIO2::Read 应成功");
             assert!(cancel_id >= 1, "cancel id 应非 0");
             assert_eq!(*perrors, E_PENDING, "ppErrors 应填 E_PENDING（异步进行中）");
@@ -1851,7 +1869,13 @@ mod tests {
             let mut cancel_id = 0u32;
             let mut perrors: *mut HRESULT = core::ptr::null_mut();
             async2
-                .Read(1, handles.as_ptr(), 999, &raw mut cancel_id, &raw mut perrors)
+                .Read(
+                    1,
+                    handles.as_ptr(),
+                    999,
+                    &raw mut cancel_id,
+                    &raw mut perrors,
+                )
                 .expect("AsyncIO2::Read");
             CoTaskMemFree(Some(perrors.cast()));
 
@@ -1861,6 +1885,17 @@ mod tests {
             let err = async2.Cancel2(u32::MAX).expect_err("未知 cancel id 应失败");
             assert_eq!(err.code(), E_INVALIDARG, "未知 cancel id 应 E_INVALIDARG");
         }
+    }
+
+    /// GroupKey 分配器：连续分配从 1 起、不重复（回归：曾用 `h_server_group` 作 key，跨
+    /// ServerObj 重复 → 多 client 时 unregister 误删他人 job，周期推送停但手动刷新正常）。
+    #[test]
+    fn sched_key_allocator_is_unique() {
+        let a = NEXT_SCHED_KEY.fetch_add(1, Ordering::Relaxed);
+        let b = NEXT_SCHED_KEY.fetch_add(1, Ordering::Relaxed);
+        assert_ne!(a, 0, "key 从 1 起（0 无效）");
+        assert_ne!(b, 0, "key 从 1 起（0 无效）");
+        assert_ne!(a, b, "连续分配必须唯一");
     }
 
     /// `Scheduler` register/unregister 计数（P0）：注册增、注销减、跨 rate 桶、幂等。

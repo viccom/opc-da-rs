@@ -57,7 +57,11 @@ pub fn global_git() -> Option<&'static IGlobalInterfaceTable> {
     }
     // SAFETY: CoCreateInstance 创建标准 in-proc GIT；CLSCTX_INPROC_SERVER。
     let g = unsafe {
-        CoCreateInstance(&CLSID_STD_GLOBAL_INTERFACE_TABLE, None, CLSCTX_INPROC_SERVER)
+        CoCreateInstance(
+            &CLSID_STD_GLOBAL_INTERFACE_TABLE,
+            None,
+            CLSCTX_INPROC_SERVER,
+        )
     }
     .ok()?;
     // get_or_init：并发时先到者胜，晚到的本地 g 丢弃（引用释放）。
