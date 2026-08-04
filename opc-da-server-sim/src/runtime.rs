@@ -1,7 +1,4 @@
 //! COM 编排：CLSID/ProgID 常量 + build_registration + run（复制库 bin 模板）。
-//!
-//! 本模块所有 pub 接口（`run_register`/`run_unregister`/`run_server`）尚未被 main.rs
-//! 消费（main.rs 仍为 Task 1 skeleton）。后续 task 接线后移除 `#[allow(dead_code)]`。
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,23 +18,17 @@ use windows::core::{GUID, Interface, Result};
 use crate::data_source::SimDataSource;
 
 /// sim 的独立 CLSID（与库 CLSID_OPC_DA_SERVER 0x9a7b_3c2d_... 不同）。
-#[allow(dead_code)] // main.rs 接线前仅测试消费。
 pub const CLSID_OPC_DA_SIM: GUID = GUID::from_u128(0xb1c2_d3e4_f5a6_0718_293a_4b5c_5d6e_7f80);
-#[allow(dead_code)] // main.rs 接线前仅 build_registration 消费。
 const PROG_ID: &str = "opc-da-rs.Sim.1";
-#[allow(dead_code)] // 同上。
 const VIPROG_ID: &str = "opc-da-rs.Sim";
-#[allow(dead_code)] // 同上。
 const DESCRIPTION: &str = "opc-da-rs OPC DA Simulation Server";
 
-#[allow(dead_code)] // 同上。
 const CATIDS: [GUID; 3] = [
     CATID_OPCDAServer10::IID,
     CATID_OPCDAServer20::IID,
     CATID_OPCDAServer30::IID,
 ];
 
-#[allow(dead_code)] // main.rs 接线前仅测试消费。
 fn build_registration(exe_path: &Path) -> ServerRegistration<'_> {
     ServerRegistration {
         clsid: CLSID_OPC_DA_SIM,
@@ -50,7 +41,6 @@ fn build_registration(exe_path: &Path) -> ServerRegistration<'_> {
     }
 }
 
-#[allow(dead_code)] // 仅 run_server 消费；后者当前未接线。
 fn read_count() -> usize {
     std::env::var("OPC_DA_SIM_COUNT")
         .ok()
@@ -59,7 +49,6 @@ fn read_count() -> usize {
         .unwrap_or(100)
 }
 
-#[allow(dead_code)] // main.rs 接线前无 caller。
 pub fn run_register() -> Result<()> {
     let exe_path = std::env::current_exe()?;
     let reg = build_registration(&exe_path);
@@ -68,7 +57,6 @@ pub fn run_register() -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)] // 同上。
 pub fn run_unregister() -> Result<()> {
     let exe_path = std::env::current_exe()?;
     let reg = build_registration(&exe_path);
@@ -77,7 +65,6 @@ pub fn run_unregister() -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)] // 同上。
 pub fn run_server() -> Result<()> {
     let count = read_count();
     // SAFETY: 标准 EXE server 启动序列（复制 opc-da-server/src/bin/opc-da-server.rs:83-119）。
