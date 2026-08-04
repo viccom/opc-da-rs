@@ -42,11 +42,35 @@ fn build_registration(exe_path: &Path) -> ServerRegistration<'_> {
 }
 
 fn read_count() -> usize {
+    let parsed = read_count_from_config().or_else(read_count_from_env);
+    parsed
+        .filter(|&n| (1..=100_000).contains(&n))
+        .unwrap_or(100)
+}
+
+/// exe 同目录 `opc-da-server-sim.ini`：首条 `count = <N>` 行。
+/// SCM 启动 exe 时不继承 shell env，env `OPC_DA_SIM_COUNT` 失效；exe 读自己的配置文件不受影响。
+fn read_count_from_config() -> Option<usize> {
+    let path = std::env::current_exe()
+        .ok()?
+        .with_file_name("opc-da-server-sim.ini");
+    let content = std::fs::read_to_string(&path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("count")
+            && let Some(num_str) = rest.trim_start().strip_prefix('=')
+            && let Ok(n) = num_str.trim().parse::<usize>()
+        {
+            return Some(n);
+        }
+    }
+    None
+}
+
+fn read_count_from_env() -> Option<usize> {
     std::env::var("OPC_DA_SIM_COUNT")
         .ok()
         .and_then(|s| s.parse().ok())
-        .filter(|&n| (1..=100_000).contains(&n))
-        .unwrap_or(100)
 }
 
 pub fn run_register() -> Result<()> {

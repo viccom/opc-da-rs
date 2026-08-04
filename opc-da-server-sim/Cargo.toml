@@ -21,6 +21,8 @@ workspace = true
 [dependencies]
 opc-da-server = { path = "../opc-da-server" }
 opc-da-client = { path = "../opc-da-client" }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { workspace = true }
