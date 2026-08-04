@@ -23,15 +23,78 @@ pub struct TagType {
 /// 8 个展开类型 + 1 单例。
 #[allow(dead_code)]
 pub static TYPES: &[TagType] = &[
-    TagType { prefix: "Random.Int4",        dtype: 3,  kind: TagKind::Random,   writable: false, range: Some((0.0, 100.0)), singleton: false },
-    TagType { prefix: "Random.Real8",       dtype: 5,  kind: TagKind::Random,   writable: false, range: Some((0.0, 100.0)), singleton: false },
-    TagType { prefix: "Square.Real8",       dtype: 5,  kind: TagKind::Square,   writable: false, range: Some((0.0, 100.0)), singleton: false },
-    TagType { prefix: "Sawtooth.Real8",     dtype: 5,  kind: TagKind::Sawtooth, writable: false, range: Some((0.0, 100.0)), singleton: false },
-    TagType { prefix: "Triangle.Real8",     dtype: 5,  kind: TagKind::Triangle, writable: false, range: Some((0.0, 100.0)), singleton: false },
-    TagType { prefix: "BucketBrigade.Int4", dtype: 3,  kind: TagKind::Counter,  writable: true,  range: Some((0.0, 100.0)), singleton: false },
-    TagType { prefix: "WriteTag.Int4",      dtype: 3,  kind: TagKind::Register, writable: true,  range: None,                singleton: false },
-    TagType { prefix: "AltBool.Bool",       dtype: 11, kind: TagKind::AltBool,  writable: false, range: None,                singleton: false },
-    TagType { prefix: "_System.Time",       dtype: 5,  kind: TagKind::SysTime,  writable: false, range: None,                singleton: true  },
+    TagType {
+        prefix: "Random.Int4",
+        dtype: 3,
+        kind: TagKind::Random,
+        writable: false,
+        range: Some((0.0, 100.0)),
+        singleton: false,
+    },
+    TagType {
+        prefix: "Random.Real8",
+        dtype: 5,
+        kind: TagKind::Random,
+        writable: false,
+        range: Some((0.0, 100.0)),
+        singleton: false,
+    },
+    TagType {
+        prefix: "Square.Real8",
+        dtype: 5,
+        kind: TagKind::Square,
+        writable: false,
+        range: Some((0.0, 100.0)),
+        singleton: false,
+    },
+    TagType {
+        prefix: "Sawtooth.Real8",
+        dtype: 5,
+        kind: TagKind::Sawtooth,
+        writable: false,
+        range: Some((0.0, 100.0)),
+        singleton: false,
+    },
+    TagType {
+        prefix: "Triangle.Real8",
+        dtype: 5,
+        kind: TagKind::Triangle,
+        writable: false,
+        range: Some((0.0, 100.0)),
+        singleton: false,
+    },
+    TagType {
+        prefix: "BucketBrigade.Int4",
+        dtype: 3,
+        kind: TagKind::Counter,
+        writable: true,
+        range: Some((0.0, 100.0)),
+        singleton: false,
+    },
+    TagType {
+        prefix: "WriteTag.Int4",
+        dtype: 3,
+        kind: TagKind::Register,
+        writable: true,
+        range: None,
+        singleton: false,
+    },
+    TagType {
+        prefix: "AltBool.Bool",
+        dtype: 11,
+        kind: TagKind::AltBool,
+        writable: false,
+        range: None,
+        singleton: false,
+    },
+    TagType {
+        prefix: "_System.Time",
+        dtype: 5,
+        kind: TagKind::SysTime,
+        writable: false,
+        range: None,
+        singleton: true,
+    },
 ];
 
 /// 展开所有 item_id：非 singleton 类型生成 count 个 `{prefix}.{i}`，singleton 加 prefix 本身。
@@ -53,7 +116,10 @@ pub fn expand_ids(count: usize) -> Vec<String> {
 /// 按 '.' 分割 ids，Trie 式合并公共前缀为 hierarchical `NsNode` 树（root 为空名 Branch）。
 #[allow(dead_code)]
 pub fn build_namespace_tree(ids: &[String]) -> NsNode {
-    let mut root = NsNode::Branch { name: Arc::from(""), children: Vec::new() };
+    let mut root = NsNode::Branch {
+        name: Arc::from(""),
+        children: Vec::new(),
+    };
     for id in ids {
         let parts: Vec<&str> = id.split('.').collect();
         insert_path(&mut root, &parts, id);
@@ -68,7 +134,9 @@ fn insert_path(node: &mut NsNode, parts: &[&str], full_id: &str) {
         NsNode::Leaf { .. } => return,
     };
     if parts.len() == 1 {
-        children.push(NsNode::Leaf { id: Arc::from(full_id) });
+        children.push(NsNode::Leaf {
+            id: Arc::from(full_id),
+        });
         return;
     }
     let head = parts[0];
@@ -79,7 +147,10 @@ fn insert_path(node: &mut NsNode, parts: &[&str], full_id: &str) {
     let new_child_idx = match pos {
         Some(i) => i,
         None => {
-            children.push(NsNode::Branch { name: Arc::from(head), children: Vec::new() });
+            children.push(NsNode::Branch {
+                name: Arc::from(head),
+                children: Vec::new(),
+            });
             children.len() - 1
         }
     };
@@ -97,7 +168,10 @@ mod tests {
         assert!(ids.contains(&"_System.Time".to_string()), "含单例");
         assert!(ids.contains(&"Random.Int4.0".to_string()));
         assert!(ids.contains(&"Random.Int4.99".to_string()));
-        assert!(!ids.contains(&"Random.Int4.100".to_string()), "index 上限 99");
+        assert!(
+            !ids.contains(&"Random.Int4.100".to_string()),
+            "index 上限 99"
+        );
     }
 
     #[test]
@@ -124,10 +198,13 @@ mod tests {
             NsNode::Branch { children, .. } => children,
             NsNode::Leaf { .. } => panic!("root 必为 Branch"),
         };
-        let names: Vec<&str> = children.iter().filter_map(|c| match c {
-            NsNode::Branch { name, .. } => Some(name.as_ref()),
-            NsNode::Leaf { .. } => None,
-        }).collect();
+        let names: Vec<&str> = children
+            .iter()
+            .filter_map(|c| match c {
+                NsNode::Branch { name, .. } => Some(name.as_ref()),
+                NsNode::Leaf { .. } => None,
+            })
+            .collect();
         assert!(names.contains(&"Random"), "缺 Random 分支");
         assert!(names.contains(&"_System"), "缺 _System 分支");
     }
@@ -137,7 +214,15 @@ mod tests {
         let ids = expand_ids(3);
         let root = build_namespace_tree(&ids);
         let n = opc_da_server::data_source::NamespaceTree::from_tree(root);
-        assert_eq!(n.browse_children(&["Random"]).len(), 2, "Random 下 Int4/Real8");
-        assert_eq!(n.browse_children(&["Random", "Int4"]).len(), 3, "3 个 index 叶");
+        assert_eq!(
+            n.browse_children(&["Random"]).len(),
+            2,
+            "Random 下 Int4/Real8"
+        );
+        assert_eq!(
+            n.browse_children(&["Random", "Int4"]).len(),
+            3,
+            "3 个 index 叶"
+        );
     }
 }

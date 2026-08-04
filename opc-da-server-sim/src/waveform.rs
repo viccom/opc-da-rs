@@ -37,7 +37,11 @@ pub fn value(kind: TagKind, index: u64, elapsed_secs: u64) -> f64 {
             f64::from(u32::try_from(mixed).unwrap_or(0))
         }
         TagKind::Square => {
-            if t.is_multiple_of(2) { 100.0 } else { 0.0 }
+            if t.is_multiple_of(2) {
+                100.0
+            } else {
+                0.0
+            }
         }
         TagKind::Sawtooth => {
             let p = t % 10;
@@ -49,13 +53,15 @@ pub fn value(kind: TagKind, index: u64, elapsed_secs: u64) -> f64 {
             f64::from(u32::try_from(tri).unwrap_or(0)) / 5.0 * 100.0
         }
         TagKind::AltBool => {
-            if t.is_multiple_of(2) { 1.0 } else { 0.0 }
+            if t.is_multiple_of(2) {
+                1.0
+            } else {
+                0.0
+            }
         }
-        TagKind::SysTime => {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0.0, |d| d.as_secs_f64())
-        }
+        TagKind::SysTime => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64()),
         TagKind::Counter | TagKind::Register => 0.0,
     }
 }
