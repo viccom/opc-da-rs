@@ -1,29 +1,32 @@
-# OPC DA Client CLI
+# OPC DA Client & Server（Rust）
 
 > **语言**：[English](README.md) | 简体中文
 
-面向 Windows 的现代异步 TUI（终端用户界面）客户端，用于浏览、读取、写入 OPC DA（Data Access）标签。
+面向 Windows 的现代 Rust 工作区——异步**客户端**（TUI + 桌面 GUI）用于浏览 / 读取 / 写入 / 订阅标签，外加原生 **OPC DA 服务器**库与对标 Matrikon 的**仿真服务器**，便于客户端测试与协议网关开发（Modbus / S7 / UA 桥接）。
 
 ## 🧩 组件
 
-本仓库是一个 Cargo 工作区，包含三个 crate：
+本仓库是一个 Cargo 工作区，包含六个 crate：
 
-| Crate | 说明 |
-| :--- | :--- |
-| **[`opc-cli`](./opc-cli/)** | 交互式 TUI 应用（`ratatui` + `crossterm`）。即本 README 侧重介绍的二进制。 |
-| **[`opc-da-client`](./opc-da-client/)** | 异步 OPC DA 库——`OpcProvider` trait + 原生 `windows-rs` COM 后端，两个应用共用。（[README](./opc-da-client/README.zh-CN.md)） |
-| **[`opc-da-desktop`](./opc-da-desktop/)** | Tauri 2 桌面 GUI（React + TypeScript），用于浏览、订阅、写入标签。（[README](./opc-da-desktop/README.md)） |
+| Crate | 侧 | 说明 |
+| :--- | :--- | :--- |
+| **[`opc-cli`](./opc-cli/)** | 客户端 | 交互式 TUI 应用（`ratatui` + `crossterm`）。 |
+| **[`opc-da-desktop`](./opc-da-desktop/)** | 客户端 | Tauri 2 桌面 GUI（React + TypeScript），用于浏览 / 订阅 / 写入。（[README](./opc-da-desktop/README.md)） |
+| **[`opc-da-client`](./opc-da-client/)** | 客户端 | 异步 OPC DA 库——`OpcProvider` trait + 原生 `windows-rs` COM 后端，两个客户端共用。（[README](./opc-da-client/README.zh-CN.md)） |
+| **[`opc-da-server`](./opc-da-server/)** | 服务器 | OPC DA Server COM 库——`IOPCServer` / `Group` / `ItemMgt` / `SyncIO` / `AsyncIO2` / `Browse` / `ItemProperties` + 全局推送调度器 + GIT 跨 apartment 回调。 |
+| **[`opc-da-server-sim`](./opc-da-server-sim/)** | 服务器 | 仿真服务器（对标 `Matrikon.OPC.Simulation`），x64 + x86。（[README](./opc-da-server-sim/README.md)） |
+| **[`opc-da-client-test`](./opc-da-client-test/)** | 测试 | 端到端测试程序，驱动 `opc-da-client` 对接 `opc-da-server` / `opc-da-server-sim`。 |
 
-延伸阅读：高层导航图 **[ARCHITECTURE_DIAGRAM.md](./ARCHITECTURE_DIAGRAM.md)**、库深设计 **[opc-da-client/architecture.md](./opc-da-client/architecture.md)**、同步/异步/订阅与 DCOM 详解 **[DCOM_GUIDE.md](./DCOM_GUIDE.md)**。
+延伸阅读：高层导航图 **[ARCHITECTURE_DIAGRAM.md](./ARCHITECTURE_DIAGRAM.md)**、客户端库深设计 **[opc-da-client/architecture.md](./opc-da-client/architecture.md)**、仿真服务器指南 **[opc-da-server-sim/README.md](./opc-da-server-sim/README.md)**、同步/异步/订阅与 DCOM 详解 **[DCOM_GUIDE.md](./DCOM_GUIDE.md)**。
 
 ## 🏗️ 架构
 
-本项目以 Cargo 工作区组织（见上文）：
+本项目以 Cargo 工作区组织，横跨 OPC DA 的客户端与服务器两侧：
 
-- **`opc-cli`**：基于 `ratatui` + `crossterm` 的交互式 TUI 应用。
-- **`opc-da-client`**：原生 Windows COM 库（`windows-rs`），通过 async trait（`OpcProvider`）抽象 OPC DA 通信。泛型于 `ServerConnector` 以便 mock。
+- **客户端**（`opc-cli`、`opc-da-desktop`）基于 **`opc-da-client`** 库——原生 Windows COM 库（`windows-rs`），通过 async trait（`OpcProvider`）抽象 OPC DA 通信，泛型于 `ServerConnector` 便于 mock。
+- **服务器**（`opc-da-server-sim`）基于 **`opc-da-server`** 库——原生 OPC DA Server COM 实现（`IOPCServer` / `Group` / `SyncIO` / `AsyncIO2` / `Browse`…），含全局推送调度器与 Global Interface Table（GIT）跨 apartment 回调，让 STA 客户端（PsOPCClient、Prosys）收 `OnDataChange` 不报 `RPC_E_WRONG_THREAD`。
 
-完整设计、状态机与数据流图见 **[opc-da-client/architecture.md](./opc-da-client/architecture.md)**。
+完整客户端设计见 **[opc-da-client/architecture.md](./opc-da-client/architecture.md)**，服务器侧接线见 **[opc-da-server-sim/README.md](./opc-da-server-sim/README.md)**。
 
 ## ✨ 功能特性
 
@@ -57,6 +60,27 @@ cargo run --bin opc-cli
 # 运行完整质量门（格式 → lint → 测试）
 pwsh -File scripts/verify.ps1
 ```
+
+## 🖥️ OPC DA Server（`opc-da-server-sim`）
+
+`opc-da-server-sim` 是独立的 OPC DA 仿真服务器，镜像 `Matrikon.OPC.Simulation` 标签集——无需真实 PLC 即可开发/测试客户端，或作为构建自定义协议网关服务器（Modbus / S7 / UA 桥接）的模板。它是 `opc-da-server` 库的薄包装，完整示范「接入自定义 `DataSource` → 注册 → 运行」流程。
+
+**注册与运行**（管理员提示符）：
+
+```powershell
+# 64 位构建——面向 64 位 OPC 客户端
+target\release\opc-da-server-sim.exe /RegServer
+
+# 32 位构建——32 位桌面客户端（PsOPCClient、Prosys OPC Client）必需
+cargo build --release -p opc-da-server-sim --target i686-pc-windows-msvc
+target\i686-pc-windows-msvc\release\opc-da-server-sim.exe /RegServer
+```
+
+随后用任意标准 OPC DA 客户端连接 ProgID **`opc-da-rs.Sim.1`**（hierarchical 命名空间，如 `Random.Int4.0`、`BucketBrigade.Int4.0`、`_System.Time`）。通过 `opc-da-server-sim.ini` 配置规模（`count = N`，上限 100 000 → 约 80 万 tag）。
+
+> ⚠ **位宽**：32 位客户端连 64 位服务器，若 `System32\OPCProxy.dll`（64 位）缺失，跨位宽 marshaling 可能崩溃——请让服务器位宽匹配客户端，或安装 64 位 OPC Core Components。详见 [opc-da-server-sim/README.md](./opc-da-server-sim/README.md)。
+
+CI 构建**两种**位宽，在每个 `v*` tag 的 GitHub Release 上发布 `opc-da-server-sim-x64.exe` + `opc-da-server-sim-x86.exe`（+ `opc-da-server-x64.exe`）。
 
 ## ⌨️ 按键操作
 

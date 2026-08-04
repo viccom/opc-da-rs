@@ -1,29 +1,32 @@
-# OPC DA Client CLI
+# OPC DA Client & Server (Rust)
 
 > **Language**: [English](README.md) | [简体中文](README.zh-CN.md)
 
-A modern, asynchronous TUI (Terminal User Interface) client for browsing, reading, and writing OPC DA (Data Access) tags on Windows.
+A modern Rust workspace for OPC DA (Data Access) on Windows — async **clients** (TUI + desktop GUI) for browsing / reading / writing / subscribing to tags, plus a native **OPC DA server** library and a Matrikon-style **simulation server** for client testing and protocol-gateway development (Modbus / S7 / UA bridge).
 
 ## 🧩 Components
 
-This repository is a Cargo workspace with three crates:
+This repository is a Cargo workspace with six crates:
 
-| Crate | Description |
-| :--- | :--- |
-| **[`opc-cli`](./opc-cli/)** | The interactive TUI application (`ratatui` + `crossterm`). The binary this README focuses on. |
-| **[`opc-da-client`](./opc-da-client/)** | The async OPC DA library — the `OpcProvider` trait + native `windows-rs` COM backend, used by both apps. ([README](./opc-da-client/README.md)) |
-| **[`opc-da-desktop`](./opc-da-desktop/)** | A Tauri 2 desktop GUI (React + TypeScript) for browsing, subscribing, and writing tags. ([README](./opc-da-desktop/README.md)) |
+| Crate | Side | Description |
+| :--- | :--- | :--- |
+| **[`opc-cli`](./opc-cli/)** | client | Interactive TUI application (`ratatui` + `crossterm`). |
+| **[`opc-da-desktop`](./opc-da-desktop/)** | client | Tauri 2 desktop GUI (React + TypeScript) for browsing / subscribing / writing. ([README](./opc-da-desktop/README.md)) |
+| **[`opc-da-client`](./opc-da-client/)** | client | Async OPC DA library — `OpcProvider` trait + native `windows-rs` COM backend, shared by both clients. ([README](./opc-da-client/README.md)) |
+| **[`opc-da-server`](./opc-da-server/)** | server | OPC DA Server COM library — `IOPCServer` / `Group` / `ItemMgt` / `SyncIO` / `AsyncIO2` / `Browse` / `ItemProperties` + global push scheduler + GIT cross-apartment callback. |
+| **[`opc-da-server-sim`](./opc-da-server-sim/)** | server | Simulation server (drop-in for `Matrikon.OPC.Simulation`), x64 + x86. ([README](./opc-da-server-sim/README.md)) |
+| **[`opc-da-client-test`](./opc-da-client-test/)** | test | End-to-end test harness driving `opc-da-client` against `opc-da-server` / `opc-da-server-sim`. |
 
-Further reading: high-level map in **[ARCHITECTURE_DIAGRAM.md](./ARCHITECTURE_DIAGRAM.md)**, library deep-dive in **[opc-da-client/architecture.md](./opc-da-client/architecture.md)**, and the sync/async/subscription + DCOM walkthrough in **[DCOM_GUIDE.md](./DCOM_GUIDE.md)**.
+Further reading: high-level map in **[ARCHITECTURE_DIAGRAM.md](./ARCHITECTURE_DIAGRAM.md)**, client library deep-dive in **[opc-da-client/architecture.md](./opc-da-client/architecture.md)**, simulation server guide in **[opc-da-server-sim/README.md](./opc-da-server-sim/README.md)**, and the sync/async/subscription + DCOM walkthrough in **[DCOM_GUIDE.md](./DCOM_GUIDE.md)**.
 
 ## 🏗️ Architecture
 
-The project is structured as a Cargo workspace (see above):
+The project is structured as a Cargo workspace spanning both sides of OPC DA:
 
-- **`opc-cli`**: The interactive TUI application built with `ratatui` + `crossterm`.
-- **`opc-da-client`**: A native Windows COM library (using `windows-rs`) that abstracts OPC DA communication through an async trait (`OpcProvider`). Generic over `ServerConnector` for easy mocking.
+- **Clients** (`opc-cli`, `opc-da-desktop`) sit on top of the **`opc-da-client`** library — a native Windows COM library (`windows-rs`) that abstracts OPC DA through an async trait (`OpcProvider`), generic over `ServerConnector` for easy mocking.
+- **Servers** (`opc-da-server-sim`) sit on top of the **`opc-da-server`** library — a native OPC DA Server COM implementation (`IOPCServer` / `Group` / `SyncIO` / `AsyncIO2` / `Browse` …) with a global push scheduler and Global Interface Table (GIT) cross-apartment callback, so STA clients (PsOPCClient, Prosys) receive `OnDataChange` without `RPC_E_WRONG_THREAD`.
 
-See **[opc-da-client/architecture.md](./opc-da-client/architecture.md)** for the full design, state machine, and data flow diagrams.
+See **[opc-da-client/architecture.md](./opc-da-client/architecture.md)** for the full client design, and **[opc-da-server-sim/README.md](./opc-da-server-sim/README.md)** for the server-side wiring.
 
 ## ✨ Features
 
@@ -57,6 +60,27 @@ cargo run --bin opc-cli
 # Run the full verification gate (format → lint → test)
 pwsh -File scripts/verify.ps1
 ```
+
+## 🖥️ OPC DA Server (`opc-da-server-sim`)
+
+`opc-da-server-sim` is a standalone OPC DA Simulation Server mirroring the `Matrikon.OPC.Simulation` tag set — use it to develop and test clients without a real PLC, or as a template for building your own protocol-gateway servers (Modbus / S7 / UA bridge). It is a thin wrapper over the `opc-da-server` library, demonstrating the full "plug in a custom `DataSource` → register → serve" flow.
+
+**Register & run** (run from an elevated prompt):
+
+```powershell
+# 64-bit build — for 64-bit OPC clients
+target\release\opc-da-server-sim.exe /RegServer
+
+# 32-bit build — REQUIRED for 32-bit desktop clients (PsOPCClient, Prosys OPC Client)
+cargo build --release -p opc-da-server-sim --target i686-pc-windows-msvc
+target\i686-pc-windows-msvc\release\opc-da-server-sim.exe /RegServer
+```
+
+Then connect any standard OPC DA client to ProgID **`opc-da-rs.Sim.1`** (hierarchical namespace, e.g. `Random.Int4.0`, `BucketBrigade.Int4.0`, `_System.Time`). Scale the tag set via `opc-da-server-sim.ini` (`count = N`, up to 100 000 → ~800k tags).
+
+> ⚠ **Bitness**: a 32-bit client connecting to a 64-bit server may crash on cross-bitness marshaling when `System32\OPCProxy.dll` (64-bit) is missing — match the server bitness to your client, or install the 64-bit OPC Core Components. Full details in [opc-da-server-sim/README.md](./opc-da-server-sim/README.md).
+
+CI builds **both** bitnesses and publishes `opc-da-server-sim-x64.exe` + `opc-da-server-sim-x86.exe` (+ `opc-da-server-x64.exe`) to the GitHub Release on every `v*` tag.
 
 ## ⌨️ Controls
 
