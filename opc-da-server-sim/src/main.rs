@@ -9,6 +9,9 @@ mod waveform;
 #[cfg(windows)]
 mod tags;
 
+#[cfg(windows)]
+mod data_source;
+
 fn main() {
     eprintln!("opc-da-server-sim: skeleton (Task 1) — 后续 task 填充 COM 编排");
 }
