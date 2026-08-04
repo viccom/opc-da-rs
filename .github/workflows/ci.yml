@@ -28,6 +28,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: i686-pc-windows-msvc   # 32 位 sim——兼容只注册 32 位 CATID 的 OPC client
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -79,4 +80,37 @@ jobs:
         with:
           name: opc-da-desktop-windows-x64
           path: target/release/opc-da-desktop.exe
+          if-no-files-found: error
+
+      # OPC DA simulation server（对标 Matrikon.OPC.Simulation）。x64 + x86 两位宽：
+      # 32 位 client（PsOPCClient/Prosys）连 64 位 sim 会因 System32\OPCProxy.dll 缺失跨位宽
+      # marshaling 崩溃，故同时产 32 位 sim。详见 memory opc-da-server-cross-bitness-marshaling。
+      - name: Build opc-da-server-sim (x64)
+        run: cargo build --release --locked -p opc-da-server-sim
+
+      - name: Build opc-da-server (x64)
+        run: cargo build --release --locked -p opc-da-server
+
+      - name: Build opc-da-server-sim 32-bit (x86)
+        run: cargo build --release --locked -p opc-da-server-sim --target i686-pc-windows-msvc
+
+      - name: Upload opc-da-server-sim (x64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opc-da-server-sim-windows-x64
+          path: target/release/opc-da-server-sim.exe
+          if-no-files-found: error
+
+      - name: Upload opc-da-server-sim (x86)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opc-da-server-sim-windows-x86
+          path: target/i686-pc-windows-msvc/release/opc-da-server-sim.exe
+          if-no-files-found: error
+
+      - name: Upload opc-da-server (x64)
+        uses: actions/upload-artifact@v4
+        with:
+          name: opc-da-server-windows-x64
+          path: target/release/opc-da-server.exe
           if-no-files-found: error

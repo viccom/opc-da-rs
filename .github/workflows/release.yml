@@ -55,13 +55,27 @@ jobs:
       - name: Build opc-da-desktop 32-bit (GUI)
         run: cargo build --release --locked -p opc-da-desktop --target i686-pc-windows-msvc
 
+      # OPC DA simulation server（对标 Matrikon.OPC.Simulation）。x64 + x86：32 位 OPC client
+      # 连 64 位 sim 会跨位宽 marshaling 崩溃，故同时发 32 位。+ 库 opc-da-server（flat/hier）。
+      - name: Build opc-da-server-sim (x64)
+        run: cargo build --release --locked -p opc-da-server-sim
+
+      - name: Build opc-da-server (x64)
+        run: cargo build --release --locked -p opc-da-server
+
+      - name: Build opc-da-server-sim 32-bit (x86)
+        run: cargo build --release --locked -p opc-da-server-sim --target i686-pc-windows-msvc
+
       - name: Stage release assets
         shell: bash
         run: |
           mkdir -p assets
-          cp target/release/opc-cli.exe assets/opc-cli-x64.exe
-          cp target/release/opc-da-desktop.exe assets/opc-da-desktop-x64.exe
-          cp target/i686-pc-windows-msvc/release/opc-da-desktop.exe assets/opc-da-desktop-x86.exe
+          cp target/release/opc-cli.exe                                 assets/opc-cli-x64.exe
+          cp target/release/opc-da-desktop.exe                          assets/opc-da-desktop-x64.exe
+          cp target/i686-pc-windows-msvc/release/opc-da-desktop.exe     assets/opc-da-desktop-x86.exe
+          cp target/release/opc-da-server-sim.exe                       assets/opc-da-server-sim-x64.exe
+          cp target/i686-pc-windows-msvc/release/opc-da-server-sim.exe  assets/opc-da-server-sim-x86.exe
+          cp target/release/opc-da-server.exe                           assets/opc-da-server-x64.exe
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -70,6 +84,9 @@ jobs:
             assets/opc-cli-x64.exe
             assets/opc-da-desktop-x64.exe
             assets/opc-da-desktop-x86.exe
+            assets/opc-da-server-sim-x64.exe
+            assets/opc-da-server-sim-x86.exe
+            assets/opc-da-server-x64.exe
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
