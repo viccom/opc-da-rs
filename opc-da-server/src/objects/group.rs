@@ -1898,6 +1898,78 @@ mod tests {
         assert_ne!(a, b, "连续分配必须唯一");
     }
 
+    /// 订阅组二次 AddItems（回归：Prosys 实测"第一次加点 OK，向已订阅组加点必崩"——
+    /// server 无 AddItems 日志 = 请求未达 server，client 进程内崩；本测试验证 server 端
+    /// 对"组非空 + 有 sink"的二次 AddItems 完全正确：两批都 S_OK、hServer 唯一、
+    /// 订阅仍可推全部 item）。
+    #[test]
+    fn add_items_second_batch_on_subscribed_group() {
+        init_mta();
+        let g = new_group();
+        // 先订阅（Advise sink）——复现"订阅组"状态。
+        let last: Arc<Mutex<Option<(u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+        let last_read: Arc<Mutex<Option<(u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+        let sink: IOPCDataCallback = CapturingSink {
+            last: Arc::clone(&last),
+            last_read: Arc::clone(&last_read),
+        }
+        .into();
+        let cpc: IConnectionPointContainer = g.cast::<IConnectionPointContainer>().expect("QI CPC");
+        let iid_dc = IOPCDataCallback::IID;
+        // SAFETY: cpc 同进程；iid_dc 有效 GUID。
+        let cp: IConnectionPoint =
+            unsafe { cpc.FindConnectionPoint(&raw const iid_dc) }.expect("FindConnectionPoint");
+        let sink_unk: IUnknown = sink.cast::<IUnknown>().expect("cast IUnknown");
+        // SAFETY: cp 同进程；sink_unk 有效 IUnknown。
+        let _cookie = unsafe { cp.Advise(&sink_unk) }.expect("Advise");
+
+        // 两批 AddItems（第一批 1 个 = "第一次加点"；第二批 2 个 = "新增点到订阅组"）。
+        // 注：new_group 用库的 flat SimDataSource（id 无 .N 后缀）。
+        let mut hs = Vec::new();
+        for batch in [
+            &["Random.Int4"][..],
+            &["Random.Real8", "Square Waves.Real8"][..],
+        ] {
+            let defs: Vec<tagOPCITEMDEF> = batch
+                .iter()
+                .enumerate()
+                .map(|(i, id)| {
+                    make_def(&wide(id), 100 + u32::try_from(i).unwrap_or(u32::MAX), true)
+                })
+                .collect();
+            let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+            let mut errors: *mut HRESULT = core::ptr::null_mut();
+            // SAFETY: g 同进程；defs/results/errors 指针有效。
+            unsafe {
+                g.AddItems(
+                    u32::try_from(defs.len()).unwrap_or(u32::MAX),
+                    defs.as_ptr(),
+                    &raw mut results,
+                    &raw mut errors,
+                )
+                .expect("AddItems 调用本身成功");
+                for i in 0..defs.len() {
+                    assert_eq!(*errors.add(i), S_OK, "批次 item {i} 应 S_OK");
+                    let h = (*results.add(i)).hServer;
+                    assert_ne!(h, 0, "批次 item {i} hServer 非 0");
+                    assert!(!hs.contains(&h), "hServer 不得重复");
+                    hs.push(h);
+                }
+                CoTaskMemFree(Some(results.cast()));
+                CoTaskMemFree(Some(errors.cast()));
+            }
+        }
+        assert_eq!(hs.len(), 3, "两批共 3 个 item 全部注册");
+
+        // 订阅仍有效：Refresh2 应推全部 3 个 active item（新点也进推送集合）。
+        let async2: IOPCAsyncIO2 = g.cast::<IOPCAsyncIO2>().expect("QI AsyncIO2");
+        // SAFETY: async2 同进程；Refresh2 内同步调 sink.OnDataChange。
+        let _ = unsafe { async2.Refresh2(OPC_DS_DEVICE, 999) }.expect("Refresh2");
+        let (tid, _hgroup, count) = locked(&last).expect("Refresh2 应触发 OnDataChange");
+        assert_eq!(tid, 999, "dwTransactionID 透传");
+        assert_eq!(count, 3, "两批 item 都应被推送");
+    }
+
     /// `Scheduler` register/unregister 计数（P0）：注册增、注销减、跨 rate 桶、幂等。
     #[test]
     fn scheduler_register_unregister_updates_count() {
