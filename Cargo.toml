@@ -5,6 +5,7 @@ members = [
     "opc-da-client-test",
     "opc-da-desktop",
     "opc-da-server",
+    "opc-da-server-sim",
 ]
 exclude = [
     "compat/*",
