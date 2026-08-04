@@ -136,6 +136,9 @@ pub fn unregister(reg: &ServerRegistration<'_>) -> Result<()> {
     // 递归删 register 写的子树（64 + 32 视图）。
     delete_subtree(&format!("CLSID\\{clsid}"))?;
     delete_subtree(reg.prog_id)?;
+    // register() 也写了 version-independent ProgID（default=描述 + CLSID/CurVer 子键）。
+    // 漏删会让 /UnregServer 残留半死 ProgID（CLSID 键已删但 ProgID 仍指向它）。
+    delete_subtree(reg.version_independent_prog_id)?;
     delete_subtree(&format!("AppID\\{appid}"))?;
     Ok(())
 }
