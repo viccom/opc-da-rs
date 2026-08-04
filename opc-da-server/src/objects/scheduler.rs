@@ -35,8 +35,10 @@ use std::time::{Duration, Instant};
 
 use std::cell::RefCell;
 use windows::Win32::Foundation::FILETIME;
-use windows::Win32::System::Com::{CoIncrementMTAUsage, IConnectionPoint};
+use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Variant::VARIANT;
+
+use opc_da_client::bindings::da::IOPCDataCallback;
 
 use crate::data_source::DataSource;
 use crate::objects::group::GroupInner;
@@ -85,12 +87,15 @@ pub(crate) struct PublishJob {
     pub(crate) key: u32,
     pub(crate) inner: Arc<Mutex<GroupInner>>,
     pub(crate) data_source: Arc<dyn DataSource>,
-    pub(crate) data_cp: IConnectionPoint,
+    /// 订阅表共享句柄（`ConnectionPoint` 的 `sinks_arc`）。worker 线程直接 `clone` sink
+    /// （AddRef）——**不做 QI**：STA client 的 sink 绑 Advise 线程，跨线程 QI 报
+    /// `RPC_E_WRONG_THREAD` 会被丢弃（旧 `enumerate_sinks` 路径，见 `publisher::typed_sinks`）。
+    pub(crate) data_sinks: Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
 }
 
-// SAFETY: server free-threaded（MTA）——所有线程经 `CoIncrementMTAUsage` 加入 MTA；
-// COM 接口指针（`data_cp`）在 MTA 下可跨线程传递/调用。其余字段（Arc/Mutex/u32/Duration）
-// 皆 Send+Sync。
+// SAFETY: server free-threaded（MTA）——sink 经 `Arc<Mutex<HashMap>>` 共享，worker 跨线程
+// `clone`（AddRef）不触发 apartment 检查（无 QI/方法调用）。其余字段（Arc/Mutex/u32/
+// Duration）皆 Send+Sync。
 unsafe impl Send for PublishJob {}
 // SAFETY: 同上；tick/worker 多线程经 `Arc<PublishJob>` 共享只读访问（字段构造后不变）。
 unsafe impl Sync for PublishJob {}
@@ -159,7 +164,7 @@ impl Scheduler {
         key: u32,
         inner: Arc<Mutex<GroupInner>>,
         data_source: Arc<dyn DataSource>,
-        data_cp: IConnectionPoint,
+        data_sinks: Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
         rate_ms: u32,
     ) {
         let rate = Duration::from_millis(u64::from(rate_ms.max(1)));
@@ -167,7 +172,7 @@ impl Scheduler {
             key,
             inner,
             data_source,
-            data_cp,
+            data_sinks,
         });
         locked(&self.registry).insert(key, (Arc::clone(&job), rate));
         let mut buckets = locked(&self.buckets);
@@ -260,8 +265,11 @@ struct PushBuf {
 /// 推送单个 job（worker 线程调）：取 sink 快照 → 锁内 read + deadband 过滤 + 更新
 /// `last_pushed` + 收集变化帧（复用 [`PUSH_BUF`]）→ 锁外 push `OnDataChange`。
 fn push_one(job: &PublishJob) {
-    let sinks = publisher::enumerate_sinks(&job.data_cp);
+    let sinks = publisher::typed_sinks(&job.data_sinks);
+    let sink_count = sinks.len();
     if sinks.is_empty() {
+        // 无 sink：仍记一条（区分"scheduler tick 没跑"vs"无订阅者"）。
+        tracing::debug!(method = "push_one", group_key = job.key, sinks = 0, changed = 0);
         return;
     }
     PUSH_BUF.with(|cell| {
@@ -301,5 +309,13 @@ fn push_one(job: &PublishJob) {
         if !buf.hc.is_empty() {
             publisher::push_data_change(&sinks, h_group, &buf.hc, &buf.v, &buf.q, &buf.ts, 0);
         }
+        // 诊断：每 tick 每 job 一条——group_key 标识哪个 group、sinks=订阅者数、changed=过滤后
+        // 实际推送的 item 数。group_key 跨 client 重复时（设计缺陷）此处会暴露。
+        tracing::debug!(
+            method = "push_one",
+            group_key = job.key,
+            sinks = sink_count,
+            changed = buf.hc.len(),
+        );
     });
 }

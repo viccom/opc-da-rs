@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use windows::Win32::Foundation::{E_POINTER, S_FALSE, S_OK};
 use windows::Win32::System::Com::{
@@ -45,8 +45,13 @@ pub struct ConnectionPoint<T>
 where
     T: Interface + Clone + 'static,
 {
-    /// `cookie -> sink` 订阅表。每个 sink 在 `Advise` 时 `cast` 到 `T` 存入。
-    sinks: Mutex<HashMap<u32, T>>,
+    /// `cookie -> sink` 订阅表（`Arc` 共享给 scheduler / Refresh2）。
+    ///
+    /// 用 `Arc` 而非裸 `Mutex`：推送路径（scheduler worker / Refresh2）需在**非 Advise 线程**
+    /// 取 sink 快照。若走 `EnumConnections` 会对 sink 做 `cast::<IUnknown>()`（QI），STA client
+    /// 的 sink proxy 绑定 Advise 线程 → 跨线程 QI 触发 `RPC_E_WRONG_THREAD`（0x8001010E）→
+    /// sink 被丢弃 → 推送断。共享 `Arc` 让推送方直接 `clone` sink（AddRef，免 QI）。
+    sinks: Arc<Mutex<HashMap<u32, T>>>,
     /// 下一个 cookie 值（从 1 递增；0 为保留的"无效"哨兵）。
     next_cookie: AtomicU32,
     /// 所属可连接对象的弱引用（`attach_container` 注入）。
@@ -61,7 +66,7 @@ where
     #[must_use]
     pub fn new() -> Self {
         Self {
-            sinks: Mutex::new(HashMap::new()),
+            sinks: Arc::new(Mutex::new(HashMap::new())),
             next_cookie: AtomicU32::new(1),
             container: Mutex::new(None),
         }
@@ -80,6 +85,15 @@ where
     /// 当前订阅数（用于测试与状态上报）。
     pub fn advise_count(&self) -> usize {
         locked(&self.sinks).len()
+    }
+
+    /// 订阅表的 `Arc` 句柄（共享给 scheduler worker / `Refresh2`）。
+    ///
+    /// 推送路径调此拿 sink 快照，**直接 `clone` sink（AddRef）**，绕过 `EnumConnections`
+    /// 的 QI——后者对 STA client 的跨线程 sink 报 `RPC_E_WRONG_THREAD`（0x8001010E）。
+    /// `Arc` clone 廉价（仅增引用计数）；订阅表生命周期与 `ConnectionPoint` 对象一致。
+    pub fn sinks_arc(&self) -> Arc<Mutex<HashMap<u32, T>>> {
+        Arc::clone(&self.sinks)
     }
 
     /// 分配下一个 cookie。绕过 0（COM 无效哨兵）：仅当 `next_cookie` 环绕回 0 时跳过
@@ -135,8 +149,21 @@ where
             .cast()
             .map_err(|_| Error::from(CONNECT_E_CANNOTCONNECT))?;
         let cookie = self.alloc_cookie();
-        locked(&self.sinks).insert(cookie, sink);
-        tracing::debug!(method = "Advise", sink_type = ?<T as Interface>::IID, cookie);
+        let sinks_len = {
+            let mut m = locked(&self.sinks);
+            m.insert(cookie, sink);
+            m.len()
+        };
+        // 诊断：obj=self 结构体地址（运行时对象身份），sinks_len=insert 后订阅总数。
+        // 对比 EnumConnections 的 obj/sinks_len：若 obj 同但 len 不同→不可能（同 Mutex）；
+        // 若 obj 不同→Advise 与 enumerate 命中了不同 ConnectionPoint 实例（对象身份问题）。
+        tracing::debug!(
+            method = "Advise",
+            obj = self as *const Self as usize,
+            sink_type = ?<T as Interface>::IID,
+            cookie,
+            sinks_len
+        );
         Ok(cookie)
     }
 
@@ -150,11 +177,36 @@ where
         }
     }
 
+    #[allow(clippy::significant_drop_tightening)] // MutexGuard m 须活到 collect（iter 借用 m）；nursery 误报
     fn EnumConnections(&self) -> Result<IEnumConnections> {
-        let snapshot: Vec<(u32, IUnknown)> = locked(&self.sinks)
-            .iter()
-            .filter_map(|(cookie, sink)| sink.cast::<IUnknown>().ok().map(|unk| (*cookie, unk)))
-            .collect();
+        let (sinks_len, snapshot) = {
+            let m = locked(&self.sinks);
+            let sl = m.len();
+            let snap: Vec<(u32, IUnknown)> = m
+                .iter()
+                .filter_map(|(cookie, sink)| match sink.cast::<IUnknown>() {
+                    Ok(unk) => Some((*cookie, unk)),
+                    Err(e) => {
+                        // 诊断：sink→IUnknown cast 失败会让该 sink 被静默丢弃。记 warn 暴露
+                        // "sinks_len 有但 snap_len 少"（跨进程 proxy 的 QI(IID_IUnknown) 异常时）。
+                        tracing::warn!(
+                            method = "EnumConnections",
+                            "sink cast IUnknown 失败: {e:?}（该订阅者将被丢弃）"
+                        );
+                        None
+                    }
+                })
+                .collect();
+            (sl, snap)
+        };
+        // 诊断：obj 与 Advise 的 obj 对比（应相同=同一 ConnectionPoint）；sinks_len=订阅总数；
+        // snap_len=cast 成功的（=能推送给的）。sinks_len>0 但 snap_len=0 → cast 全失败。
+        tracing::debug!(
+            method = "EnumConnections",
+            obj = self as *const Self as usize,
+            sinks_len,
+            snap_len = snapshot.len()
+        );
         Ok(EnumConnectionsObj {
             entries: snapshot,
             cursor: Mutex::new(0),

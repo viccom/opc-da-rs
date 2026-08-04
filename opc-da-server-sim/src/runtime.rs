@@ -126,11 +126,16 @@ pub fn run_server() -> Result<()> {
             REGCLS_MULTIPLEUSE | REGCLS_SUSPENDED,
         )?;
         CoResumeClassObjects()?;
+        // 区分 SCM 启动（-Embedding，client 连接触发）vs 手动启动（终端跑）。多实例诊断用。
+        let launched_by_scm = std::env::args()
+            .any(|a| a.eq_ignore_ascii_case("-Embedding") || a.eq_ignore_ascii_case("/Embedding"));
         tracing::info!(
-            "opc-da-server-sim: serving (ProgID={}, {} tags, count={}, Ctrl+C 退出)",
+            "opc-da-server-sim: serving (ProgID={}, {} tags, count={}, pid={}, launched_by={}, Ctrl+C 退出)",
             PROG_ID,
             8 * count + 1,
-            count
+            count,
+            std::process::id(),
+            if launched_by_scm { "SCM" } else { "manual" }
         );
         tracing::info!(
             "详细日志: {}\\logs\\opc-da-server-sim.log（debug 级，每日滚动）",

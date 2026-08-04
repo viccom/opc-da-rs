@@ -137,8 +137,12 @@ pub struct GroupObj {
     data_source: Arc<dyn DataSource>,
     /// 订阅 sink 连接点（`IConnectionPoint` 接口，指向 `ConnectionPoint<IOPCDataCallback>`
     /// COM 对象，refcount 由 COM 自管）。`FindConnectionPoint(IOPCDataCallback)` 返回它的
-    /// clone（AddRef）；publisher 引擎（§10）经 `EnumConnections` 遍历 sink 推送 `OnDataChange`。
+    /// clone（AddRef）。
     pub(crate) data_cp: IConnectionPoint,
+    /// 订阅表共享句柄（`data_cp` 内部 sinks 的 `Arc`）。`Refresh2` / scheduler 推送经
+    /// `publisher::typed_sinks` 直接 `clone` sink（AddRef）——**免 QI**（STA client sink 跨
+    /// 线程 QI 报 `RPC_E_WRONG_THREAD` 0x8001010E，旧 `EnumConnections` 路径会丢 sink）。
+    data_sinks: Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
     /// `IOPCAsyncIO2` 事务 CancelID 分配器（从 1 起，0 = 无效）。
     next_cancel_id: AtomicU32,
 }
@@ -174,7 +178,10 @@ impl GroupObj {
             h_server_group,
         }));
         // data_cp 未 attach container（见 ConnectionPoint::GetConnectionPointContainer 注释）。
-        let data_cp: IConnectionPoint = ConnectionPoint::<IOPCDataCallback>::new().into();
+        // sinks_arc 共享给 scheduler（推送免 QI 取 sink 快照，见 publisher::typed_sinks）。
+        let cp = ConnectionPoint::<IOPCDataCallback>::new();
+        let data_sinks = cp.sinks_arc();
+        let data_cp: IConnectionPoint = cp.into();
         // 注册全局推送调度器（替代旧 per-group spawn；Scheduler 未 init 时 global() 返
         // None 跳过——兼容单测。h_server_group 作 GroupKey，update_rate 作周期）。
         if let Some(sched) = crate::objects::scheduler::global() {
@@ -182,7 +189,7 @@ impl GroupObj {
                 h_server_group,
                 Arc::clone(&inner),
                 data_source.clone(),
-                data_cp.clone(),
+                data_sinks.clone(),
                 update_rate,
             );
         }
@@ -190,6 +197,7 @@ impl GroupObj {
             inner,
             data_source,
             data_cp,
+            data_sinks,
             next_cancel_id: AtomicU32::new(1),
         }
     }
@@ -851,7 +859,7 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
         if frames.is_empty() {
             return Ok(cancel_id);
         }
-        let sinks = crate::objects::publisher::enumerate_sinks(&self.data_cp);
+        let sinks = crate::objects::publisher::typed_sinks(&self.data_sinks);
         if sinks.is_empty() {
             return Ok(cancel_id);
         }
@@ -1616,11 +1624,12 @@ mod tests {
             h_client_group: 0,
             h_server_group: 1,
         }));
-        let cp: IConnectionPoint = ConnectionPoint::<IOPCDataCallback>::new().into();
-        s.register(1, Arc::clone(&inner), Arc::clone(&ds), cp.clone(), 100);
+        let cp = ConnectionPoint::<IOPCDataCallback>::new();
+        let data_sinks = cp.sinks_arc();
+        s.register(1, Arc::clone(&inner), Arc::clone(&ds), data_sinks.clone(), 100);
         assert_eq!(s.registered_count(), 1, "注册 1 个后 1");
-        // 不同 rate → 进不同桶（验证多桶注册/注销）。ds/cp 最后一次用，move 避免 redundant clone。
-        s.register(2, Arc::clone(&inner), ds, cp, 250);
+        // 不同 rate → 进不同桶（验证多桶注册/注销）。ds/data_sinks 最后一次用，move 避免 redundant clone。
+        s.register(2, Arc::clone(&inner), ds, data_sinks, 250);
         assert_eq!(s.registered_count(), 2, "注册第 2 个（不同 rate）后 2");
         s.unregister(1);
         assert_eq!(s.registered_count(), 1, "注销 1 后 1");

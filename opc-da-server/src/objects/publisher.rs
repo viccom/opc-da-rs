@@ -5,6 +5,9 @@
 //! sink 快照）+ [`push_data_change`]（打包 5 数组 + 遍历 sink 调 `OnDataChange`）。
 //! 由 `scheduler.rs` 的 worker 线程与 `group.rs` 的 `Refresh2` 复用。
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
 use windows::Win32::Foundation::{FILETIME, S_OK};
 use windows::Win32::System::Com::{CONNECTDATA, IConnectionPoint};
 use windows::Win32::System::Variant::VARIANT;
@@ -12,7 +15,29 @@ use windows::core::{HRESULT, Interface};
 
 use opc_da_client::bindings::da::IOPCDataCallback;
 
+/// 取锁；mutex poison 时返回 guard（不 panic）。同模块内 `typed_sinks` 用。
+fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
+    lock.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// 从 `ConnectionPoint` 共享的订阅表直接取 sink 快照——**`clone`（AddRef），无 QI**。
+///
+/// 替代 `enumerate_sinks`（走 `EnumConnections` 对 sink 做 `cast::<IUnknown>()`：STA client
+/// 的 sink proxy 绑定 Advise 线程，跨线程 QI 报 `RPC_E_WRONG_THREAD`（0x8001010E）→ sink
+/// 被丢弃 → 推送断）。scheduler worker / `Refresh2` 用此路径，跨线程安全（AddRef 仅增引用
+/// 计数，不触发 apartment 检查）。
+pub fn typed_sinks(
+    sinks: &Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
+) -> Vec<IOPCDataCallback> {
+    locked(sinks).values().cloned().collect()
+}
+
 /// 枚举 `data_cp` 当前所有 sink（`IOPCDataCallback`）：`EnumConnections` + `Next` → pUnk cast。
+///
+/// ⚠ 生产推送已改走 [`typed_sinks`]（本函数对 sink 做 QI——STA client 跨线程 sink 报
+/// `RPC_E_WRONG_THREAD`）。保留供测试（验证 `EnumConnections` 多轮 Next 不截断）与
+/// 潜在的 client 查询路径。
+#[allow(dead_code)]
 pub fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
     let mut sinks = Vec::new();
     // SAFETY: cp 为 IConnectionPoint 接口；EnumConnections 返回快照枚举器。
@@ -70,7 +95,7 @@ pub fn push_data_change(
     for sink in sinks {
         // SAFETY: sink 是 IOPCDataCallback 接口（MTA 下跨线程/跨进程可调）；数组指针在本函数
         // 栈存活期间有效（OnDataChange 同步返回前不释放）。
-        let _ = unsafe {
+        let hr = unsafe {
             sink.OnDataChange(
                 trans_id, // dwTransID：周期推送=0，Refresh2=client dwTransactionID
                 h_group,
@@ -84,6 +109,17 @@ pub fn push_data_change(
                 errors.as_ptr(),
             )
         };
+        // 诊断：OnDataChange 返回非 S_OK → 回调失败（跨进程 marshaling 断、client 已死等）。
+        // 周期推送 trans_id=0；失败时记 hr 帮助定位"scheduler 推了但 client 没收到"。
+        if let Err(e) = &hr {
+            tracing::warn!(
+                method = "OnDataChange",
+                h_group,
+                count,
+                hr = ?e.code(),
+                "回调失败"
+            );
+        }
     }
 }
 
