@@ -17,13 +17,15 @@ use std::collections::HashMap;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::thread;
 
 use windows::Win32::Foundation::{
     E_INVALIDARG, E_NOINTERFACE, E_NOTIMPL, E_OUTOFMEMORY, E_POINTER, FILETIME, S_OK,
 };
 use windows::Win32::System::Com::{
-    CoTaskMemAlloc, CoTaskMemFree, IConnectionPoint, IConnectionPointContainer,
-    IConnectionPointContainer_Impl, IEnumConnectionPoints,
+    COINIT_MULTITHREADED, CoInitializeEx, CoTaskMemAlloc, CoTaskMemFree, CoUninitialize,
+    IConnectionPoint, IConnectionPointContainer, IConnectionPointContainer_Impl,
+    IEnumConnectionPoints,
 };
 use windows::Win32::System::Variant::{VARENUM, VARIANT};
 use windows::core::{
@@ -46,6 +48,15 @@ const OPC_WRITEABLE: u32 = 0x2;
 /// OPC DA 错误码：item ID 不存在（`OPC_BASE=0xC0040000` + 7）。bindings 未导出，按规范值定义。
 #[allow(clippy::cast_possible_wrap)] // HRESULT 失败码用负 i32 表示（COM 约定）
 const OPC_E_INVALIDITEMID: HRESULT = HRESULT(0xC004_0007u32 as i32);
+
+/// AsyncIO2 事务表条目：`(cancel_id, items 快照)`。
+type AsyncTxn = (u32, Vec<(u32, Arc<str>)>);
+/// AsyncIO2 事务表：`client dwTransactionID → AsyncTxn`。
+type AsyncTxnTable = Arc<Mutex<HashMap<u32, AsyncTxn>>>;
+
+/// 异步操作进行中（`AsyncIO2::Read` 的 `ppErrors` 填此值）。windows-rs 未导出，按标准值定义。
+#[allow(clippy::cast_possible_wrap)] // HRESULT 失败码用负 i32 表示（COM 约定）
+const E_PENDING: HRESULT = HRESULT(0x8000_000Au32 as i32);
 
 /// 取锁；mutex poison 时返回 guard（不 panic）。poison 表示持锁线程曾 panic；本模块锁内
 /// 不执行会 panic 的操作，故继续而非传播 panic（遵循 CLAUDE.md "禁止 panic"）。
@@ -143,6 +154,10 @@ pub struct GroupObj {
     /// scheduler 推送经 `publisher::typed_sinks` → GIT 取 proxy 调 `OnDataChange`——免 STA
     /// client sink 跨线程 `RPC_E_WRONG_THREAD`（0x8001010E）。
     data_sinks: Arc<Mutex<HashMap<u32, u32>>>,
+    /// `IOPCAsyncIO2` 事务表：`client dwTransactionID → (cancel_id, items 快照)`。
+    /// `AsyncIO2::Read` 存、后台 worker 完成时删、`Cancel2` 取消时删（幂等）。`Arc`
+    /// 共享给 worker 线程（完成后清理自身事务）。
+    txns: AsyncTxnTable,
     /// `IOPCAsyncIO2` 事务 CancelID 分配器（从 1 起，0 = 无效）。
     next_cancel_id: AtomicU32,
 }
@@ -198,6 +213,7 @@ impl GroupObj {
             data_source,
             data_cp,
             data_sinks,
+            txns: Arc::new(Mutex::new(HashMap::new())),
             next_cancel_id: AtomicU32::new(1),
         }
     }
@@ -235,6 +251,55 @@ fn read_frames(
         timestamps.push(ts);
     }
     (hclients, values, qualities, timestamps)
+}
+
+/// `AsyncIO2::Read` 的后台 worker：读全部 → GIT 取 sink → `OnReadComplete` → 清事务。
+///
+/// 独立线程（`DataFrame` 纯计算无 IO，读很快；client 不会高频调 AsyncRead）。线程入 MTA
+/// 以便调 GIT / sink proxy（free-threaded）。事务完成清理幂等：`Cancel2` 先删（或 client
+/// 复用 txn_id 覆盖）则本 worker 不再回调、不误删新事务。
+#[allow(clippy::too_many_arguments)] // 闭包捕获集合过大，显式传参更清晰
+fn async_read_worker(
+    data_source: Arc<dyn DataSource>,
+    data_sinks: Arc<Mutex<HashMap<u32, u32>>>,
+    txns: AsyncTxnTable,
+    h_group: u32,
+    dwtransactionid: u32,
+    cancel_id: u32,
+    frames: Vec<(u32, Arc<str>)>,
+) {
+    thread::spawn(move || {
+        // SAFETY: 线程入 MTA（GIT / sink proxy 调用需 COM 线程上下文）；失败忽略（GIT 仍可调用）。
+        let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
+        // 事务有效性（Cancel2 已删则不再回调）。
+        let alive = locked(&txns)
+            .get(&dwtransactionid)
+            .is_some_and(|(cid, _)| *cid == cancel_id);
+        if alive {
+            let (hclients, values, qualities, timestamps) = read_frames(&frames, &*data_source);
+            let sinks = crate::objects::publisher::typed_sinks(&data_sinks);
+            if !sinks.is_empty() {
+                crate::objects::publisher::push_read_complete(
+                    &sinks,
+                    h_group,
+                    dwtransactionid,
+                    &hclients,
+                    &values,
+                    &qualities,
+                    &timestamps,
+                );
+            }
+            // 只删自己的事务（防 client 复用 txn_id 覆盖后误删新事务）。
+            if locked(&txns)
+                .get(&dwtransactionid)
+                .is_some_and(|(cid, _)| *cid == cancel_id)
+            {
+                locked(&txns).remove(&dwtransactionid);
+            }
+        }
+        // SAFETY: 匹配 CoInitializeEx。
+        unsafe { CoUninitialize() };
+    });
 }
 
 impl IOPCItemMgt_Impl for GroupObj_Impl {
@@ -825,16 +890,73 @@ impl IOPCSyncIO_Impl for GroupObj_Impl {
 }
 
 impl IOPCAsyncIO2_Impl for GroupObj_Impl {
-    // TODO(后续阶段): AsyncIO2::Read（异步读 + OnReadComplete 回调，需事务表）。
+    /// `AsyncIO2::Read`：异步读（后台线程读全部 → GIT 取 sink → `OnReadComplete` 回调）。
+    ///
+    /// `dwTransactionID` 由 client 提供（回调透传）；`pdwCancelID` 返回本 server 分配的事务
+    /// 取消号；`ppErrors` 填 `E_PENDING`（异步进行中）。事务存 [`GroupObj::txns`]，worker
+    /// 完成时清理（幂等——`Cancel2` 先删则 worker 不再回调）。
     fn Read(
         &self,
-        _dwcount: u32,
-        _phserver: *const u32,
-        _dwtransactionid: u32,
-        _pdwcancelid: *mut u32,
-        _pperrors: *mut *mut HRESULT,
+        dwcount: u32,
+        phserver: *const u32,
+        dwtransactionid: u32,
+        pdwcancelid: *mut u32,
+        pperrors: *mut *mut HRESULT,
     ) -> Result<()> {
-        nyi()
+        let n = prealloc_errors(dwcount, phserver, pperrors)?;
+        if n == 0 {
+            return Ok(()); // 0-item 空操作成功。
+        }
+        if pdwcancelid.is_null() {
+            return Err(Error::from(E_POINTER));
+        }
+        // 快照 items（锁内取 h_client + item_id；未知 handle 跳过）。
+        let frames: Vec<(u32, Arc<str>)> = {
+            let inner = locked(&self.inner);
+            (0..n)
+                .filter_map(|i| {
+                    // SAFETY: phserver 含 dwcount 个 u32（调用方保证）；i < n。
+                    let h = unsafe { *phserver.add(i) };
+                    inner
+                        .items
+                        .get(&h)
+                        .map(|e| (e.h_client, Arc::clone(&e.item_id)))
+                })
+                .collect()
+        };
+        if frames.is_empty() {
+            // 全部未知 handle：无可读内容，返回 E_INVALIDARG（client 处理 per-item 错误）。
+            return Err(Error::from(E_INVALIDARG));
+        }
+        let cancel_id = self.next_cancel_id.fetch_add(1, Ordering::Relaxed);
+        locked(&self.txns).insert(dwtransactionid, (cancel_id, frames.clone()));
+        // SAFETY: pdwcancelid 非空（已校验）。
+        unsafe {
+            *pdwcancelid = cancel_id;
+        }
+        // SAFETY: pperrors 含 n 个槽（prealloc 已分配）；全填 E_PENDING（异步进行中）。
+        unsafe {
+            for i in 0..n {
+                *(*pperrors).add(i) = E_PENDING;
+            }
+        }
+        let h_group = locked(&self.inner).h_client_group;
+        tracing::debug!(
+            method = "AsyncIO2::Read",
+            count = frames.len(),
+            trans_id = dwtransactionid,
+            cancel_id
+        );
+        async_read_worker(
+            Arc::clone(&self.data_source),
+            Arc::clone(&self.data_sinks),
+            Arc::clone(&self.txns),
+            h_group,
+            dwtransactionid,
+            cancel_id,
+            frames,
+        );
+        Ok(())
     }
 
     // TODO(后续阶段): AsyncIO2::Write（异步写 + OnWriteComplete 回调，需事务表）。
@@ -876,9 +998,31 @@ impl IOPCAsyncIO2_Impl for GroupObj_Impl {
         Ok(cancel_id)
     }
 
-    // TODO(后续阶段): Cancel2（取消未完成 async 事务，需事务表）。
-    fn Cancel2(&self, _dwcancelid: u32) -> Result<()> {
-        nyi()
+    /// `Cancel2`：取消未完成 async 事务（`dwcancelid` 为 `Read`/`Refresh2` 返回的 CancelID）。
+    ///
+    /// 删除事务（worker 完成时不再回调）+ 调 `OnCancelComplete(dwcancelid, hGroup)`。
+    /// 无匹配事务返 `E_INVALIDARG`（规范：未知 cancel id）。
+    fn Cancel2(&self, dwcancelid: u32) -> Result<()> {
+        // 找匹配 cancel_id 的事务（txn_id 由 client 提供，不能直接当 key 查）。
+        let txn_tid: Option<u32> = {
+            let t = locked(&self.txns);
+            t.iter()
+                .find(|(_, (cid, _))| *cid == dwcancelid)
+                .map(|(tid, _)| *tid)
+        };
+        let Some(tid) = txn_tid else {
+            return Err(Error::from(E_INVALIDARG));
+        };
+        locked(&self.txns).remove(&tid);
+        // 调 OnCancelComplete（GIT 取 sink；本线程可调）。
+        let sinks = crate::objects::publisher::typed_sinks(&self.data_sinks);
+        let h_group = locked(&self.inner).h_client_group;
+        for sink in &sinks {
+            // SAFETY: sink 是 GIT 取的 proxy（当前线程可调）；参数为标量。
+            let _ = unsafe { sink.OnCancelComplete(dwcancelid, h_group) };
+        }
+        tracing::debug!(method = "Cancel2", cancel_id = dwcancelid, trans_id = tid);
+        Ok(())
     }
 
     // TODO(后续阶段): SetEnable（group 回调总开关）。
@@ -924,7 +1068,13 @@ mod tests {
         OPC_DS_DEVICE,
     };
     use windows::Win32::Foundation::FILETIME;
-    use windows::Win32::System::Com::CoTaskMemFree;
+    use windows::Win32::System::Com::{CoIncrementMTAUsage, CoTaskMemFree};
+
+    /// 测试线程入 MTA（`Advise` 经 GIT 注册 sink 需 COM 初始化；幂等）。
+    fn init_mta() {
+        // SAFETY: CoIncrementMTAUsage 幂等（多次调用累加计数，无害）。
+        unsafe { CoIncrementMTAUsage() }.expect("CoIncrementMTAUsage");
+    }
     use windows::Win32::System::Variant::{VARIANT, VT_I4, VT_R8};
     use windows::core::{IUnknown, Interface};
 
@@ -1448,14 +1598,16 @@ mod tests {
         );
     }
 
-    /// 测试用 `IOPCDataCallback` sink：捕获 `OnDataChange` 的 `(trans_id, h_group, count)`，
-    /// 经共享 `Arc<Mutex>` 让测试同步读取（同进程 COM 调用直接进 OnDataChange）。
+    /// 测试用 `IOPCDataCallback` sink：捕获 `OnDataChange` / `OnReadComplete` 的
+    /// `(trans_id, h_group, count)`，经共享 `Arc<Mutex>` 让测试同步读取（同进程 COM 调用
+    /// 直接进回调；AsyncIO2 worker 跨线程写，测试轮询读取）。
     #[implement(IOPCDataCallback)]
     struct CapturingSink {
         last: Arc<Mutex<Option<(u32, u32, u32)>>>,
+        last_read: Arc<Mutex<Option<(u32, u32, u32)>>>,
     }
 
-    // IOPCDataCallback 4 方法：OnDataChange 记录；其余 no-op（Refresh2 只触发 OnDataChange）。
+    // IOPCDataCallback 4 方法：OnDataChange/OnReadComplete 记录；其余 no-op。
     #[allow(clippy::too_many_arguments)] // COM vtable 签名固定（bindings 生成）
     impl IOPCDataCallback_Impl for CapturingSink_Impl {
         fn OnDataChange(
@@ -1477,17 +1629,18 @@ mod tests {
 
         fn OnReadComplete(
             &self,
-            _dwtransid: u32,
-            _hgroup: u32,
+            dwtransid: u32,
+            hgroup: u32,
             _hrmasterquality: HRESULT,
             _hrmastererror: HRESULT,
-            _dwcount: u32,
+            dwcount: u32,
             _phclientitems: *const u32,
             _pvvalues: *const VARIANT,
             _pwqualities: *const u16,
             _pfttimestamps: *const FILETIME,
             _perrors: *const HRESULT,
         ) -> Result<()> {
+            *locked(&self.last_read) = Some((dwtransid, hgroup, dwcount));
             Ok(())
         }
 
@@ -1579,8 +1732,10 @@ mod tests {
 
         // Advise 捕获 sink（共享 Arc 让测试读 OnDataChange 记录）。
         let last: Arc<Mutex<Option<(u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+        let last_read: Arc<Mutex<Option<(u32, u32, u32)>>> = Arc::new(Mutex::new(None));
         let sink: IOPCDataCallback = CapturingSink {
             last: Arc::clone(&last),
+            last_read: Arc::clone(&last_read),
         }
         .into();
         let cpc: IConnectionPointContainer = g.cast::<IConnectionPointContainer>().expect("QI CPC");
@@ -1603,6 +1758,109 @@ mod tests {
         let (tid, _hgroup, count) = captured.expect("Refresh2 应触发 OnDataChange");
         assert_eq!(tid, 12345, "dwTransactionID 应透传到 OnDataChange");
         assert_eq!(count, 1, "只推 1 个 active item（inactive 过滤）");
+    }
+
+    /// `AsyncIO2::Read`：异步读——返回 cancelID + errors=E_PENDING，后台线程读完后
+    /// `OnReadComplete(trans_id, h_group, count)` 回调（轮询等待 ≤2s）。
+    #[test]
+    fn async_read_completes_with_callback() {
+        init_mta();
+        let g = new_group();
+        // AddItems 1 个 active item。
+        let id = wide("Random.Int4");
+        let defs = [make_def(&id, 7, true)];
+        let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+        let mut errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: g 同进程；指针有效。
+        unsafe {
+            g.AddItems(1, defs.as_ptr(), &raw mut results, &raw mut errs)
+                .expect("AddItems");
+            let h_server = (*results).hServer;
+            CoTaskMemFree(Some(results.cast()));
+            CoTaskMemFree(Some(errs.cast()));
+
+            // Advise 捕获 sink。
+            let last_read: Arc<Mutex<Option<(u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+            let last: Arc<Mutex<Option<(u32, u32, u32)>>> = Arc::new(Mutex::new(None));
+            let sink: IOPCDataCallback = CapturingSink {
+                last: Arc::clone(&last),
+                last_read: Arc::clone(&last_read),
+            }
+            .into();
+            let cpc: IConnectionPointContainer =
+                g.cast::<IConnectionPointContainer>().expect("QI CPC");
+            let iid_dc = IOPCDataCallback::IID;
+            let cp: IConnectionPoint =
+                cpc.FindConnectionPoint(&raw const iid_dc).expect("FindConnectionPoint");
+            let sink_unk: IUnknown = sink.cast::<IUnknown>().expect("cast");
+            let _cookie = cp.Advise(&sink_unk).expect("Advise");
+
+            // AsyncIO2::Read(dwTransactionID=8888)。
+            let async2: IOPCAsyncIO2 = g.cast::<IOPCAsyncIO2>().expect("QI AsyncIO2");
+            let handles = [h_server];
+            let mut cancel_id = 0u32;
+            let mut perrors: *mut HRESULT = core::ptr::null_mut();
+            async2
+                .Read(1, handles.as_ptr(), 8888, &raw mut cancel_id, &raw mut perrors)
+                .expect("AsyncIO2::Read 应成功");
+            assert!(cancel_id >= 1, "cancel id 应非 0");
+            assert_eq!(*perrors, E_PENDING, "ppErrors 应填 E_PENDING（异步进行中）");
+            CoTaskMemFree(Some(perrors.cast()));
+
+            // 轮询等待 OnReadComplete（worker 线程异步回调，≤2s）。
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            let mut captured: Option<(u32, u32, u32)> = None;
+            while captured.is_none() {
+                // 先取出（guard 在此语句末释放）。
+                let cur = *locked(&last_read);
+                if cur.is_some() {
+                    captured = cur;
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "2s 内未收到 OnReadComplete——异步回调断"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let captured = captured.expect("OnReadComplete");
+            assert_eq!(captured.0, 8888, "dwTransactionID 应透传到 OnReadComplete");
+            assert_eq!(captured.2, 1, "回调 count=1（1 个 item）");
+        }
+    }
+
+    /// `Cancel2`：取消未完成事务——删事务 + `OnCancelComplete`；未知 cancel id 返 E_INVALIDARG。
+    #[test]
+    fn cancel2_removes_txn_and_callbacks() {
+        let g = new_group();
+        // AddItems 1 个。
+        let id = wide("Random.Int4");
+        let defs = [make_def(&id, 7, true)];
+        let mut results: *mut tagOPCITEMRESULT = core::ptr::null_mut();
+        let mut errs: *mut HRESULT = core::ptr::null_mut();
+        // SAFETY: g 同进程；指针有效。
+        unsafe {
+            g.AddItems(1, defs.as_ptr(), &raw mut results, &raw mut errs)
+                .expect("AddItems");
+            let h_server = (*results).hServer;
+            CoTaskMemFree(Some(results.cast()));
+            CoTaskMemFree(Some(errs.cast()));
+
+            let async2: IOPCAsyncIO2 = g.cast::<IOPCAsyncIO2>().expect("QI AsyncIO2");
+            let handles = [h_server];
+            let mut cancel_id = 0u32;
+            let mut perrors: *mut HRESULT = core::ptr::null_mut();
+            async2
+                .Read(1, handles.as_ptr(), 999, &raw mut cancel_id, &raw mut perrors)
+                .expect("AsyncIO2::Read");
+            CoTaskMemFree(Some(perrors.cast()));
+
+            // Cancel2 成功（txn 存在）。
+            async2.Cancel2(cancel_id).expect("Cancel2 应成功");
+            // 未知 cancel id → E_INVALIDARG。
+            let err = async2.Cancel2(u32::MAX).expect_err("未知 cancel id 应失败");
+            assert_eq!(err.code(), E_INVALIDARG, "未知 cancel id 应 E_INVALIDARG");
+        }
     }
 
     /// `Scheduler` register/unregister 计数（P0）：注册增、注销减、跨 rate 桶、幂等。

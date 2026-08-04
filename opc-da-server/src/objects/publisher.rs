@@ -91,6 +91,51 @@ pub fn enumerate_sinks(cp: &IConnectionPoint) -> Vec<IOPCDataCallback> {
     sinks
 }
 
+/// 遍历 sink 调 `OnReadComplete`（`AsyncIO2::Read` 的结果回调，5 数组由 caller 打包）。
+///
+/// `trans_id` = client 的 `dwTransactionID`（AsyncIO2::Read 传入）；`h_group` = client 的
+/// `hClientGroup`。`hrMasterQuality/hrMasterError` 恒 `S_OK`（per-item 错误在 `pErrors`）。
+pub fn push_read_complete(
+    sinks: &[IOPCDataCallback],
+    h_group: u32,
+    trans_id: u32,
+    hclients: &[u32],
+    values: &[VARIANT],
+    qualities: &[u16],
+    timestamps: &[FILETIME],
+) {
+    let n = hclients.len();
+    let errors: Vec<HRESULT> = vec![S_OK; n];
+    let count = u32::try_from(n).unwrap_or(u32::MAX);
+    for sink in sinks {
+        // SAFETY: sink 是 GIT 取的 proxy（当前线程可调）；数组指针在调用期间存活。
+        let hr = unsafe {
+            sink.OnReadComplete(
+                trans_id,
+                h_group,
+                S_OK, // hrMasterQuality
+                S_OK, // hrMasterError
+                count,
+                hclients.as_ptr(),
+                values.as_ptr(),
+                qualities.as_ptr(),
+                timestamps.as_ptr(),
+                errors.as_ptr(),
+            )
+        };
+        // 诊断：回调失败（跨进程 marshaling 断、client 已死等）。
+        if let Err(e) = &hr {
+            tracing::warn!(
+                method = "OnReadComplete",
+                h_group,
+                trans_id,
+                hr = ?e.code(),
+                "回调失败"
+            );
+        }
+    }
+}
+
 /// 遍历 sink 调 `OnDataChange`（5 数组由 caller 打包；P1 起 push_data_change 不再 read）。
 ///
 /// `trans_id`：周期推送传 `0`（非事务）；`Refresh2` 传 client 的 `dwTransactionID`。
