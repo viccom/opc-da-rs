@@ -38,8 +38,6 @@ use windows::Win32::Foundation::FILETIME;
 use windows::Win32::System::Com::CoIncrementMTAUsage;
 use windows::Win32::System::Variant::VARIANT;
 
-use opc_da_client::bindings::da::IOPCDataCallback;
-
 use crate::data_source::DataSource;
 use crate::objects::group::GroupInner;
 use crate::objects::publisher;
@@ -87,10 +85,10 @@ pub(crate) struct PublishJob {
     pub(crate) key: u32,
     pub(crate) inner: Arc<Mutex<GroupInner>>,
     pub(crate) data_source: Arc<dyn DataSource>,
-    /// 订阅表共享句柄（`ConnectionPoint` 的 `sinks_arc`）。worker 线程直接 `clone` sink
-    /// （AddRef）——**不做 QI**：STA client 的 sink 绑 Advise 线程，跨线程 QI 报
-    /// `RPC_E_WRONG_THREAD` 会被丢弃（旧 `enumerate_sinks` 路径，见 `publisher::typed_sinks`）。
-    pub(crate) data_sinks: Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
+    /// 订阅表共享句柄（`ConnectionPoint` 的 `sinks_arc`，`cookie → GIT cookie`）。worker
+    /// 经 GIT `GetInterfaceFromGlobal` 取 proxy 调 `OnDataChange`——免 STA client sink 跨线程
+    /// `RPC_E_WRONG_THREAD`（0x8001010E）。详见 `publisher::typed_sinks`。
+    pub(crate) data_sinks: Arc<Mutex<HashMap<u32, u32>>>,
 }
 
 // SAFETY: server free-threaded（MTA）——sink 经 `Arc<Mutex<HashMap>>` 共享，worker 跨线程
@@ -164,7 +162,7 @@ impl Scheduler {
         key: u32,
         inner: Arc<Mutex<GroupInner>>,
         data_source: Arc<dyn DataSource>,
-        data_sinks: Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
+        data_sinks: Arc<Mutex<HashMap<u32, u32>>>,
         rate_ms: u32,
     ) {
         let rate = Duration::from_millis(u64::from(rate_ms.max(1)));
@@ -269,7 +267,12 @@ fn push_one(job: &PublishJob) {
     let sink_count = sinks.len();
     if sinks.is_empty() {
         // 无 sink：仍记一条（区分"scheduler tick 没跑"vs"无订阅者"）。
-        tracing::debug!(method = "push_one", group_key = job.key, sinks = 0, changed = 0);
+        tracing::debug!(
+            method = "push_one",
+            group_key = job.key,
+            sinks = 0,
+            changed = 0
+        );
         return;
     }
     PUSH_BUF.with(|cell| {

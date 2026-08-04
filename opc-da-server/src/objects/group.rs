@@ -139,10 +139,10 @@ pub struct GroupObj {
     /// COM 对象，refcount 由 COM 自管）。`FindConnectionPoint(IOPCDataCallback)` 返回它的
     /// clone（AddRef）。
     pub(crate) data_cp: IConnectionPoint,
-    /// 订阅表共享句柄（`data_cp` 内部 sinks 的 `Arc`）。`Refresh2` / scheduler 推送经
-    /// `publisher::typed_sinks` 直接 `clone` sink（AddRef）——**免 QI**（STA client sink 跨
-    /// 线程 QI 报 `RPC_E_WRONG_THREAD` 0x8001010E，旧 `EnumConnections` 路径会丢 sink）。
-    data_sinks: Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
+    /// 订阅表共享句柄（`data_cp` 内部 sinks 的 `Arc`，`cookie → GIT cookie`）。`Refresh2` /
+    /// scheduler 推送经 `publisher::typed_sinks` → GIT 取 proxy 调 `OnDataChange`——免 STA
+    /// client sink 跨线程 `RPC_E_WRONG_THREAD`（0x8001010E）。
+    data_sinks: Arc<Mutex<HashMap<u32, u32>>>,
     /// `IOPCAsyncIO2` 事务 CancelID 分配器（从 1 起，0 = 无效）。
     next_cancel_id: AtomicU32,
 }
@@ -1626,7 +1626,13 @@ mod tests {
         }));
         let cp = ConnectionPoint::<IOPCDataCallback>::new();
         let data_sinks = cp.sinks_arc();
-        s.register(1, Arc::clone(&inner), Arc::clone(&ds), data_sinks.clone(), 100);
+        s.register(
+            1,
+            Arc::clone(&inner),
+            Arc::clone(&ds),
+            data_sinks.clone(),
+            100,
+        );
         assert_eq!(s.registered_count(), 1, "注册 1 个后 1");
         // 不同 rate → 进不同桶（验证多桶注册/注销）。ds/data_sinks 最后一次用，move 避免 redundant clone。
         s.register(2, Arc::clone(&inner), ds, data_sinks, 250);

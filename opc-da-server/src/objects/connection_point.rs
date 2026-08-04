@@ -10,16 +10,59 @@
 //! 及其 `IEnumConnections` 实现 [`EnumConnectionsObj`]。
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
-use windows::Win32::Foundation::{E_POINTER, S_FALSE, S_OK};
+use windows::Win32::Foundation::{E_FAIL, E_POINTER, S_FALSE, S_OK};
 use windows::Win32::System::Com::{
-    CONNECTDATA, IConnectionPoint, IConnectionPoint_Impl, IConnectionPointContainer,
-    IEnumConnections, IEnumConnections_Impl,
+    CLSCTX_INPROC_SERVER, CONNECTDATA, CoCreateInstance, IConnectionPoint, IConnectionPoint_Impl,
+    IConnectionPointContainer, IEnumConnections, IEnumConnections_Impl, IGlobalInterfaceTable,
 };
 use windows::Win32::System::Ole::{CONNECT_E_CANNOTCONNECT, CONNECT_E_NOCONNECTION};
 use windows::core::{Error, GUID, HRESULT, IUnknown, Interface, Ref, Result, Weak, implement};
+
+/// `CLSID_StdGlobalInterfaceTable`（windows-rs 0.61 未导出，按 MSDN 标准值定义）：
+/// `00000323-0000-0000-C000-000000000046`。
+const CLSID_STD_GLOBAL_INTERFACE_TABLE: GUID = GUID {
+    data1: 0x0000_0323,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+/// GIT 句柄包装（GIT 本身 free-threaded——可从任意 apartment 调用）。
+#[allow(clippy::non_send_fields_in_send_ty)] // IGlobalInterfaceTable 内部含 raw ptr（非 Send）；
+// GIT 是进程级 free-threaded 单例（MSDN：RegisterInterfaceInGlobal / GetInterfaceFromGlobal /
+// RevokeInterfaceFromGlobal 均可从任意 apartment 调用），跨线程共享安全。
+struct GitHandle(IGlobalInterfaceTable);
+
+// SAFETY: GIT 是进程级 free-threaded 单例（MSDN：上述方法可从任意 apartment 调用）。
+unsafe impl Send for GitHandle {}
+// SAFETY: 同上；GIT 内部状态由 COM 管理，线程安全。
+unsafe impl Sync for GitHandle {}
+
+/// 进程级 GIT（Global Interface Table）——STA client 的 sink 经此跨线程共享。
+///
+/// MTA server 的 scheduler worker 直接调 STA client 的 sink proxy 报 `RPC_E_WRONG_THREAD`
+/// （0x8001010E）：proxy 的 apartment 上下文绑定 client 侧。GIT 在 **Advise 线程**注册
+/// （sink 的正确上下文），`GetInterfaceFromGlobal` 返回**可用于调用线程**的 proxy——COM
+/// 处理跨 apartment 回调的标准机制（经典做法同 `CoMarshalInterThreadInterfaceInStream`）。
+static GIT: OnceLock<GitHandle> = OnceLock::new();
+
+/// 取进程级 GIT（懒初始化；标准 in-proc 单例，失败返 `None`——调用方降级）。
+pub fn global_git() -> Option<&'static IGlobalInterfaceTable> {
+    if let Some(g) = GIT.get() {
+        return Some(&g.0);
+    }
+    // SAFETY: CoCreateInstance 创建标准 in-proc GIT；CLSCTX_INPROC_SERVER。
+    let g = unsafe {
+        CoCreateInstance(&CLSID_STD_GLOBAL_INTERFACE_TABLE, None, CLSCTX_INPROC_SERVER)
+    }
+    .ok()?;
+    // get_or_init：并发时先到者胜，晚到的本地 g 丢弃（引用释放）。
+    Some(&GIT.get_or_init(|| GitHandle(g)).0)
+}
 
 /// 取锁；mutex poison 时返回 guard（不 panic）。
 ///
@@ -45,13 +88,15 @@ pub struct ConnectionPoint<T>
 where
     T: Interface + Clone + 'static,
 {
-    /// `cookie -> sink` 订阅表（`Arc` 共享给 scheduler / Refresh2）。
+    /// `cookie -> GIT cookie` 订阅表（`Arc` 共享给 scheduler / Refresh2）。
     ///
-    /// 用 `Arc` 而非裸 `Mutex`：推送路径（scheduler worker / Refresh2）需在**非 Advise 线程**
-    /// 取 sink 快照。若走 `EnumConnections` 会对 sink 做 `cast::<IUnknown>()`（QI），STA client
-    /// 的 sink proxy 绑定 Advise 线程 → 跨线程 QI 触发 `RPC_E_WRONG_THREAD`（0x8001010E）→
-    /// sink 被丢弃 → 推送断。共享 `Arc` 让推送方直接 `clone` sink（AddRef，免 QI）。
-    sinks: Arc<Mutex<HashMap<u32, T>>>,
+    /// 存 **GIT cookie**（`RegisterInterfaceInGlobal` 返回值）而非 sink 接口指针：scheduler
+    /// worker（MTA）跨线程**直接**调 STA client 的 sink proxy 报 `RPC_E_WRONG_THREAD`
+    /// （0x8001010E）；经 GIT `GetInterfaceFromGlobal` 取到**可用于当前线程**的 proxy 再调。
+    /// `Arc` 共享让推送方在非 Advise 线程也能读表。
+    sinks: Arc<Mutex<HashMap<u32, u32>>>,
+    /// 标记 T（运行时仅用于 IID / Advise cast，不存于字段）。
+    _phantom: PhantomData<T>,
     /// 下一个 cookie 值（从 1 递增；0 为保留的"无效"哨兵）。
     next_cookie: AtomicU32,
     /// 所属可连接对象的弱引用（`attach_container` 注入）。
@@ -69,6 +114,7 @@ where
             sinks: Arc::new(Mutex::new(HashMap::new())),
             next_cookie: AtomicU32::new(1),
             container: Mutex::new(None),
+            _phantom: PhantomData,
         }
     }
 
@@ -87,12 +133,12 @@ where
         locked(&self.sinks).len()
     }
 
-    /// 订阅表的 `Arc` 句柄（共享给 scheduler worker / `Refresh2`）。
+    /// 订阅表（`cookie → GIT cookie`）的 `Arc` 句柄（共享给 scheduler worker / `Refresh2`）。
     ///
-    /// 推送路径调此拿 sink 快照，**直接 `clone` sink（AddRef）**，绕过 `EnumConnections`
-    /// 的 QI——后者对 STA client 的跨线程 sink 报 `RPC_E_WRONG_THREAD`（0x8001010E）。
-    /// `Arc` clone 廉价（仅增引用计数）；订阅表生命周期与 `ConnectionPoint` 对象一致。
-    pub fn sinks_arc(&self) -> Arc<Mutex<HashMap<u32, T>>> {
+    /// 推送方经 GIT `GetInterfaceFromGlobal` 取**可用于当前线程**的 sink proxy 再调
+    /// `OnDataChange`——避免直接调 STA client sink 报 `RPC_E_WRONG_THREAD`（0x8001010E）。
+    /// `Arc` clone 廉价（仅增引用计数）。
+    pub fn sinks_arc(&self) -> Arc<Mutex<HashMap<u32, u32>>> {
         Arc::clone(&self.sinks)
     }
 
@@ -148,27 +194,44 @@ where
             .ok_or_else(|| Error::from(E_POINTER))?
             .cast()
             .map_err(|_| Error::from(CONNECT_E_CANNOTCONNECT))?;
+        // GIT 注册（在 Advise 线程 = sink 的正确 apartment 上下文；注册 sink 的 identity）。
+        let Some(git) = global_git() else {
+            return Err(Error::from(E_FAIL));
+        };
+        let unk: IUnknown = sink
+            .cast()
+            .map_err(|_| Error::from(CONNECT_E_CANNOTCONNECT))?;
+        // SAFETY: git 有效（进程级 GIT）；unk 是 sink 的 identity；riid=T::IID 与后续
+        // GetInterfaceFromGlobal 匹配。Advise 线程 QI 成功（跨线程才 RPC_E_WRONG_THREAD）。
+        let git_cookie = unsafe { git.RegisterInterfaceInGlobal(&unk, &<T as Interface>::IID) }?;
         let cookie = self.alloc_cookie();
         let sinks_len = {
             let mut m = locked(&self.sinks);
-            m.insert(cookie, sink);
+            m.insert(cookie, git_cookie);
             m.len()
         };
         // 诊断：obj=self 结构体地址（运行时对象身份），sinks_len=insert 后订阅总数。
-        // 对比 EnumConnections 的 obj/sinks_len：若 obj 同但 len 不同→不可能（同 Mutex）；
-        // 若 obj 不同→Advise 与 enumerate 命中了不同 ConnectionPoint 实例（对象身份问题）。
         tracing::debug!(
             method = "Advise",
             obj = self as *const Self as usize,
             sink_type = ?<T as Interface>::IID,
             cookie,
-            sinks_len
+            sinks_len,
+            git_cookie
         );
         Ok(cookie)
     }
 
     fn Unadvise(&self, dwcookie: u32) -> Result<()> {
-        if locked(&self.sinks).remove(&dwcookie).is_some() {
+        // 先取出 removed（guard 在此语句末释放），再 if let——避免锁持有延长到 if body
+        //（clippy significant_drop_in_scrutinee）。
+        let removed = locked(&self.sinks).remove(&dwcookie);
+        if let Some(git_cookie) = removed {
+            // 从 GIT 注销（失败静默——sink 可能已被 client 释放；cookie 已移除，幂等）。
+            if let Some(git) = global_git() {
+                // SAFETY: git_cookie 由本 cp Advise 经同一 GIT 注册。
+                let _ = unsafe { git.RevokeInterfaceFromGlobal(git_cookie) };
+            }
             tracing::debug!(method = "Unadvise", cookie = dwcookie);
             Ok(())
         } else {
@@ -179,21 +242,33 @@ where
 
     #[allow(clippy::significant_drop_tightening)] // MutexGuard m 须活到 collect（iter 借用 m）；nursery 误报
     fn EnumConnections(&self) -> Result<IEnumConnections> {
+        // sinks 存 GIT cookie：经 GIT GetInterfaceFromGlobal 取回 IUnknown 快照（本线程可用）。
+        let Some(git) = global_git() else {
+            return Err(Error::from(E_FAIL));
+        };
         let (sinks_len, snapshot) = {
             let m = locked(&self.sinks);
             let sl = m.len();
             let snap: Vec<(u32, IUnknown)> = m
                 .iter()
-                .filter_map(|(cookie, sink)| match sink.cast::<IUnknown>() {
-                    Ok(unk) => Some((*cookie, unk)),
-                    Err(e) => {
-                        // 诊断：sink→IUnknown cast 失败会让该 sink 被静默丢弃。记 warn 暴露
-                        // "sinks_len 有但 snap_len 少"（跨进程 proxy 的 QI(IID_IUnknown) 异常时）。
-                        tracing::warn!(
-                            method = "EnumConnections",
-                            "sink cast IUnknown 失败: {e:?}（该订阅者将被丢弃）"
-                        );
-                        None
+                .filter_map(|(cookie, git_cookie)| {
+                    let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
+                    // SAFETY: git 有效；git_cookie 由本 cp Advise 经同一 GIT 注册；riid=IUnknown。
+                    let hr = unsafe {
+                        git.GetInterfaceFromGlobal(*git_cookie, &IUnknown::IID, &raw mut raw)
+                    };
+                    match hr {
+                        Ok(()) => {
+                            // SAFETY: GetInterfaceFromGlobal 成功返回 AddRef 过的 IUnknown。
+                            Some((*cookie, unsafe { IUnknown::from_raw(raw) }))
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                method = "EnumConnections",
+                                "GIT GetInterfaceFromGlobal 失败: {e:?}（该订阅者将被丢弃）"
+                            );
+                            None
+                        }
                     }
                 })
                 .collect();

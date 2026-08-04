@@ -15,21 +15,36 @@ use windows::core::{HRESULT, Interface};
 
 use opc_da_client::bindings::da::IOPCDataCallback;
 
+use crate::objects::connection_point::global_git;
+
 /// 取锁；mutex poison 时返回 guard（不 panic）。同模块内 `typed_sinks` 用。
 fn locked<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// 从 `ConnectionPoint` 共享的订阅表直接取 sink 快照——**`clone`（AddRef），无 QI**。
+/// 从 `ConnectionPoint` 共享的订阅表（`cookie → GIT cookie`）取 sink proxy 快照。
 ///
-/// 替代 `enumerate_sinks`（走 `EnumConnections` 对 sink 做 `cast::<IUnknown>()`：STA client
-/// 的 sink proxy 绑定 Advise 线程，跨线程 QI 报 `RPC_E_WRONG_THREAD`（0x8001010E）→ sink
-/// 被丢弃 → 推送断）。scheduler worker / `Refresh2` 用此路径，跨线程安全（AddRef 仅增引用
-/// 计数，不触发 apartment 检查）。
-pub fn typed_sinks(
-    sinks: &Arc<Mutex<HashMap<u32, IOPCDataCallback>>>,
-) -> Vec<IOPCDataCallback> {
-    locked(sinks).values().cloned().collect()
+/// 经 GIT `GetInterfaceFromGlobal` 取**可用于当前线程**的 `IOPCDataCallback` proxy——解决
+/// STA client（PsOPCClient 等）的 sink 绑定 client STA 线程、MTA worker 直接调报
+/// `RPC_E_WRONG_THREAD`（0x8001010E）的问题。GIT 在 Advise 线程注册（sink 正确上下文），
+/// 任意线程 GetInterfaceFromGlobal 取回的 proxy 可直接调 `OnDataChange`。
+///
+/// GIT 不可用时返空（降级——不推送，避免崩溃）。
+pub fn typed_sinks(sinks: &Arc<Mutex<HashMap<u32, u32>>>) -> Vec<IOPCDataCallback> {
+    let Some(git) = global_git() else {
+        return Vec::new();
+    };
+    locked(sinks)
+        .values()
+        .filter_map(|git_cookie| {
+            // SAFETY: git 有效（进程级 GIT）；git_cookie 由 Advise 经同一 GIT 注册；riid 匹配。
+            let mut raw: *mut core::ffi::c_void = core::ptr::null_mut();
+            unsafe { git.GetInterfaceFromGlobal(*git_cookie, &IOPCDataCallback::IID, &raw mut raw) }
+                .ok()
+                // SAFETY: GetInterfaceFromGlobal 成功返回 AddRef 过的 proxy；本线程可调。
+                .map(|()| unsafe { IOPCDataCallback::from_raw(raw) })
+        })
+        .collect()
 }
 
 /// 枚举 `data_cp` 当前所有 sink（`IOPCDataCallback`）：`EnumConnections` + `Next` → pUnk cast。
